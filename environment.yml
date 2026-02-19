@@ -1,0 +1,20 @@
+name: trajectorykit
+channels:
+  - pytorch-nightly
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pytorch-cuda=12.4
+  - numpy
+  - requests
+  - pip
+  - pip:
+      - vllm>=0.15
+      - openai>=2.0
+      - torch>=2.9
+      - transformers
+      - matplotlib
+      - python-dotenv
+      - pydantic
