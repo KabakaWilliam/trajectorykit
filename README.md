@@ -22,7 +22,7 @@ print(result["final_response"])
 The agent writes and executes code in a sandbox, returning results with inline images:
 
 <p align="center">
-  <img src="../../docs/trace_example.png" width="500" alt="Yu-Gi-Oh Card Stats Comparison">
+  <img src="docs/trace_example.png" width="500" alt="Yu-Gi-Oh Card Stats Comparison">
 </p>
 
 ## ✨ Features
