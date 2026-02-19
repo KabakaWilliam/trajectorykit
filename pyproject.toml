@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trajectorykit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight, local-first agentic framework with tool calling, recursive sub-agents, and full execution tracing."
 readme = "src/trajectorykit/README.md"
 license = "MIT"
@@ -16,7 +16,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -30,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/KabakaWilliam/dispatch_v2"
-Repository = "https://github.com/KabakaWilliam/dispatch_v2"
-Issues = "https://github.com/KabakaWilliam/dispatch_v2/issues"
+Homepage = "https://github.com/KabakaWilliam/trajectorykit"
+Repository = "https://github.com/KabakaWilliam/trajectorykit"
+Issues = "https://github.com/KabakaWilliam/trajectorykit/issues"
 
 [project.optional-dependencies]
 serve = [

@@ -6,3 +6,4 @@ build/
 __pycache__/
 *.pyc
 *.pyo
+CI_demo.md
