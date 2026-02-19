@@ -4,8 +4,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![PyPI](https://img.shields.io/pypi/v/trajectorykit)](https://pypi.org/project/trajectorykit/)
+
+## 📥 Installation
+
+```bash
+pip install trajectorykit
+```
+
+For the full stack (vLLM serving, visualization, etc.):
+
+```bash
+pip install trajectorykit[all]
+```
 
 ## 🏎💨 Quickstart
+
+After installing, you can start using TrajectoryKit right away:
 
 ```python
 from trajectorykit import dispatch
