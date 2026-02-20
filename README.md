@@ -1,4 +1,4 @@
-# 🤖 TrajectoryKit: An Agent Starter Pack
+# 🤖 TrajectoryKit: A Research Agent Starter Pack
 
 > A lightweight, local-first agentic framework for HuggingFace models with built-in tool calling, recursive sub-agents, and full execution tracing.
 
@@ -223,7 +223,7 @@ If you use TrajectoryKit in your research or project, please cite it:
 
 ```bibtex
 @software{trajectorykit2026,
-  title={TrajectoryKit: An Agent Starter Pack},
+  title={TrajectoryKit: A Research Agent Starter Pack},
   author={Lugoloobi, William},
   year={2026},
   url={https://github.com/KabakaWilliam/TrajectoryKit}
