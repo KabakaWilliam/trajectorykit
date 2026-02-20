@@ -11,7 +11,7 @@ EXAMPLE_4 = "Compare the base stats of Charizard, Blastoise, and Venusaur. Visua
 EXAMPLE_5 = "Compare the canonical power scaling or feats of Goku, Naruto Uzumaki, and Ichigo Kurosaki at their strongest confirmed forms. Visualise destructive capability tiers. Mark the strongest based on feats only. Then apply a canonical power multiplier from their series (e.g., form transformation) and re-rank then visualise."
 
 result = dispatch(
-    user_input=EXAMPLE_3,
+    user_input=EXAMPLE_4,
     turn_length=None,
     max_tokens=32768,
     verbose=True

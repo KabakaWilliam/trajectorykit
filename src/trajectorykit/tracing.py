@@ -307,7 +307,7 @@ body {
 }
 .trace-header-left .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
 .trace-header-right { font-family: var(--mono); font-size: 10px; color: var(--text-light); }
-.trace-stats { display: grid; grid-template-columns: repeat(4, 1fr); }
+.trace-stats { display: grid; grid-template-columns: repeat(5, 1fr); }
 .trace-stat {
   padding: 18px 16px; border-right: 1px solid var(--border); text-align: center;
 }
@@ -319,6 +319,22 @@ body {
 .trace-stat-lbl {
   font-family: var(--mono); font-size: 9px; color: var(--text-light);
   text-transform: uppercase; letter-spacing: 0.1em;
+}
+
+/* ── Token ratio bar (in stats header) ── */
+.token-ratio-bar {
+  display: flex; height: 4px; border-radius: 2px; overflow: hidden;
+  margin-top: 10px; background: var(--off);
+}
+.token-ratio-in { background: var(--accent); }
+.token-ratio-out { background: var(--success); }
+.token-ratio-legend {
+  display: flex; justify-content: center; gap: 12px; margin-top: 6px;
+  font-family: var(--mono); font-size: 9px; color: var(--text-light);
+}
+.token-ratio-legend span { display: flex; align-items: center; gap: 4px; }
+.token-ratio-legend .swatch {
+  display: inline-block; width: 8px; height: 8px; border-radius: 2px;
 }
 
 /* ── Turn cards ── */
@@ -417,10 +433,19 @@ body {
 .tc-img { margin-top: 8px; }
 .tc-img img { max-width: 100%; border-radius: 6px; border: 1px solid var(--border); }
 
-/* ── Tokens pill ── */
+/* ── Tokens pill (dual segment) ── */
 .tokens-pill {
-  font-family: var(--mono); font-size: 10px; color: var(--text-light);
-  background: var(--off); border: 1px solid var(--border); padding: 2px 7px; border-radius: 10px;
+  display: inline-flex; align-items: center; font-family: var(--mono); font-size: 10px;
+  border-radius: 10px; overflow: hidden; border: 1px solid var(--border);
+}
+.tokens-pill .tok-in {
+  padding: 2px 6px 2px 7px; background: var(--accent-bg); color: var(--accent);
+}
+.tokens-pill .tok-out {
+  padding: 2px 7px 2px 6px; background: #edf7f0; color: var(--success);
+}
+.tokens-pill .tok-sep {
+  width: 1px; background: var(--border); align-self: stretch;
 }
 
 /* ── Status indicator ── */
@@ -447,7 +472,7 @@ body {
   .viewer { grid-template-columns: 1fr; }
   .sidebar { position: relative; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
   .main { padding: 24px 20px; }
-  .trace-stats { grid-template-columns: repeat(2, 1fr); }
+  .trace-stats { grid-template-columns: repeat(3, 1fr); }
 }
 """
 
@@ -688,7 +713,11 @@ def _render_turn_card(card: dict) -> str:
         f'<span class="turn-title">{title}</span>'
         f'</div>'
         f'<div class="turn-meta">'
-        f'<span class="tokens-pill">{prompt_tok + comp_tok:,} tok</span>'
+        f'<span class="tokens-pill">'
+        f'<span class="tok-in">\u2193{prompt_tok:,}</span>'
+        f'<span class="tok-sep"></span>'
+        f'<span class="tok-out">\u2191{comp_tok:,}</span>'
+        f'</span>'
         f'<span>{td_s:.2f}s</span>'
         f'{_CHEVRON_SVG}'
         f'</div>'
@@ -793,6 +822,9 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
 
     total_turns, total_calls, total_subs, total_prompt_tok, total_comp_tok = _count(d)
     total_tok = total_prompt_tok + total_comp_tok
+    # Token ratio percentages for the bar
+    in_pct = (total_prompt_tok / total_tok * 100) if total_tok else 50
+    out_pct = 100 - in_pct
 
     # Flatten trace into sequential cards
     flat_cards = _flatten_trace(d)
@@ -856,7 +888,19 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
         <div class="trace-stat"><span class="trace-stat-val">{dur:.1f}s</span><span class="trace-stat-lbl">Duration</span></div>
         <div class="trace-stat"><span class="trace-stat-val">{total_turns}</span><span class="trace-stat-lbl">Turns</span></div>
         <div class="trace-stat"><span class="trace-stat-val">{total_subs}</span><span class="trace-stat-lbl">Sub-Agents</span></div>
-        <div class="trace-stat"><span class="trace-stat-val">{total_tok:,}</span><span class="trace-stat-lbl">Tokens</span></div>
+        <div class="trace-stat"><span class="trace-stat-val">{total_prompt_tok:,}</span><span class="trace-stat-lbl">Input Tokens</span></div>
+        <div class="trace-stat"><span class="trace-stat-val">{total_comp_tok:,}</span><span class="trace-stat-lbl">Output Tokens</span></div>
+      </div>
+      <div style="padding:0 16px 14px;">
+        <div class="token-ratio-bar">
+          <div class="token-ratio-in" style="width:{in_pct:.1f}%"></div>
+          <div class="token-ratio-out" style="width:{out_pct:.1f}%"></div>
+        </div>
+        <div class="token-ratio-legend">
+          <span><span class="swatch" style="background:var(--accent)"></span> Input {in_pct:.0f}%</span>
+          <span><span class="swatch" style="background:var(--success)"></span> Output {out_pct:.0f}%</span>
+          <span style="color:var(--text-mid);">{total_tok:,} total</span>
+        </div>
       </div>
     </div>
 
