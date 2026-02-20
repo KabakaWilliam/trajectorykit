@@ -1,6 +1,7 @@
 import requests
 from typing import Any, Callable, Dict, List, Optional
 from .utils import SUPPORTED_LANGUAGES, API_TIMEOUT, MAX_RETRIES, INITIAL_RETRY_DELAY
+from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW
 import logging
 import os
 import threading
@@ -119,8 +120,8 @@ def search_web(q: str, num_results: int = 5) -> str:
 def spawn_agent(
     task: str,
     context: Optional[str] = None,
-    turn_length: int = 5,
-    max_tokens: int = 8192,
+    turn_length: Optional[int] = None,
+    max_tokens: Optional[int] = None,
     temperature: float = 0.7,
     _depth: int = 0,
 ) -> str:
@@ -129,7 +130,12 @@ def spawn_agent(
     Returns the sub-agent's final response as a string.
     """
     from .agent import dispatch   # lazy import to avoid circular dependency
-    from .config import MAX_RECURSION_DEPTH
+    from .config import MAX_RECURSION_DEPTH, CONTEXT_WINDOW
+
+    if turn_length is None:
+        turn_length = SUB_AGENT_TURN_BUDGET
+    if max_tokens is None:
+        max_tokens = CONTEXT_WINDOW
 
     if _depth >= MAX_RECURSION_DEPTH:
         return json.dumps({
@@ -147,7 +153,7 @@ def spawn_agent(
         user_input=full_input,
         turn_length=turn_length,
         verbose=False,           # sub-agents run silently
-        max_tokens=max_tokens,
+        max_tokens=CONTEXT_WINDOW,
         temperature=temperature,
         _depth=_depth + 1,       # increment depth for recursive calls
     )
@@ -316,12 +322,38 @@ def execute_code_wrapper(**kwargs):
                     for fname, b64data in fetched.items():
                         output += f"--- {fname} (base64) ---\n{b64data}\n"
                 
+                # Warn if files were requested but none came back
+                requested_files = kwargs.get("fetch_files", [])
+                if requested_files and not fetched:
+                    output += (
+                        f"\nWARNING: You requested fetch_files={requested_files} but no files were returned. "
+                        "Make sure your code writes these files to the working directory "
+                        "(e.g., use plt.savefig('output.png') instead of plt.show())."
+                    )
+                
                 result = output if output.strip() else "Code executed successfully with no output"
                 return result, None
             else:
-                # Execution failed
-                message = sandbox_result.get("message", "Unknown error")
-                return f"ERROR: Execution failed - {message}", None
+                # Execution failed — gather as much detail as possible
+                message = sandbox_result.get("message", "")
+                run_result = sandbox_result.get("run_result", {})
+                stderr = run_result.get("stderr", "")
+                stdout = run_result.get("stdout", "")
+                return_code = run_result.get("return_code", "")
+                
+                error_parts = [f"ERROR: Execution failed (status: {status})"]
+                if message:
+                    error_parts.append(f"Message: {message}")
+                if return_code != "":
+                    error_parts.append(f"Return code: {return_code}")
+                if stderr:
+                    error_parts.append(f"STDERR:\n{stderr}")
+                if stdout:
+                    error_parts.append(f"STDOUT:\n{stdout}")
+                if not message and not stderr:
+                    error_parts.append("No error details provided by sandbox. Check your code for syntax errors or missing imports.")
+                
+                return "\n".join(error_parts), None
         
         # Fallback
         return f"Unexpected result format: {str(sandbox_result)[:200]}", None
@@ -369,11 +401,12 @@ def spawn_agent_wrapper(_depth: int = 0, **kwargs):
         if not task:
             return "ERROR: 'task' parameter is required", None
 
+        from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW
         output, child_trace = spawn_agent(
             task=task,
             context=kwargs.get("context"),
-            turn_length=kwargs.get("turn_length", 5),
-            max_tokens=kwargs.get("max_tokens", 8192),
+            turn_length=kwargs.get("turn_length", SUB_AGENT_TURN_BUDGET),
+            max_tokens=kwargs.get("max_tokens", CONTEXT_WINDOW),
             temperature=kwargs.get("temperature", 0.7),
             _depth=_depth,
         )
@@ -563,17 +596,22 @@ TOOLS = [
         "function": {
             "name": "spawn_agent",
             "description": (
-                "Spawn a sub-agent to handle a complex subtask independently. "
-                "The sub-agent gets its own agent loop with full tool access (including spawning further sub-agents). "
-                "Use this to decompose complex problems: delegate research, analysis, or coding subtasks "
-                "to a child agent and receive its final answer.\n\n"
-                "WHEN TO USE:\n"
-                "- A task has multiple independent parts that benefit from focused attention\n"
-                "- You need to research one topic while working on another\n"
-                "- A subtask requires many tool calls and you want to keep your main context clean\n"
-                "- You want to run a multi-step computation or analysis as a self-contained unit\n\n"
-                "The sub-agent inherits all your tools but runs with its own conversation history. "
-                "It returns its final response along with metadata (turns used, tool calls made)."
+                "DELEGATE a subtask to an independent sub-agent. This is your PRIMARY tool for complex tasks. "
+                "The sub-agent gets its own fresh context, tools, and turn budget. It does the work and returns ONLY its final result — "
+                "keeping your context clean and small.\n\n"
+                "YOU MUST USE THIS TOOL WHEN:\n"
+                "- The user asks to compare, research, or analyze 2+ items → spawn one sub-agent PER item\n"
+                "- A subtask needs search + code execution → delegate it, don't do it yourself\n"
+                "- You're about to make 3+ tool calls for one part of the task → that's a sub-agent\n\n"
+                "HOW TO WRITE THE TASK STRING:\n"
+                "The sub-agent has NO context from your conversation. The task string is ALL it gets.\n"
+                "- BAD: 'Research card A' (too vague)\n"
+                "- GOOD: 'Find the ATK, DEF, Level, Type, and Attribute of the Yu-Gi-Oh card Blue-Eyes White Dragon. "
+                "Search the web for accurate stats. Return the results as a JSON object with keys: name, atk, def, level, type, attribute.'\n\n"
+                "PATTERN FOR MULTI-ITEM TASKS:\n"
+                "1. spawn_agent(task='[detailed task for item 1, specify return format]')\n"
+                "2. spawn_agent(task='[detailed task for item 2, specify return format]')\n"
+                "3. Collect results, then use execute_code yourself to visualize/synthesize"
             ),
             "parameters": {
                 "type": "object",
@@ -591,13 +629,13 @@ TOOLS = [
                     },
                     "turn_length": {
                         "type": "integer",
-                        "description": "Maximum turns for the sub-agent (default: 5)",
-                        "default": 5
+                        "description": f"Maximum turns for the sub-agent (default: {SUB_AGENT_TURN_BUDGET})",
+                        "default": SUB_AGENT_TURN_BUDGET
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "Maximum tokens per generation for the sub-agent (default: 8192)",
-                        "default": 8192
+                        "description": f"Maximum tokens per generation for the sub-agent (default: {CONTEXT_WINDOW})",
+                        "default": CONTEXT_WINDOW
                     },
                     "temperature": {
                         "type": "number",

@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 *.pyo
 CI_demo.md
+serve_vllm_oss.sh
+data
