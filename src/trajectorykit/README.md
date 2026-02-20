@@ -161,6 +161,16 @@ All settings live in `config.py`:
 | `MAX_RECURSION_DEPTH` | `3` | Max sub-agent nesting depth |
 | `TRACES_DIR` | `<repo_root>/traces/` | Where `.json` and `.html` traces are saved |
 
+### Environment Variables
+
+The `search_web` tool requires a [SerpAPI](https://serpapi.com/) key. Add it to a `.env` file in your project root:
+
+```bash
+SERP_API_KEY=your_serpapi_key_here
+```
+
+You can get a free API key at [serpapi.com](https://serpapi.com/). Web search will be disabled if this key is not set.
+
 ## 🚀 Running
 
 ### 1. Install conda env 
