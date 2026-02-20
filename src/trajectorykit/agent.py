@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, CONTEXT_WINDOW, TOKEN_SAFETY_MARGIN
+from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, TOKEN_SAFETY_MARGIN, get_model_profile
 from .tool_store import TOOLS, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
 
@@ -19,7 +19,9 @@ def dispatch(
     turn_length: Optional[int] = 5,
     verbose: bool = True,
     max_tokens: int = 2000,
-    temperature: float = 0.7,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     _depth: int = 0,
 ) -> Dict[str, Any]:
     """
@@ -30,7 +32,10 @@ def dispatch(
         turn_length: Maximum number of turns. None for unlimited (runs until completion)
         verbose: Print detailed turn-by-turn output
         max_tokens: Maximum tokens per generation (default: 2000)
-        temperature: Sampling temperature for model (default: 0.7)
+        temperature: Sampling temperature (default: from model profile)
+        model: Model name to use (default: config.MODEL_NAME)
+        reasoning_effort: Reasoning effort for supported models — "low"/"medium"/"high"
+                          (default: from model profile if supported, else None)
         _depth: Current recursion depth (internal — used by spawn_agent)
     
     Returns:
@@ -42,11 +47,24 @@ def dispatch(
             - 'trace': EpisodeTrace capturing the full execution tree
     """
 
+    # Resolve model and its profile
+    model = model or MODEL_NAME
+    profile = get_model_profile(model)
+    context_window = profile["context_window"]
+
+    # Resolve temperature: explicit arg > profile default
+    if temperature is None:
+        temperature = profile.get("default_temperature", 0.7)
+
+    # Resolve reasoning_effort: explicit arg > profile default (if model supports it)
+    if reasoning_effort is None and profile.get("supports_reasoning_effort"):
+        reasoning_effort = profile.get("default_reasoning_effort")
+
     # Initialize trace
     episode = EpisodeTrace(
         depth=_depth,
         user_input=user_input,
-        model=MODEL_NAME,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
         turn_length=turn_length,
@@ -58,6 +76,20 @@ def dispatch(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input}
     ]
+
+    def _call_api(effective_max_tokens):
+        """Build payload and call the chat completions API."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "temperature": temperature,
+            "max_tokens": effective_max_tokens,
+        }
+        if reasoning_effort and profile.get("supports_reasoning_effort"):
+            payload["reasoning_effort"] = reasoning_effort
+        return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
     
     turn = 0
     total_tool_calls = 0
@@ -99,17 +131,7 @@ def dispatch(
         effective_max_tokens = max_tokens
 
         # Call vLLM with tools using generation settings
-        response = requests.post(
-            f"{VLLM_API_URL}/chat/completions",
-            json={
-                "model": MODEL_NAME,
-                "messages": messages,
-                "tools": TOOLS,
-                "tool_choice": "auto",
-                "temperature": temperature,
-                "max_tokens": effective_max_tokens
-            }
-        )
+        response = _call_api(effective_max_tokens)
         
         result = response.json()
         
@@ -122,21 +144,11 @@ def dispatch(
                 match = _re.search(r'has (\d+) input tokens', error_msg)
                 if match:
                     input_tokens = int(match.group(1))
-                    effective_max_tokens = CONTEXT_WINDOW - input_tokens - TOKEN_SAFETY_MARGIN
+                    effective_max_tokens = context_window - input_tokens - TOKEN_SAFETY_MARGIN
                     if effective_max_tokens > 0:
                         if verbose:
                             print(f"⚠️  max_tokens too large, retrying with {effective_max_tokens}")
-                        response = requests.post(
-                            f"{VLLM_API_URL}/chat/completions",
-                            json={
-                                "model": MODEL_NAME,
-                                "messages": messages,
-                                "tools": TOOLS,
-                                "tool_choice": "auto",
-                                "temperature": temperature,
-                                "max_tokens": effective_max_tokens
-                            }
-                        )
+                        response = _call_api(effective_max_tokens)
                         result = response.json()
                         if response.status_code != 200:
                             if verbose:
@@ -144,7 +156,7 @@ def dispatch(
                             return _finalize(f"Error: {result}")
                     else:
                         if verbose:
-                            print(f"❌ Context window exhausted ({input_tokens} input tokens, {CONTEXT_WINDOW} max)")
+                            print(f"❌ Context window exhausted ({input_tokens} input tokens, {context_window} max)")
                         return _finalize(f"Error: Context window exhausted. Input too long ({input_tokens} tokens).")
                 else:
                     if verbose:
@@ -190,7 +202,7 @@ def dispatch(
                 tc_start = time.time()
                 child_trace = None
                 try:
-                    output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth)
+                    output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort)
                     if verbose and len(output) < 200:
                         print(f"       → {output}")
                     elif verbose:
@@ -283,7 +295,7 @@ def dispatch(
                             tc_start = time.time()
                             child_trace = None
                             try:
-                                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth)
+                                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort)
                                 if verbose and len(output) < 200:
                                     print(f"       → {output}")
                                 elif verbose:

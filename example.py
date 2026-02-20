@@ -14,6 +14,7 @@ result = dispatch(
     user_input=EXAMPLE_4,
     turn_length=None,
     max_tokens=32768,
+    model="Qwen/Qwen3-8B",
     verbose=True
 )
 

@@ -122,7 +122,9 @@ def spawn_agent(
     context: Optional[str] = None,
     turn_length: Optional[int] = None,
     max_tokens: Optional[int] = None,
-    temperature: float = 0.7,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     _depth: int = 0,
 ) -> str:
     """
@@ -130,12 +132,15 @@ def spawn_agent(
     Returns the sub-agent's final response as a string.
     """
     from .agent import dispatch   # lazy import to avoid circular dependency
-    from .config import MAX_RECURSION_DEPTH, CONTEXT_WINDOW
+    from .config import MAX_RECURSION_DEPTH, get_model_profile, MODEL_NAME
+
+    resolved_model = model or MODEL_NAME
+    profile = get_model_profile(resolved_model)
 
     if turn_length is None:
         turn_length = SUB_AGENT_TURN_BUDGET
     if max_tokens is None:
-        max_tokens = CONTEXT_WINDOW
+        max_tokens = profile["context_window"]
 
     if _depth >= MAX_RECURSION_DEPTH:
         return json.dumps({
@@ -153,8 +158,10 @@ def spawn_agent(
         user_input=full_input,
         turn_length=turn_length,
         verbose=False,           # sub-agents run silently
-        max_tokens=CONTEXT_WINDOW,
+        max_tokens=profile["context_window"],
         temperature=temperature,
+        model=model,
+        reasoning_effort=reasoning_effort,
         _depth=_depth + 1,       # increment depth for recursive calls
     )
 
@@ -393,28 +400,30 @@ def search_web_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def spawn_agent_wrapper(_depth: int = 0, **kwargs):
-    """Wrapper for spawn_agent tool. Injects _depth from the parent dispatch loop.
+def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, **kwargs):
+    """Wrapper for spawn_agent tool. Injects _depth, _model, _reasoning_effort from the parent dispatch loop.
     Returns (output_str, child_trace) where child_trace is an EpisodeTrace."""
     try:
         task = kwargs.get("task")
         if not task:
             return "ERROR: 'task' parameter is required", None
 
-        from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW
+        from .config import SUB_AGENT_TURN_BUDGET
         output, child_trace = spawn_agent(
             task=task,
             context=kwargs.get("context"),
             turn_length=kwargs.get("turn_length", SUB_AGENT_TURN_BUDGET),
-            max_tokens=kwargs.get("max_tokens", CONTEXT_WINDOW),
-            temperature=kwargs.get("temperature", 0.7),
+            max_tokens=kwargs.get("max_tokens"),
+            temperature=kwargs.get("temperature"),
+            model=_model,
+            reasoning_effort=_reasoning_effort,
             _depth=_depth,
         )
         return output, child_trace
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0):
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -423,6 +432,8 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0):
         tool_name: Name of the tool to call
         tool_args: Arguments the model provided for the tool
         _depth: Current recursion depth (injected by the agent loop, invisible to the model)
+        model: Model name to propagate to sub-agents
+        reasoning_effort: Reasoning effort level to propagate to sub-agents
     
     Returns:
         Tuple of (output_string, child_trace) where child_trace is an
@@ -437,7 +448,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0):
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
-        return spawn_agent_wrapper(_depth=_depth, **tool_args)
+        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, **tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
 

@@ -11,10 +11,36 @@ VLLM_API_URL = "http://localhost:3030/v1"
 SANDBOX_FUSION_URL = "http://localhost:8080/run_code"
 MAX_RECURSION_DEPTH = 2
 SUB_AGENT_TURN_BUDGET = 5  # Max turns each sub-agent gets to complete its task
-if "gpt-oss"in MODEL_NAME.lower():
-  CONTEXT_WINDOW = 131072  # Max context length for the model
-elif "qwen3" in MODEL_NAME.lower():
-  CONTEXT_WINDOW = 32768
+
+# ── Model profiles ──────────────────────────────────────────────────────
+# Single source of truth for model-specific settings.
+# Add a new entry here when onboarding a new model.
+MODEL_PROFILES = {
+    "Qwen/Qwen3-8B": {
+        "context_window": 32768,
+        "supports_reasoning_effort": False,
+        "default_temperature": 0.7,
+    },
+    "openai/gpt-oss-20b": {
+        "context_window": 131072,
+        "supports_reasoning_effort": True,
+        "default_reasoning_effort": "medium",
+        "default_temperature": 1.0,
+    },
+}
+
+_DEFAULT_PROFILE = {
+    "context_window": 32768,
+    "supports_reasoning_effort": False,
+    "default_temperature": 0.7,
+}
+
+def get_model_profile(model: str) -> dict:
+    """Return the profile for a model, falling back to defaults for unknown models."""
+    return MODEL_PROFILES.get(model, _DEFAULT_PROFILE)
+
+# Backward-compatible module-level constant (uses default model)
+CONTEXT_WINDOW = get_model_profile(MODEL_NAME)["context_window"]
 TOKEN_SAFETY_MARGIN = 256  # Reserve tokens to avoid edge-case overflows
 
 # Traces directory — resolved relative to repo root (two levels up from this file)
