@@ -111,7 +111,7 @@ class EpisodeTrace:
         html_str = render_trace_html(self.to_dict())
         with open(html_path, "w") as f:
             f.write(html_str)
-        return path
+        return html_path
 
     def compute_recursive_stats(self):
         """Walk the trace tree and compute aggregate stats."""

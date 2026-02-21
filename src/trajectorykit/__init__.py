@@ -6,4 +6,4 @@ from .agent import dispatch
 from .tracing import EpisodeTrace, render_trace_html, render_trace_file
 
 __all__ = ["dispatch", "EpisodeTrace", "render_trace_html", "render_trace_file"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

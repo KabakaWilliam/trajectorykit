@@ -10,8 +10,70 @@ EXAMPLE_4 = "Compare the base stats of Charizard, Blastoise, and Venusaur. Visua
 
 EXAMPLE_5 = "Compare the canonical power scaling or feats of Goku, Naruto Uzumaki, and Ichigo Kurosaki at their strongest confirmed forms. Visualise destructive capability tiers. Mark the strongest based on feats only. Then apply a canonical power multiplier from their series (e.g., form transformation) and re-rank then visualise."
 
+EXAMPLE_6 = "Compare streaming numbers, Grammy wins, and Billboard Hot 100 entries of Kendrick Lamar, Drake, and J. Cole. Visualise them. Mark the statistically most awarded artist. Then find a real remix collaboration that boosted streaming numbers and model its impact across all three."
+
+EXAMPLE_7 = "Who are the 3 most likely teams to win the UEFA Champions League. Rank them and use a barchart to visualise the odds."
+
+EXAMPLE_8 = """Compare Satoru Gojo, Ryomen Sukuna, and Megumi Fushiguro in terms of:
+    1. Domain Expansion mechanics
+    2. Energy cost
+    3. Domain range
+    4. Lethality conditions
+Visualise comparative strengths. Then simulate overlapping domain activation and determine the likely outcome under canon rules."""
+
+EXAMPLE_9 = """You are playing Yu-Gi-Oh under Duel Links / Speed Duel rules:
+
+- Starting LP: 4000
+- 3 Monster Zones
+- 3 Spell/Trap Zones
+- Standard TCG rulings apply
+- You are only allowed to look up information on cards and their effects. Nothing else.
+
+It is your turn. You have not yet entered the Battle Phase.
+
+CURRENT BOARD STATE
+
+Opponent:
+- LP: 4000
+- Field: No monsters
+- Graveyard contains exactly 3 Dragon monsters:
+  - Blue-Eyes White Dragon
+  - Red-Eyes Black Dragon
+  - Luster Dragon
+
+You:
+- LP: 4000
+- Field (face-up):
+  - Buster Blader
+
+- Hand:
+  - Dark Magician
+  - Polymerization
+
+- Extra Deck:
+  - Dark Paladin
+
+TASK
+
+You can win this turn by playing exactly one card from your hand.
+
+1. Identify which card you must play.
+2. Explain why it results in lethal damage this turn.
+3. Show all attack calculations explicitly.
+4. Use only official card effects (look these up).
+5. Do not assume any additional cards or hidden effects.
+
+Your final answer must be structured in a nicely designed graphic with the following text exactly as:
+
+Card Played:
+Reasoning:
+ATK Calculation:
+Final Damage:
+
+"""
+
 result = dispatch(
-    user_input=EXAMPLE_4,
+    user_input=EXAMPLE_3,
     turn_length=None,
     max_tokens=32768,
     model="Qwen/Qwen3-8B",
