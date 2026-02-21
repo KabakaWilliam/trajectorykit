@@ -18,7 +18,7 @@ def dispatch(
     user_input: str,
     turn_length: Optional[int] = 5,
     verbose: bool = True,
-    max_tokens: int = 2000,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -31,7 +31,7 @@ def dispatch(
         user_input: Initial user message describing the task
         turn_length: Maximum number of turns. None for unlimited (runs until completion)
         verbose: Print detailed turn-by-turn output
-        max_tokens: Maximum tokens per generation (default: 2000)
+        max_tokens: Maximum tokens per generation (default: from model profile context_window)
         temperature: Sampling temperature (default: from model profile)
         model: Model name to use (default: config.MODEL_NAME)
         reasoning_effort: Reasoning effort for supported models — "low"/"medium"/"high"
@@ -55,6 +55,10 @@ def dispatch(
     # Resolve temperature: explicit arg > profile default
     if temperature is None:
         temperature = profile.get("default_temperature", 0.7)
+
+    # Resolve max_tokens: explicit arg > profile context_window
+    if max_tokens is None:
+        max_tokens = context_window
 
     # Resolve reasoning_effort: explicit arg > profile default (if model supports it)
     if reasoning_effort is None and profile.get("supports_reasoning_effort"):
@@ -193,7 +197,13 @@ def dispatch(
             # Process each tool call
             for i, tool_call in enumerate(assistant_message["tool_calls"], 1):
                 tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
+                raw_args = tool_call["function"].get("arguments", "")
+                try:
+                    tool_args = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    tool_args = {}
+                    if verbose:
+                        print(f"   ⚠️  Malformed tool arguments for {tool_name}, using empty args")
                 
                 if verbose:
                     print(f"   [{i}] {tool_name}")

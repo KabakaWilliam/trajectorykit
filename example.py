@@ -69,14 +69,13 @@ Card Played:
 Reasoning:
 ATK Calculation:
 Final Damage:
-
 """
 
 result = dispatch(
     user_input=EXAMPLE_3,
     turn_length=None,
-    max_tokens=32768,
-    model="Qwen/Qwen3-8B",
+    model="Qwen/Qwen3-8B", #"openai/gpt-oss-20b", "Qwen/Qwen3-8B"
+    reasoning_effort="high",
     verbose=True
 )
 

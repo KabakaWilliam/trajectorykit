@@ -423,6 +423,30 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
+def search_available_tools_wrapper(**kwargs):
+    """Wrapper for search_available_tools. Returns (output, None)."""
+    try:
+        tool_name = kwargs.get("tool_name")
+        if tool_name:
+            # Return full schema for the requested tool
+            for tool in TOOLS:
+                if tool["function"]["name"] == tool_name:
+                    return json.dumps(tool, indent=2), None
+            return f"ERROR: No tool named '{tool_name}'. Call search_available_tools with no arguments to see all available tools.", None
+        else:
+            # Return compact summary: name + description for each tool
+            summary = []
+            for tool in TOOLS:
+                func = tool["function"]
+                name = func["name"]
+                desc = func["description"].split('\n')[0]  # first line only
+                required = func.get("parameters", {}).get("required", [])
+                summary.append(f"- {name} (required args: {required})\n  {desc}")
+            return "Available tools:\n\n" + "\n\n".join(summary), None
+    except Exception as e:
+        return f"ERROR: {str(e)}", None
+
+
 def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
     """Route tool calls to appropriate wrapper function.
     
@@ -449,6 +473,8 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
         return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, **tool_args)
+    elif tool_name == "search_available_tools":
+        return search_available_tools_wrapper(**tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
 
@@ -655,6 +681,31 @@ TOOLS = [
                     }
                 },
                 "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_available_tools",
+            "description": (
+                "Look up the tools you have available and their parameter schemas. "
+                "Call with no arguments to get a compact summary of all tools. "
+                "Call with a tool_name to get the full JSON schema for that specific tool, "
+                "including all parameters, types, defaults, and descriptions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": (
+                            "Name of a specific tool to get its full schema. "
+                            "Omit to list all available tools with short descriptions."
+                        )
+                    }
+                },
+                "required": []
             }
         }
     }
