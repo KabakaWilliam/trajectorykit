@@ -10,11 +10,16 @@ EXAMPLE_4 = "Compare the base stats of Charizard, Blastoise, and Venusaur. Visua
 
 EXAMPLE_5 = "Compare the canonical power scaling or feats of Goku, Naruto Uzumaki, and Ichigo Kurosaki at their strongest confirmed forms. Visualise destructive capability tiers. Mark the strongest based on feats only. Then apply a canonical power multiplier from their series (e.g., form transformation) and re-rank then visualise."
 
+EXAMPLE_6 = "Compare streaming numbers, Grammy wins, and Billboard Hot 100 entries of Kendrick Lamar, Drake, and J. Cole. Visualise them. Mark the statistically most awarded artist. Then find a real remix collaboration that boosted streaming numbers and model its impact across all three."
+
+EXAMPLE_7 = "Who are the 3 most likely teams to win the UEFA Champions League. rank them and use a barcart to visualise the odds."
+
 result = dispatch(
-    user_input=EXAMPLE_4,
+    user_input=EXAMPLE_7,
     turn_length=None,
     max_tokens=32768,
     model="Qwen/Qwen3-8B",
+    live=True,
     verbose=True
 )
 

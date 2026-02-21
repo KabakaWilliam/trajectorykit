@@ -22,6 +22,7 @@ def dispatch(
     temperature: Optional[float] = None,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    live: bool = False,
     _depth: int = 0,
 ) -> Dict[str, Any]:
     """
@@ -36,6 +37,7 @@ def dispatch(
         model: Model name to use (default: config.MODEL_NAME)
         reasoning_effort: Reasoning effort for supported models — "low"/"medium"/"high"
                           (default: from model profile if supported, else None)
+        live: Open a live trace viewer in the browser (default: False)
         _depth: Current recursion depth (internal — used by spawn_agent)
     
     Returns:
@@ -77,6 +79,20 @@ def dispatch(
         {"role": "user", "content": user_input}
     ]
 
+    # Start live trace server (root agent only)
+    live_server = None
+    if live and _depth == 0:
+        try:
+            from .live_trace import LiveTraceServer
+            live_server = LiveTraceServer(episode)
+            url = live_server.start()
+            if verbose:
+                print(f"\n🌐 Live trace: {url}")
+        except Exception as e:
+            if verbose:
+                print(f"\n⚠️  Live trace server failed to start: {e}")
+            live_server = None
+
     def _call_api(effective_max_tokens):
         """Build payload and call the chat completions API."""
         payload = {
@@ -89,7 +105,7 @@ def dispatch(
         }
         if reasoning_effort and profile.get("supports_reasoning_effort"):
             payload["reasoning_effort"] = reasoning_effort
-        return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
+        return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload, timeout=300)
     
     turn = 0
     total_tool_calls = 0
@@ -105,6 +121,12 @@ def dispatch(
         episode.ended_at = datetime.now().isoformat()
         episode.duration_s = round(time.time() - episode_start, 3)
         episode.compute_recursive_stats()
+        # Push final state to live viewer
+        if live_server:
+            try:
+                live_server.finalize(final_content)
+            except Exception:
+                pass
         return {
             'final_response': final_content,
             'turns': turn,
@@ -336,6 +358,8 @@ def dispatch(
                     # Continue the loop — don't finalize yet
                     turn_record.duration_s = round(time.time() - turn_start, 3)
                     episode.turns.append(turn_record)
+                    if live_server:
+                        live_server.push_turn(turn_record, depth=_depth)
                     continue
 
             # Model is truly done
@@ -349,10 +373,14 @@ def dispatch(
             
             turn_record.duration_s = round(time.time() - turn_start, 3)
             episode.turns.append(turn_record)
+            if live_server:
+                live_server.push_turn(turn_record, depth=_depth)
             return _finalize(final_content)
         
         turn_record.duration_s = round(time.time() - turn_start, 3)
         episode.turns.append(turn_record)
+        if live_server:
+            live_server.push_turn(turn_record, depth=_depth)
     
     # Return last assistant message if we hit turn limit
     final_content = ""
