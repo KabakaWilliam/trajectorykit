@@ -343,22 +343,46 @@ def execute_code_wrapper(**kwargs):
             else:
                 # Execution failed — gather as much detail as possible
                 message = sandbox_result.get("message", "")
-                run_result = sandbox_result.get("run_result", {})
+                run_result = sandbox_result.get("run_result", {}) or {}
+                run_status = run_result.get("status", "")
                 stderr = run_result.get("stderr", "")
                 stdout = run_result.get("stdout", "")
-                return_code = run_result.get("return_code", "")
+                return_code = run_result.get("return_code")
+                exec_time = run_result.get("execution_time", 0)
                 
-                error_parts = [f"ERROR: Execution failed (status: {status})"]
-                if message:
-                    error_parts.append(f"Message: {message}")
-                if return_code != "":
-                    error_parts.append(f"Return code: {return_code}")
-                if stderr:
-                    error_parts.append(f"STDERR:\n{stderr}")
-                if stdout:
-                    error_parts.append(f"STDOUT:\n{stdout}")
-                if not message and not stderr:
-                    error_parts.append("No error details provided by sandbox. Check your code for syntax errors or missing imports.")
+                # Detect specific sandbox failure modes from run_result.status
+                if run_status == "TimeLimitExceeded":
+                    run_timeout = kwargs.get("run_timeout", 5)
+                    error_parts = [
+                        f"ERROR: Time limit exceeded — your code ran for {exec_time:.1f}s and was killed (limit: {run_timeout}s).",
+                        "Your code took too long to execute. Common causes:",
+                        "- Infinite loops (while True) or very long loops",
+                        "- Blocking calls (time.sleep, input()) or network waits",
+                        "- Computationally expensive operations",
+                        "FIX: Rewrite your code to complete within the time limit. Do NOT use infinite loops in the sandbox.",
+                    ]
+                    if stdout:
+                        error_parts.append(f"Partial STDOUT before kill:\n{stdout}")
+                elif run_status == "MemoryLimitExceeded":
+                    memory_limit = kwargs.get("memory_limit_mb", 128)
+                    error_parts = [
+                        f"ERROR: Memory limit exceeded (limit: {memory_limit}MB).",
+                        "Your code used too much memory. Reduce data size or optimize memory usage.",
+                    ]
+                else:
+                    error_parts = [f"ERROR: Execution failed (status: {status})"]
+                    if run_status:
+                        error_parts.append(f"Run status: {run_status}")
+                    if message:
+                        error_parts.append(f"Message: {message}")
+                    if return_code is not None:
+                        error_parts.append(f"Return code: {return_code}")
+                    if stderr:
+                        error_parts.append(f"STDERR:\n{stderr}")
+                    if stdout:
+                        error_parts.append(f"STDOUT:\n{stdout}")
+                    if not message and not stderr and not run_status:
+                        error_parts.append("No error details provided by sandbox. Check your code for syntax errors or missing imports.")
                 
                 return "\n".join(error_parts), None
         
