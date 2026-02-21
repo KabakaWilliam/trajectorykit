@@ -75,7 +75,7 @@ EXAMPLE_10 = """Of the authors (First M. Last) that worked on the paper "Pie Men
 result = dispatch(
     user_input=EXAMPLE_8,
     turn_length=None,
-    model="Qwen/Qwen3-8B", #"openai/gpt-oss-20b", "Qwen/Qwen3-8B"
+    model="openai/gpt-oss-20b", #"openai/gpt-oss-20b", "Qwen/Qwen3-8B"
     reasoning_effort="high",
     verbose=True
 )
