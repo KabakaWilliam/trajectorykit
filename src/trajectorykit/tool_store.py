@@ -471,7 +471,48 @@ def search_available_tools_wrapper(**kwargs):
         return f"ERROR: {str(e)}", None
 
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
+def recall_wrapper(scratchpad: dict, **kwargs):
+    """Retrieve data from the scratchpad. Returns (output, None)."""
+    try:
+        key = kwargs.get("key")
+        query = kwargs.get("query")
+
+        if not scratchpad:
+            return "Scratchpad is empty. No data has been stored yet.", None
+
+        if key:
+            # Exact key lookup
+            if key in scratchpad:
+                return scratchpad[key], None
+            available = ", ".join(scratchpad.keys())
+            return f"No entry for '{key}'. Available keys: {available}", None
+
+        if query:
+            # Substring search across all stored values
+            query_lower = query.lower()
+            matches = []
+            for k, v in scratchpad.items():
+                idx = v.lower().find(query_lower)
+                if idx != -1:
+                    start = max(0, idx - 50)
+                    end = min(len(v), idx + len(query) + 100)
+                    snippet = v[start:end]
+                    matches.append(f"  {k}: ...{snippet}...")
+            if matches:
+                return f"Found '{query}' in {len(matches)} entries:\n" + "\n".join(matches), None
+            available = ", ".join(scratchpad.keys())
+            return f"No entries contain '{query}'. Available keys: {available}", None
+
+        # No args — list all keys with previews
+        lines = []
+        for k, v in scratchpad.items():
+            lines.append(f"  {k} ({len(v)} chars): {v[:80]}...")
+        return "Stored data:\n" + "\n".join(lines), None
+    except Exception as e:
+        return f"ERROR: {str(e)}", None
+
+
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, scratchpad: Optional[dict] = None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -482,6 +523,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         _depth: Current recursion depth (injected by the agent loop, invisible to the model)
         model: Model name to propagate to sub-agents
         reasoning_effort: Reasoning effort level to propagate to sub-agents
+        scratchpad: Shared scratchpad dict for storing/retrieving large outputs
     
     Returns:
         Tuple of (output_string, child_trace) where child_trace is an
@@ -499,6 +541,8 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, **tool_args)
     elif tool_name == "search_available_tools":
         return search_available_tools_wrapper(**tool_args)
+    elif tool_name == "recall":
+        return recall_wrapper(scratchpad=scratchpad or {}, **tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
 
@@ -727,6 +771,33 @@ TOOLS = [
                             "Name of a specific tool to get its full schema. "
                             "Omit to list all available tools with short descriptions."
                         )
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "Retrieve data from the scratchpad. Large tool outputs are automatically "
+                "stored here to keep your context clean. "
+                "Call with no args to list all stored keys with previews. "
+                "Call with key to retrieve a specific entry. "
+                "Call with query to search across all stored values by substring."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Exact key name to retrieve (shown in [Stored as 'key'] receipts)"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Substring to search for across all stored values"
                     }
                 },
                 "required": []

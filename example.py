@@ -1,6 +1,6 @@
 from trajectorykit import dispatch
 
-EXAMPLE_1 = "Compare the stats of Blue Eyes White Dragon vs Dark Magician vs TimeWizard Yu-Gi-Oh cards and visualise them. Put a star on the strongest monster. Next look up a spell card that when applied to each card, would make it the strongest. Do not make this up please. visualise this monster + card combination."
+EXAMPLE_1 = "Compare the stats of Blue Eyes White Dragon vs Dark Magician vs TimeWizard Yu-Gi-Oh cards and visualise them. Put a star on the strongest monster. Next look up a spell card that when applied to each card, would make it the strongest. This card can be different per monster. Do not make this up please. visualise this monster + spell card combination indicating which card was used."
 
 EXAMPLE_2 = "What is the general consensus on George RR Martin releasing the Winds of Winter this year? If it's not this year, then what year is the most likely then according to what you find out there."
 
@@ -71,8 +71,9 @@ ATK Calculation:
 Final Damage:
 """
 
+EXAMPLE_10 = """Of the authors (First M. Last) that worked on the paper "Pie Menus or Linear Menus, Which Is Better?" in 2015, what was the title of the first paper authored by the one that had authored prior papers?"""
 result = dispatch(
-    user_input=EXAMPLE_3,
+    user_input=EXAMPLE_8,
     turn_length=None,
     model="Qwen/Qwen3-8B", #"openai/gpt-oss-20b", "Qwen/Qwen3-8B"
     reasoning_effort="high",

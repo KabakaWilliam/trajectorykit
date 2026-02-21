@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, TOKEN_SAFETY_MARGIN, get_model_profile
+from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, SUB_AGENT_SYSTEM_PROMPT, TOKEN_SAFETY_MARGIN, MAX_INLINE_CHARS, get_model_profile
 from .tool_store import TOOLS, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
 
@@ -76,10 +76,15 @@ def dispatch(
     )
     episode_start = time.time()
     
+    # Use a lean worker prompt for sub-agents, full orchestrator prompt for root
+    system_prompt = SYSTEM_PROMPT if _depth == 0 else SUB_AGENT_SYSTEM_PROMPT
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_input}
     ]
+
+    # Scratchpad: auto-stores large tool outputs, retrievable via recall() tool
+    scratchpad = {}
 
     def _call_api(effective_max_tokens):
         """Build payload and call the chat completions API."""
@@ -212,7 +217,7 @@ def dispatch(
                 tc_start = time.time()
                 child_trace = None
                 try:
-                    output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort)
+                    output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, scratchpad=scratchpad)
                     if verbose and len(output) < 200:
                         print(f"       → {output}")
                     elif verbose:
@@ -244,7 +249,7 @@ def dispatch(
                     consecutive_error_count = 0
                     last_error_signature = None
                 
-                # Record tool call in trace
+                # Record tool call in trace (always stores full output)
                 tc_record = ToolCallRecord(
                     tool_name=tool_name,
                     tool_args=tool_args,
@@ -262,6 +267,16 @@ def dispatch(
                     r"\1[file content saved to trace]\2",
                     output, flags=re.DOTALL
                 )
+                
+                # Auto-store large outputs to scratchpad to keep context lean
+                if len(msg_output) > MAX_INLINE_CHARS:
+                    store_key = f"{tool_name}_t{turn}_{i}"
+                    scratchpad[store_key] = msg_output
+                    preview = msg_output[:200].replace('\n', ' ')
+                    msg_output = f"[Stored as '{store_key}'] ({len(scratchpad[store_key])} chars) Preview: {preview}..."
+                    if verbose:
+                        print(f"       📦 Auto-stored to scratchpad as '{store_key}'")
+                
                 tool_message = {
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
@@ -305,7 +320,7 @@ def dispatch(
                             tc_start = time.time()
                             child_trace = None
                             try:
-                                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort)
+                                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, scratchpad=scratchpad)
                                 if verbose and len(output) < 200:
                                     print(f"       → {output}")
                                 elif verbose:
@@ -332,6 +347,16 @@ def dispatch(
                                 r"\1[file content saved to trace]\2",
                                 output, flags=re.DOTALL
                             )
+                            
+                            # Auto-store large outputs to scratchpad
+                            if len(msg_output) > MAX_INLINE_CHARS:
+                                store_key = f"{tool_name}_t{turn}_{idx}"
+                                scratchpad[store_key] = msg_output
+                                preview = msg_output[:200].replace('\n', ' ')
+                                msg_output = f"[Stored as '{store_key}'] ({len(scratchpad[store_key])} chars) Preview: {preview}..."
+                                if verbose:
+                                    print(f"       📦 Auto-stored to scratchpad as '{store_key}'")
+                            
                             tool_message = {
                                 "role": "tool",
                                 "tool_call_id": fake_id,
