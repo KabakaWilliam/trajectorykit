@@ -1,0 +1,66 @@
+# ═══════════════════════════════════════════════════════════════════════
+# trajectorykit — default configuration
+# ═══════════════════════════════════════════════════════════════════════
+# Copy this file to create experiment-specific configs:
+#   cp configs/default.yaml configs/experiments/my_experiment.yaml
+#
+# Usage:
+#   python evals/eval.py --config configs/default.yaml
+#   python evals/eval.py --config configs/experiments/my_experiment.yaml
+
+# ── Model ──────────────────────────────────────────────────────────────
+model:
+  name: "Qwen/Qwen3-8B"
+  api_url: "http://localhost:3030/v1"
+
+# ── Agent behavior ─────────────────────────────────────────────────────
+agent:
+  max_recursion_depth: 1
+  sub_agent_turn_budget: 15
+  token_safety_margin: 256
+
+# ── Sandbox ────────────────────────────────────────────────────────────
+sandbox:
+  url: "http://localhost:8080/run_code"
+
+# ── Traces ─────────────────────────────────────────────────────────────
+traces:
+  dir: "traces/"         # relative to repo root
+
+# ── Prompts (file paths relative to repo root) ─────────────────────────
+prompts:
+  orchestrator: "configs/prompts/orchestrator.txt"
+  worker: "configs/prompts/worker.txt"
+
+# ── Model profiles ─────────────────────────────────────────────────────
+# Each model's capabilities and defaults. Add new models here.
+model_profiles:
+  "Qwen/Qwen3-8B":
+    context_window: 32768
+    supports_reasoning_effort: false
+    default_temperature: 0.7
+
+  "openai/gpt-oss-20b":
+    context_window: 131072
+    supports_reasoning_effort: true
+    default_reasoning_effort: "high"
+    default_temperature: 1.0
+
+default_profile:
+  context_window: 32768
+  supports_reasoning_effort: false
+  default_temperature: 0.7
+
+# ── Dataset (used by eval.py) ──────────────────────────────────────────
+dataset:
+  name: "google/deepsearchqa"
+  split: "eval"
+  sample_n: 50               # random sample of N rows (null = use full dataset)
+  seed: 42                    # random seed for reproducible sampling
+
+# ── Eval settings ──────────────────────────────────────────────────────
+eval:
+  turn_length: null              # null = unlimited
+  reasoning_effort: "high"
+  verbose: true
+  output_dir: null               # null = auto-generate from model + dataset

@@ -1,0 +1,50 @@
+# Experiment: GPT-OSS-20B on DeepSearchQA
+# Usage: python evals/eval.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
+
+model:
+  name: "openai/gpt-oss-20b"
+  api_url: "http://localhost:3030/v1"
+
+agent:
+  max_recursion_depth: 1
+  sub_agent_turn_budget: 15
+  token_safety_margin: 256
+
+sandbox:
+  url: "http://localhost:8080/run_code"
+
+traces:
+  dir: "traces/"
+
+prompts:
+  orchestrator: "configs/prompts/orchestrator.txt"
+  worker: "configs/prompts/worker.txt"
+
+model_profiles:
+  "Qwen/Qwen3-8B":
+    context_window: 32768
+    supports_reasoning_effort: false
+    default_temperature: 0.7
+
+  "openai/gpt-oss-20b":
+    context_window: 131072
+    supports_reasoning_effort: true
+    default_reasoning_effort: "high"
+    default_temperature: 1.0
+
+default_profile:
+  context_window: 32768
+  supports_reasoning_effort: false
+  default_temperature: 0.7
+
+dataset:
+  name: "google/deepsearchqa"
+  split: "eval"
+  sample_n: 50
+  seed: 42
+
+eval:
+  turn_length: null
+  reasoning_effort: "high"
+  verbose: true
+  output_dir: null
