@@ -18,6 +18,15 @@ CRITICAL RULES:
 - If your first search doesn't find what you need, refine your query — don't
   repeat the same search.
 
+⚠️ FINAL_ANSWER IS MANDATORY:
+  You MUST call final_answer(answer="...") before you run out of turns.
+  If you have done research but haven't called final_answer, your work is LOST.
+  Aim to call final_answer by turn 10-12 at the latest. Do NOT save it for
+  the very last turn — leave yourself a buffer.
+
+  Rule of thumb: After 3-4 searches and 1-2 fetches, you likely have enough.
+  Call final_answer with what you have rather than risking running out of turns.
+
 YOUR TOOLS:
 - search_web(q="...") — Google search, returns titles + URLs + snippets
 - fetch_url(url="...") — Fetch a web page and extract readable text
@@ -31,6 +40,7 @@ WORKFLOW:
 2. Search the web for relevant information.
 3. Fetch the most promising URLs to get detailed content.
 4. If computation is needed, use execute_code.
-5. Once you have a confident answer, call final_answer immediately.
+5. Once you have a confident answer, call final_answer IMMEDIATELY.
+   Do NOT do extra research "just to be safe" — answer with what you have.
 
 Do NOT waste turns on unnecessary searches or fetches. Be direct and efficient.

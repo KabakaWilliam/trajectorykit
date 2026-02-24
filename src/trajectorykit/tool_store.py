@@ -63,61 +63,75 @@ def search_web(q: str, num_results: int = 5) -> str:
         "gl": "us",
     }
     
-    try:
-        logger.info(f"Executing search query: {q}")
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Check for API errors
-        if "error" in data:
-            return f"Search API Error: {data.get('error', 'Unknown error')}"
-        
-        # Extract organic results
-        results = data.get("organic_results", [])
-        
-        if not results:
-            return f"No results found for query: {q}"
-        
-        # Format results for readability
-        formatted_results = f"Search Results for '{q}':\n\n"
-        for i, result in enumerate(results[:num_results], 1):
-            title = result.get("title", "No title")
-            link = result.get("link", "No link")
-            snippet = result.get("snippet", "No snippet")
-            formatted_results += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
-        
-        logger.info(f"Successfully retrieved {len(results[:num_results])} search results")
-        return formatted_results
-        
-    except requests.exceptions.Timeout:
-        error_msg = f"Search timeout: Query '{q}' took too long to complete"
-        logger.error(error_msg)
-        return error_msg
-    except requests.exceptions.ConnectionError:
-        error_msg = "Search error: Could not connect to SerpAPI. Check internet connection."
-        logger.error(error_msg)
-        return error_msg
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            return "Search error: Invalid API key. Check SERPAPI_KEY."
-        elif e.response.status_code == 403:
-            return "Search error: API key not authorized for this request."
-        elif e.response.status_code == 429:
-            return "Search error: Rate limit exceeded. Please try again later."
-        else:
-            error_msg = f"Search HTTP error {e.response.status_code}"
+    SEARCH_TIMEOUT = 25  # seconds — complex quoted queries need more time
+    MAX_SEARCH_RETRIES = 2
+    
+    last_error = None
+    for attempt in range(MAX_SEARCH_RETRIES + 1):
+        try:
+            logger.info(f"Executing search query (attempt {attempt+1}): {q}")
+            response = requests.get(url, params=params, timeout=SEARCH_TIMEOUT)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Check for API errors
+            if "error" in data:
+                return f"Search API Error: {data.get('error', 'Unknown error')}"
+            
+            # Extract organic results
+            results = data.get("organic_results", [])
+            
+            if not results:
+                return f"No results found for query: {q}"
+            
+            # Format results for readability
+            formatted_results = f"Search Results for '{q}':\n\n"
+            for i, result in enumerate(results[:num_results], 1):
+                title = result.get("title", "No title")
+                link = result.get("link", "No link")
+                snippet = result.get("snippet", "No snippet")
+                formatted_results += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+            
+            logger.info(f"Successfully retrieved {len(results[:num_results])} search results")
+            return formatted_results
+            
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Search timeout: Query '{q}' timed out after {SEARCH_TIMEOUT}s. "
+                "TIP: Simplify your query — remove quoted phrases, reduce to key terms, "
+                "or split into multiple simpler searches."
+            )
+            logger.warning(f"Search timeout (attempt {attempt+1}/{MAX_SEARCH_RETRIES+1}): {q}")
+            if attempt < MAX_SEARCH_RETRIES:
+                time.sleep(1 * (attempt + 1))  # linear backoff: 1s, 2s
+                continue
+            return last_error
+        except requests.exceptions.ConnectionError:
+            error_msg = "Search error: Could not connect to SerpAPI. Check internet connection."
             logger.error(error_msg)
             return error_msg
-    except json.JSONDecodeError:
-        error_msg = "Search error: Invalid JSON response from API"
-        logger.error(error_msg)
-        return error_msg
-    except Exception as e:
-        error_msg = f"Search error: {type(e).__name__}: {str(e)}"
-        logger.error(error_msg)
-        return error_msg
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                return "Search error: Invalid API key. Check SERPAPI_KEY."
+            elif e.response.status_code == 403:
+                return "Search error: API key not authorized for this request."
+            elif e.response.status_code == 429:
+                return "Search error: Rate limit exceeded. Please try again later."
+            else:
+                error_msg = f"Search HTTP error {e.response.status_code}"
+                logger.error(error_msg)
+                return error_msg
+        except json.JSONDecodeError:
+            error_msg = "Search error: Invalid JSON response from API"
+            logger.error(error_msg)
+            return error_msg
+        except Exception as e:
+            error_msg = f"Search error: {type(e).__name__}: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+    
+    return last_error or "Search error: Unknown failure after retries"
 
 def fetch_url(url: str, max_chars: int = 8000) -> str:
     """Fetch and extract readable text from a URL."""
@@ -148,6 +162,7 @@ def spawn_agent(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     _depth: int = 0,
+    _sandbox_files: Optional[dict] = None,
 ) -> ToolReturn:
     """
     Spawn a sub-agent to handle a subtask. Calls dispatch() recursively.
@@ -186,6 +201,7 @@ def spawn_agent(
         model=model,
         reasoning_effort=reasoning_effort,
         _depth=_depth + 1,       # increment depth for recursive calls
+        _sandbox_files=_sandbox_files,
     )
 
     # Extract child trace from the result
@@ -447,7 +463,7 @@ def search_web_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, **kwargs):
+def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, **kwargs):
     """Wrapper for spawn_agent tool. Injects _depth, _model, _reasoning_effort from the parent dispatch loop.
     Returns (output_str, child_trace) where child_trace is an EpisodeTrace."""
     try:
@@ -465,6 +481,7 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
             model=_model,
             reasoning_effort=_reasoning_effort,
             _depth=_depth,
+            _sandbox_files=_sandbox_files,
         )
         return output, child_trace
     except Exception as e:
@@ -544,7 +561,7 @@ def read_pdf_wrapper(**kwargs):
     
 
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -555,12 +572,19 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         _depth: Current recursion depth (injected by the agent loop, invisible to the model)
         model: Model name to propagate to sub-agents
         reasoning_effort: Reasoning effort level to propagate to sub-agents
+        _sandbox_files: Files to auto-inject into every execute_code sandbox call.
+                        Dict of {filename: base64_content}. Merged with model-provided files.
     
     Returns:
         Tuple of (output_string, child_trace) where child_trace is an
         EpisodeTrace if the tool was spawn_agent, otherwise None.
     """
     if tool_name == "execute_code":
+        # Merge framework-injected sandbox files with any model-provided files
+        if _sandbox_files:
+            model_files = tool_args.get("files") or {}
+            merged = {**_sandbox_files, **model_files}  # model files take precedence
+            tool_args = {**tool_args, "files": merged}
         return execute_code_wrapper(**tool_args)
     elif tool_name == "get_current_time":
         return get_current_time_wrapper(**tool_args)
@@ -569,7 +593,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
-        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, **tool_args)
+        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, **tool_args)
     elif tool_name == "final_answer":
         return final_answer_wrapper(**tool_args)
     elif tool_name == "search_available_tools":

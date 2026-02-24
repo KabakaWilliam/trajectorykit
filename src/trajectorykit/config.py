@@ -159,7 +159,7 @@ def _update_module_constants():
     global MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, TOKEN_SAFETY_MARGIN
     global CONTEXT_WINDOW, TRACES_DIR
     global MODEL_PROFILES, _DEFAULT_PROFILE
-    global SYSTEM_PROMPT, WORKER_PROMPT
+    global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
 
     c = _config
@@ -194,8 +194,10 @@ def _update_module_constants():
     # Prompts
     orchestrator_path = c.get("prompts", {}).get("orchestrator", "configs/prompts/orchestrator.txt")
     worker_path = c.get("prompts", {}).get("worker", "configs/prompts/worker.txt")
+    synthesizer_path = c.get("prompts", {}).get("synthesizer", "configs/prompts/synthesizer.txt")
     SYSTEM_PROMPT = _load_prompt(orchestrator_path)
     WORKER_PROMPT = _load_prompt(worker_path)
+    SYNTHESIZER_PROMPT = _load_prompt(synthesizer_path)
 
     # Dataset & eval (new — used by eval.py)
     DATASET_CONFIG = c.get("dataset", {})
