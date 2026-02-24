@@ -71,11 +71,16 @@ ATK Calculation:
 Final Damage:
 """
 
+EXAMPLE_10 = """	From 2020 to 2050, how many elderly people will there be in Japan? What is their consumption potential across various aspects such as clothing, food, housing, and transportation? Based on population projections, elderly consumer willingness, and potential changes in their consumption habits, please produce a market size analysis report for the elderly demographic."""
+
+
+EXAMPLE_11 = "I went on a three-day trip, starting in Cape Kiwanda on the first day, traveling to Shoshone Falls Park on the second day, and arriving at the American Heritage Center on the third day. I remember seeing some type of shrew that is apparently endemic to one of the areas we were in, but I can't remember its scientific name. It was at least 150 mm long. What was the scientific name of the one I am trying to remember? Use animalia.bio to source the info."
+
 result = dispatch(
-    user_input=EXAMPLE_3,
+    user_input=EXAMPLE_11,
     turn_length=None,
     model="Qwen/Qwen3-8B", #"openai/gpt-oss-20b", "Qwen/Qwen3-8B"
-    reasoning_effort="high",
+    # reasoning_effort="high",
     verbose=True
 )
 

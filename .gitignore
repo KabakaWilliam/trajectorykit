@@ -9,3 +9,5 @@ __pycache__/
 CI_demo.md
 serve_vllm_oss.sh
 data
+demo
+evals

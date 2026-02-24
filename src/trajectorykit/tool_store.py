@@ -1,7 +1,8 @@
 import requests
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional,Tuple, Union
 from .utils import SUPPORTED_LANGUAGES, API_TIMEOUT, MAX_RETRIES, INITIAL_RETRY_DELAY
 from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW
+from .tracing import EpisodeTrace  # adjust import path to wherever EpisodeTrace lives
 import logging
 import os
 import threading
@@ -10,6 +11,7 @@ import traceback
 import uuid
 import json
 from datetime import datetime
+
 
 # Load environment variables from .env file
 try:
@@ -20,6 +22,8 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+ToolReturn = Tuple[str, Optional[EpisodeTrace]]
 
 
 # Define tool implementations
@@ -115,7 +119,25 @@ def search_web(q: str, num_results: int = 5) -> str:
         logger.error(error_msg)
         return error_msg
 
-# tool_store.py — add alongside execute_code
+def fetch_url(url: str, max_chars: int = 8000) -> str:
+    """Fetch and extract readable text from a URL."""
+    import httpx
+    from bs4 import BeautifulSoup
+    resp = httpx.get(url, timeout=15, follow_redirects=True)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+    return text[:max_chars]
+
+def read_pdf(url: str, max_chars: int = 8000) -> str:
+    """Download and extract text from a PDF at a URL."""
+    import httpx, io
+    import pypdf
+    resp = httpx.get(url, timeout=30)
+    reader = pypdf.PdfReader(io.BytesIO(resp.content))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    return text[:max_chars]
 
 def spawn_agent(
     task: str,
@@ -126,7 +148,7 @@ def spawn_agent(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     _depth: int = 0,
-) -> str:
+) -> ToolReturn:
     """
     Spawn a sub-agent to handle a subtask. Calls dispatch() recursively.
     Returns the sub-agent's final response as a string.
@@ -147,6 +169,7 @@ def spawn_agent(
             "response": f"[RECURSION LIMIT] Depth {_depth} reached (max {MAX_RECURSION_DEPTH}). Cannot spawn further sub-agents.",
             "turns_used": 0,
             "tool_calls_made": 0,
+            "depth": _depth + 1,
         }), None
 
     full_input = f"{context}\n\nTASK: {task}" if context else task
@@ -447,6 +470,13 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
+def final_answer_wrapper(**kwargs):
+    """Wrapper for final_answer tool. Returns the answer text directly.
+    The agent loop treats this tool call as the termination signal."""
+    answer = kwargs.get("answer", "")
+    return answer or "", None
+
+
 def search_available_tools_wrapper(**kwargs):
     """Wrapper for search_available_tools. Returns (output, None)."""
     try:
@@ -458,17 +488,60 @@ def search_available_tools_wrapper(**kwargs):
                     return json.dumps(tool, indent=2), None
             return f"ERROR: No tool named '{tool_name}'. Call search_available_tools with no arguments to see all available tools.", None
         else:
-            # Return compact summary: name + description for each tool
+            # Return compact signature + one-liner for each tool
             summary = []
             for tool in TOOLS:
                 func = tool["function"]
                 name = func["name"]
-                desc = func["description"].split('\n')[0]  # first line only
-                required = func.get("parameters", {}).get("required", [])
-                summary.append(f"- {name} (required args: {required})\n  {desc}")
+                # Build a compact signature: name(param: type, param?: type=default, ...)
+                params = func.get("parameters", {}).get("properties", {})
+                required = set(func.get("parameters", {}).get("required", []))
+                parts = []
+                for pname, pschema in params.items():
+                    ptype = pschema.get("type", "any")
+                    default = pschema.get("default")
+                    if pname in required:
+                        parts.append(f"{pname}: {ptype}")
+                    elif default is not None:
+                        parts.append(f"{pname}?: {ptype}={default}")
+                    else:
+                        parts.append(f"{pname}?: {ptype}")
+                sig = ", ".join(parts)
+                # First sentence of description (split on '. ' to get a real sentence)
+                raw_desc = func["description"].replace('\n', ' ')
+                first_sentence = raw_desc.split('. ')[0].strip().rstrip('.')
+                summary.append(f"- {name}({sig})\n  {first_sentence}.")
             return "Available tools:\n\n" + "\n\n".join(summary), None
     except Exception as e:
         return f"ERROR: {str(e)}", None
+    
+def fetch_url_wrapper(**kwargs):
+    """Wrapper for fetch_url tool. Returns (output, None)."""
+    try:
+        url = kwargs.get("url")
+        if not url:
+            return "ERROR: 'url' parameter is required", None
+
+        max_chars = kwargs.get("max_chars", 8000)
+        text = fetch_url(url=url, max_chars=max_chars)
+        return text, None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
+def read_pdf_wrapper(**kwargs):
+    """Wrapper for read_pdf tool. Returns (output, None)."""
+    try:
+        url = kwargs.get("url")
+        if not url:
+            return "ERROR: 'url' parameter is required", None
+
+        max_chars = kwargs.get("max_chars", 8000)
+        text = read_pdf(url=url, max_chars=max_chars)
+        return text, None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+    
 
 
 def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
@@ -497,8 +570,14 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
         return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, **tool_args)
+    elif tool_name == "final_answer":
+        return final_answer_wrapper(**tool_args)
     elif tool_name == "search_available_tools":
         return search_available_tools_wrapper(**tool_args)
+    elif tool_name == "fetch_url":
+        return fetch_url_wrapper(**tool_args)
+    elif tool_name == "read_pdf":
+        return read_pdf_wrapper(**tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
 
@@ -590,6 +669,56 @@ TOOLS = [
                 }
             },
             "required": ["completion"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "fetch_url",
+        "description": (
+            "Fetch a web page by URL and extract readable text content (HTML cleaned). "
+            "Use this after finding a relevant link via search_web, to pull the page text into context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch (http/https)."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum number of characters of extracted text to return (default: 8000).",
+                    "default": 8000
+                }
+            },
+            "required": ["url"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "read_pdf",
+        "description": (
+            "Download a PDF from a URL and extract its text content. "
+            "Use this when a search result is a PDF (papers, reports)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Direct URL to a PDF file."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum number of characters of extracted text to return (default: 8000).",
+                    "default": 8000
+                }
+            },
+            "required": ["url"]
         }
     }
 },
@@ -705,6 +834,27 @@ TOOLS = [
                     }
                 },
                 "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "final_answer",
+            "description": (
+                "Submit your final answer to the user. You MUST call this tool when you are ready "
+                "to deliver your response. Do NOT produce a plain text response — always use this tool. "
+                "Put your complete, well-formatted answer in the 'answer' parameter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": "Your complete final answer to the user's question or task."
+                    }
+                },
+                "required": ["answer"]
             }
         }
     },
