@@ -205,6 +205,7 @@ def dispatch(
     turn = 0
     total_tool_calls = 0
     consecutive_error_count = 0
+    consecutive_no_tool_count = 0  # Tracks successive responses with no tool calls
     last_error_signature = None
     MAX_CONSECUTIVE_ERRORS = 3  # Break retry loops after 3 identical failures
     
@@ -427,27 +428,43 @@ def dispatch(
         # Process them, and if any call is final_answer → terminate.
         tool_calls_in_msg = assistant_message.get("tool_calls") or []
         if not tool_calls_in_msg:
-            # Shouldn't happen with tool_choice="required", but handle gracefully.
-            # Treat any content as a final answer.
+            # Shouldn't happen with tool_choice="required", but vLLM's tool-call
+            # parser sometimes fails to extract calls from the model output,
+            # returning empty tool_calls with content text instead.
+            # Nudge the model to retry with a proper tool call.
+            # Only give up and finalize after repeated failures.
+            consecutive_no_tool_count += 1
+            
             final_content = assistant_message.get("content", "") or ""
-            if final_content.strip():
+            
+            if consecutive_no_tool_count >= 3:
+                # Model keeps refusing to use tools — accept whatever it gave us
                 if verbose:
-                    print(f"✅ Model produced text without tool calls (unexpected with required)")
-                    print(f"\n📝 Final Response:\n{final_content}")
+                    print(f"⚠️  Model produced text without tool calls {consecutive_no_tool_count}x in a row — accepting as final answer")
+                    if final_content.strip():
+                        print(f"\n📝 Final Response:\n{final_content[:300]}")
                 turn_record.duration_s = round(time.time() - turn_start, 3)
                 episode.turns.append(turn_record)
                 return _finalize(final_content)
             else:
-                # Empty response with no tool calls — nudge and continue
+                # Nudge model to call a tool
                 if verbose:
-                    print(f"⚠️  Empty response with no tool calls — nudging model")
+                    print(f"⚠️  No tool calls returned (attempt {consecutive_no_tool_count}/3) — nudging model to use tools")
                 messages.append({
                     "role": "user",
-                    "content": "Your response was empty. Call the `search_available_tools` tool to get all the tools you need or call `final_answer` tool with your response."
+                    "content": (
+                        "You must call a tool. Your previous response contained only text "
+                        "with no tool calls. Either call a research tool (search_web, "
+                        "execute_code, fetch_url, search_available_tools) to continue working, or call `final_answer` "
+                        "with your complete answer if you are done."
+                    )
                 })
                 turn_record.duration_s = round(time.time() - turn_start, 3)
                 episode.turns.append(turn_record)
                 continue
+        else:
+            # Reset counter on successful tool call
+            consecutive_no_tool_count = 0
 
         total_tool_calls += len(tool_calls_in_msg)
         if verbose:
