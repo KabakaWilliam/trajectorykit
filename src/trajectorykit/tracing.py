@@ -631,7 +631,14 @@ def _render_tool_block(tc: dict) -> str:
 
     # Output / result
     if display_output.strip():
-        is_error = "error" in display_output.lower()[:80] or "traceback" in display_output.lower()[:80]
+        # Detect actual errors — but not DDG fallback results or search results
+        # that merely mention the word "error" in their content.
+        _lower_head = display_output.lower()[:80]
+        is_error = (
+            _lower_head.startswith("error:") or
+            _lower_head.startswith("err:") or
+            "traceback" in _lower_head
+        )
         result_cls = "tool-error" if is_error else "tool-result"
         parts.append(f'<div class="{result_cls}">')
         parts.append(f'<div style="font-size:9px;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">{"Error" if is_error else "Result"}</div>')

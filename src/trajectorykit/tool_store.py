@@ -203,13 +203,14 @@ def _search_serpapi(q: str, num_results: int = 5) -> str:
 def _search_ddg(q: str, num_results: int = 5) -> str:
     """Fallback search via DuckDuckGo (no API key needed)."""
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        return "Search error: duckduckgo-search package not installed. Run: pip install duckduckgo-search"
+        return "Search error: duckduckgo-search package not installed. Run: pip install ddgs"
 
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(q, max_results=min(num_results, 10)))
+        # with DDGS() as ddgs:
+            # results = list(ddgs.text(q, max_results=min(num_results, 10)))
+        results = DDGS().text(q, max_results=min(num_results, 10))
 
         if not results:
             return f"No results found for query: {q}"
@@ -272,7 +273,9 @@ def search_web(q: str, num_results: int = 5) -> str:
         if ddg_result.startswith("Search error:") or ddg_result.startswith("DDG search error:"):
             # DDG also failed — return both errors
             return f"{primary_error}\n[DDG fallback also failed: {ddg_result}]"
-        return f"[DDG fallback — primary search unavailable: {primary_error}]\n{ddg_result}"
+        # Return clean results — the model doesn't need to know about the fallback.
+        # The switch is logged above for traceability.
+        return ddg_result
 
     return result
 
