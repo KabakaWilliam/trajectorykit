@@ -447,18 +447,31 @@ def dispatch(
                 episode.turns.append(turn_record)
                 return _finalize(final_content)
             else:
-                # Nudge model to call a tool
+                # Nudge model to call a tool — include its own content so it can
+                # wrap it in final_answer without losing it.
                 if verbose:
                     print(f"⚠️  No tool calls returned (attempt {consecutive_no_tool_count}/3) — nudging model to use tools")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You must call a tool. Your previous response contained only text "
-                        "with no tool calls. Either call a research tool (search_web, "
-                        "execute_code, fetch_url, search_available_tools) to continue working, or call `final_answer` "
-                        "with your complete answer if you are done."
+                # Truncate very long content to avoid blowing up context
+                content_echo = final_content[:3000] if final_content.strip() else ""
+                if content_echo:
+                    nudge = (
+                        "Your previous response contained your answer as plain text but "
+                        "without a tool call. You MUST call a tool.\n\n"
+                        "If the response below IS your final answer, call `final_answer` now "
+                        "and COPY YOUR COMPLETE ANSWER into the `answer` parameter — do NOT "
+                        "leave it empty.\n\n"
+                        "If you still need to research, call a research tool instead.\n\n"
+                        f"YOUR PREVIOUS RESPONSE (for reference):\n{content_echo}"
                     )
-                })
+                else:
+                    nudge = (
+                        "Your response was empty with no tool calls. "
+                        "Either call a research tool (search_web, execute_code, fetch_url) "
+                        "to continue working, or call `final_answer` with your complete answer."
+                        "If you're unsure what tools are available or how to use them, "
+                        "call `search_available_tools` to see all options and their parameters."
+                    )
+                messages.append({"role": "user", "content": nudge})
                 turn_record.duration_s = round(time.time() - turn_start, 3)
                 episode.turns.append(turn_record)
                 continue
@@ -491,6 +504,37 @@ def dispatch(
             # ── Check for final_answer ────────────────────────────────
             if tool_name == "final_answer":
                 final_content = tool_args.get("answer", "")
+                
+                # Backfill: if the model called final_answer with an empty/trivial
+                # answer, it likely already wrote its real answer as plain text in
+                # a previous turn. Scan backwards for the most recent substantive
+                # assistant content.
+                if len(final_content.strip()) < 20:
+                    _NON_ANSWER_PREFIXES = (
+                        "i should", "i'll", "i need", "i will", "let me",
+                        "okay", "ok,", "ok ", "sure", "now i",
+                        "let's", "alright",
+                    )
+                    _STRUCTURE_SIGNALS = ("|", "#", "- ", "1.", "1)", "{", "**")
+                    
+                    for msg in reversed(messages):
+                        if msg.get("role") != "assistant":
+                            continue
+                        candidate = (msg.get("content") or "").strip()
+                        if len(candidate) < 100:
+                            continue
+                        # Skip meta-commentary
+                        lower = candidate[:40].lower()
+                        if any(lower.startswith(p) for p in _NON_ANSWER_PREFIXES):
+                            continue
+                        # Prefer structured content (tables, headers, lists, JSON)
+                        has_structure = any(s in candidate[:500] for s in _STRUCTURE_SIGNALS)
+                        if has_structure or len(candidate) > 200:
+                            final_content = candidate
+                            if verbose:
+                                print(f"   ↩️  Backfilled empty final_answer from prior response ({len(candidate)} chars)")
+                            break
+                
                 tc_record = ToolCallRecord(
                     tool_name=tool_name,
                     tool_args=tool_args,

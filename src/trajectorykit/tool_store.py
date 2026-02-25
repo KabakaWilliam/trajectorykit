@@ -200,26 +200,81 @@ def _search_serpapi(q: str, num_results: int = 5) -> str:
     return last_error or "Search error: Unknown failure after retries"
 
 
+def _search_ddg(q: str, num_results: int = 5) -> str:
+    """Fallback search via DuckDuckGo (no API key needed)."""
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return "Search error: duckduckgo-search package not installed. Run: pip install duckduckgo-search"
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(q, max_results=min(num_results, 10)))
+
+        if not results:
+            return f"No results found for query: {q}"
+
+        formatted = f"Search Results for '{q}':\n\n"
+        for i, r in enumerate(results[:num_results], 1):
+            title = r.get("title", "No title")
+            link = r.get("href", r.get("link", "No link"))
+            snippet = r.get("body", r.get("snippet", "No snippet"))
+            formatted += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+
+        logger.info(f"DDG fallback returned {len(results[:num_results])} results for: {q}")
+        return formatted
+
+    except Exception as e:
+        error_msg = f"DDG search error: {type(e).__name__}: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+
+# Error patterns that indicate the primary search backend is exhausted/broken
+# and we should fall back to DDG for all remaining queries.
+_SEARCH_FALLBACK_ERRORS = (
+    "Search HTTP error",
+    "Search error: Rate limit exceeded",
+    "Search error: Invalid Serper API key",
+    "Search error: Invalid API key",
+    "Search error: API key not authorized",
+    "Search API Error",
+)
+
+
 def search_web(q: str, num_results: int = 5) -> str:
     """
-    Execute a Google search and return structured results.
+    Execute a web search and return structured results.
     
-    Backend is selected by the SEARCH_BACKEND env var:
-      - "serper"  (default) — uses Serper.dev, needs SERPER_API_KEY
-      - "serpapi" — uses SerpAPI.com, needs SERP_API_KEY
+    Backend priority:
+      1. Primary: serper (default) or serpapi (set SEARCH_BACKEND env var)
+      2. Fallback: DuckDuckGo (automatic if primary fails with credit/auth errors)
     
     Args:
         q: Search query string
         num_results: Number of results to return (default: 5)
     
     Returns:
-        Formatted string with top search results or error message
+        Formatted string with top search results or error message.
+        Results from the DDG fallback are prefixed with [DDG fallback].
     """
     backend = os.getenv("SEARCH_BACKEND", "serper").lower()
     if backend == "serpapi":
-        return _search_serpapi(q, num_results)
+        result = _search_serpapi(q, num_results)
     else:
-        return _search_serper(q, num_results)
+        result = _search_serper(q, num_results)
+
+    # If primary backend failed with a credit/auth/rate error, fall back to DDG
+    if any(result.startswith(err) for err in _SEARCH_FALLBACK_ERRORS):
+        primary_error = result
+        logger.warning(f"Primary search failed ({primary_error}), falling back to DuckDuckGo")
+        ddg_result = _search_ddg(q, num_results)
+        if ddg_result.startswith("Search error:") or ddg_result.startswith("DDG search error:"):
+            # DDG also failed — return both errors
+            return f"{primary_error}\n[DDG fallback also failed: {ddg_result}]"
+        return f"[DDG fallback — primary search unavailable: {primary_error}]\n{ddg_result}"
+
+    return result
 
 def fetch_url(url: str, max_chars: int = 8000) -> str:
     """Fetch and extract readable text from a URL."""
@@ -956,7 +1011,7 @@ TOOLS = [
             "description": (
                 "Submit your final answer to the user. You MUST call this tool when you are ready "
                 "to deliver your response. Do NOT produce a plain text response — always use this tool. "
-                "Put your complete, well-formatted answer in the 'answer' parameter."
+                "Put your complete, well-formatted answer in the 'answer' parameter. This should NOT be an empty answer."
             ),
             "parameters": {
                 "type": "object",

@@ -27,6 +27,7 @@ dependencies = [
     "requests",
     "python-dotenv",
     "pyyaml",
+    "duckduckgo-search>=7.0",
 ]
 
 [project.urls]
