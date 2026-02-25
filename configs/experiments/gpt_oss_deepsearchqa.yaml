@@ -48,3 +48,8 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: null
+
+judge:
+  enabled: true
+  model: "gpt-4.1-mini"
+  threads: 5
