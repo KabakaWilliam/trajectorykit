@@ -19,12 +19,16 @@ traces:
 prompts:
   orchestrator: "configs/prompts/orchestrator.txt"
   worker: "configs/prompts/worker.txt"
+  synthesizer: "configs/prompts/synthesizer.txt"
 
 model_profiles:
   "Qwen/Qwen3-8B":
     context_window: 32768
+    max_completion_tokens: 8192
     supports_reasoning_effort: false
     default_temperature: 0.7
+    chat_template_kwargs:
+      enable_thinking: true
 
   "openai/gpt-oss-20b":
     context_window: 131072
@@ -40,11 +44,11 @@ default_profile:
 dataset:
   name: "google/deepsearchqa"
   split: "eval"
-  sample_n: 50
+  sample_n: 2
   seed: 42
 
 eval:
-  turn_length: null
+  turn_length: 25
   reasoning_effort: null
   verbose: true
   output_dir: null

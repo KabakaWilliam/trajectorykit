@@ -49,6 +49,7 @@ class TurnRecord:
 class EpisodeTrace:
     """Full trace of a dispatch episode, forming a tree with sub-agent traces."""
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    example_id: str = ""  # Semantic ID linking trace to a dataset row (e.g. "q070")
     depth: int = 0
     user_input: str = ""
     model: str = ""

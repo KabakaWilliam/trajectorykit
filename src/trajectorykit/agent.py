@@ -95,6 +95,7 @@ def dispatch(
     temperature: Optional[float] = None,
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    example_id: Optional[str] = None,
     _depth: int = 0,
     _sandbox_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
@@ -144,6 +145,7 @@ def dispatch(
     # Initialize trace
     episode = EpisodeTrace(
         depth=_depth,
+        example_id=example_id or "",
         user_input=user_input,
         model=model,
         temperature=temperature,
@@ -194,6 +196,10 @@ def dispatch(
         }
         if reasoning_effort and profile.get("supports_reasoning_effort"):
             payload["reasoning_effort"] = reasoning_effort
+        # Pass chat_template_kwargs (e.g. enable_thinking for Qwen3)
+        chat_template_kwargs = profile.get("chat_template_kwargs")
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
         return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
     
     turn = 0
@@ -248,6 +254,11 @@ def dispatch(
         effective_max_tokens = max(context_window - approx_input_tokens - TOKEN_SAFETY_MARGIN, 256)
         # Never exceed the original max_tokens cap
         effective_max_tokens = min(effective_max_tokens, max_tokens)
+        # Cap per-turn completion tokens to prevent truncated tool-call JSON
+        # (e.g. Qwen3 with 32K context but thinking tokens can eat most of it)
+        max_completion = profile.get("max_completion_tokens")
+        if max_completion:
+            effective_max_tokens = min(effective_max_tokens, max_completion)
 
         # ── Budget-aware tool restriction ─────────────────────────────────
         # Progressive warnings at multiple checkpoints, then force final_answer.
@@ -353,6 +364,29 @@ def dispatch(
                 return _finalize(f"Error: {result}")
         
         # Guard against malformed API responses (200 but missing expected fields)
+        # vLLM sometimes returns HTTP 200 with an error body (e.g. generation failures).
+        # Detect this and treat it as a recoverable error.
+        if result.get("error"):
+            err_detail = result["error"]
+            if verbose:
+                print(f"⚠️  vLLM returned 200 with error body: {str(err_detail)[:200]}")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "The server encountered an internal error processing your last response. "
+                    "Please try your tool call again. Use a simpler approach if possible."
+                )
+            })
+            turn_record = TurnRecord(
+                turn_number=turn,
+                assistant_content=None,
+                raw_assistant_message={"error": str(err_detail)},
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+            )
+            turn_record.duration_s = round(time.time() - turn_start, 3)
+            episode.turns.append(turn_record)
+            continue
+        
         choices = result.get("choices")
         if not choices or not isinstance(choices, list) or len(choices) == 0:
             if verbose:
@@ -366,9 +400,20 @@ def dispatch(
             return _finalize(f"Error: Malformed API response — no 'message' in choice. Raw: {str(choices[0])[:200]}")
         
         usage = result.get("usage", {})
-        messages.append(assistant_message)
         
-        # Start building turn record
+        # Strip non-standard fields from assistant message before appending.
+        # vLLM's reasoning parser (deepseek_r1) adds 'reasoning', 'reasoning_content',
+        # etc. to responses, but chokes with a 500 if they're sent back as input.
+        # Keep only the standard OpenAI fields.
+        clean_msg = {
+            "role": assistant_message["role"],
+            "content": assistant_message.get("content") or "",
+        }
+        if assistant_message.get("tool_calls"):
+            clean_msg["tool_calls"] = assistant_message["tool_calls"]
+        messages.append(clean_msg)
+        
+        # Start building turn record (keep full raw message for trace)
         turn_record = TurnRecord(
             turn_number=turn,
             assistant_content=assistant_message.get("content"),
@@ -679,6 +724,7 @@ def dispatch(
                 temperature=temperature,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                example_id=example_id,
                 _depth=_depth + 1,
                 _sandbox_files=sandbox_files,
             )
