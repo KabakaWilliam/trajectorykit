@@ -40,6 +40,49 @@ The agent writes and executes code in a sandbox, returning results with inline i
   <img src="docs/trace_example_v2.png" width="500" alt="Yu-Gi-Oh Card Stats Comparison">
 </p>
 
+## 📊 Preliminary Evaluation
+
+TrajectoryKit was evaluated on a subset of **DeepSearchQA** (n = 62) to validate recursive delegation and tool orchestration under real-world conditions.
+
+**Configuration**
+
+- Model: `gpt-oss-20b(high)` (served via vLLM)
+- Orchestration: Recursive delegation enabled (max depth ≤ 1)
+- Tools: Web search + code sandbox fallback
+- Judge: GPT-4o-mini (strict rubric-based evaluation)
+
+### Results (Subset: n = 62)
+
+| Model                | Fully Correct | Fully Incorrect | Correct w/ Extraneous | F1    |
+|----------------------|---------------|----------------|-----------------------|-------|
+| Ours (gpt-20b)      | 30.65 ± 11.48 | 45.16 ± 12.39  | 6.45 ± 6.12           | 46.44 |
+
+---
+
+### Important Caveats
+
+- ~42% of questions encountered search credit limits mid-run.
+- When search failed, the agent fell back to API-based retrieval via its code sandbox.
+- Small sample size (n = 62) results in wide confidence intervals.
+- Judge model (GPT-4o-mini) differs from Gemini-based evaluations reported elsewhere.
+
+---
+
+### Interpretation
+
+This experiment was conducted to validate architectural stability rather than leaderboard performance.
+
+Despite degraded search conditions:
+
+- Recursive delegation remained stable (no depth explosions).
+- Tool fallback mechanisms functioned as intended.
+- The agent maintained non-trivial task performance.
+- Structured sub-agent coordination operated reliably.
+
+These results suggest that performance was bottlenecked primarily by retrieval constraints rather than orchestration instability.
+
+---
+
 ## ✨ Features
 
 - 🏠 **100% Local** — runs on your own GPU via vLLM, no API keys needed
