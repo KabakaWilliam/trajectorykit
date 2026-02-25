@@ -37,87 +37,244 @@ def add_numbers(a: float, b: float) -> str:
     result = a + b
     return f"{a} + {b} = {result}"
 
+
+# ── Search backend selection ─────────────────────────────────────────────
+# Set SEARCH_BACKEND env var to switch: "serper" (default) or "serpapi"
+# Each backend needs its own API key:
+#   - serper:  SERPER_API_KEY  (from serper.dev)
+#   - serpapi: SERP_API_KEY    (from serpapi.com)
+
+SEARCH_TIMEOUT = 25   # seconds — complex quoted queries need more time
+MAX_SEARCH_RETRIES = 2
+
+
+def _search_serper(q: str, num_results: int = 5) -> str:
+    """Google search via Serper.dev API."""
+    api_key = os.getenv("SERPER_API_KEY", "")
+    if not api_key:
+        return "Error: Serper API key not configured. Set SERPER_API_KEY environment variable."
+
+    url = "https://google.serper.dev/search"
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "q": q,
+        "num": min(num_results, 10),
+        "gl": "us",
+        "hl": "en",
+    }
+
+    last_error = None
+    for attempt in range(MAX_SEARCH_RETRIES + 1):
+        try:
+            logger.info(f"Serper search (attempt {attempt+1}): {q}")
+            response = requests.post(url, json=payload, headers=headers, timeout=SEARCH_TIMEOUT)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # Serper returns organic results under "organic"
+            results = data.get("organic", [])
+            if not results:
+                return f"No results found for query: {q}"
+
+            formatted_results = f"Search Results for '{q}':\n\n"
+            for i, result in enumerate(results[:num_results], 1):
+                title = result.get("title", "No title")
+                link = result.get("link", "No link")
+                snippet = result.get("snippet", "No snippet")
+                formatted_results += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+
+            logger.info(f"Successfully retrieved {len(results[:num_results])} search results via Serper")
+            return formatted_results
+
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Search timeout: Query '{q}' timed out after {SEARCH_TIMEOUT}s. "
+                "TIP: Simplify your query — remove quoted phrases, reduce to key terms, "
+                "or split into multiple simpler searches."
+            )
+            logger.warning(f"Serper timeout (attempt {attempt+1}/{MAX_SEARCH_RETRIES+1}): {q}")
+            if attempt < MAX_SEARCH_RETRIES:
+                time.sleep(1 * (attempt + 1))
+                continue
+            return last_error
+        except requests.exceptions.ConnectionError:
+            return "Search error: Could not connect to Serper API. Check internet connection."
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else 0
+            if status == 401:
+                return "Search error: Invalid Serper API key. Check SERPER_API_KEY."
+            elif status == 429:
+                return "Search error: Rate limit exceeded. Please try again later."
+            else:
+                error_msg = f"Search HTTP error {status}"
+                logger.error(error_msg)
+                return error_msg
+        except json.JSONDecodeError:
+            return "Search error: Invalid JSON response from Serper API"
+        except Exception as e:
+            error_msg = f"Search error: {type(e).__name__}: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+
+    return last_error or "Search error: Unknown failure after retries"
+
+
+def _search_serpapi(q: str, num_results: int = 5) -> str:
+    """Google search via SerpAPI.com."""
+    api_key = os.getenv("SERP_API_KEY", "")
+    if not api_key:
+        return "Error: SerpAPI key not configured. Set SERP_API_KEY environment variable."
+
+    url = "https://serpapi.com/search"
+    params = {
+        "engine": "google",
+        "q": q,
+        "api_key": api_key,
+        "num": min(num_results, 10),
+        "hl": "en",
+        "gl": "us",
+    }
+
+    last_error = None
+    for attempt in range(MAX_SEARCH_RETRIES + 1):
+        try:
+            logger.info(f"SerpAPI search (attempt {attempt+1}): {q}")
+            response = requests.get(url, params=params, timeout=SEARCH_TIMEOUT)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if "error" in data:
+                return f"Search API Error: {data.get('error', 'Unknown error')}"
+
+            results = data.get("organic_results", [])
+            if not results:
+                return f"No results found for query: {q}"
+
+            formatted_results = f"Search Results for '{q}':\n\n"
+            for i, result in enumerate(results[:num_results], 1):
+                title = result.get("title", "No title")
+                link = result.get("link", "No link")
+                snippet = result.get("snippet", "No snippet")
+                formatted_results += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+
+            logger.info(f"Successfully retrieved {len(results[:num_results])} search results via SerpAPI")
+            return formatted_results
+
+        except requests.exceptions.Timeout:
+            last_error = (
+                f"Search timeout: Query '{q}' timed out after {SEARCH_TIMEOUT}s. "
+                "TIP: Simplify your query — remove quoted phrases, reduce to key terms, "
+                "or split into multiple simpler searches."
+            )
+            logger.warning(f"SerpAPI timeout (attempt {attempt+1}/{MAX_SEARCH_RETRIES+1}): {q}")
+            if attempt < MAX_SEARCH_RETRIES:
+                time.sleep(1 * (attempt + 1))
+                continue
+            return last_error
+        except requests.exceptions.ConnectionError:
+            return "Search error: Could not connect to SerpAPI. Check internet connection."
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else 0
+            if status == 401:
+                return "Search error: Invalid API key. Check SERP_API_KEY."
+            elif status == 403:
+                return "Search error: API key not authorized for this request."
+            elif status == 429:
+                return "Search error: Rate limit exceeded. Please try again later."
+            else:
+                error_msg = f"Search HTTP error {status}"
+                logger.error(error_msg)
+                return error_msg
+        except json.JSONDecodeError:
+            return "Search error: Invalid JSON response from SerpAPI"
+        except Exception as e:
+            error_msg = f"Search error: {type(e).__name__}: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+
+    return last_error or "Search error: Unknown failure after retries"
+
+
+def _search_ddg(q: str, num_results: int = 5) -> str:
+    """Fallback search via DuckDuckGo (no API key needed)."""
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return "Search error: duckduckgo-search package not installed. Run: pip install duckduckgo-search"
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(q, max_results=min(num_results, 10)))
+
+        if not results:
+            return f"No results found for query: {q}"
+
+        formatted = f"Search Results for '{q}':\n\n"
+        for i, r in enumerate(results[:num_results], 1):
+            title = r.get("title", "No title")
+            link = r.get("href", r.get("link", "No link"))
+            snippet = r.get("body", r.get("snippet", "No snippet"))
+            formatted += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+
+        logger.info(f"DDG fallback returned {len(results[:num_results])} results for: {q}")
+        return formatted
+
+    except Exception as e:
+        error_msg = f"DDG search error: {type(e).__name__}: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+
+# Error patterns that indicate the primary search backend is exhausted/broken
+# and we should fall back to DDG for all remaining queries.
+_SEARCH_FALLBACK_ERRORS = (
+    "Search HTTP error",
+    "Search error: Rate limit exceeded",
+    "Search error: Invalid Serper API key",
+    "Search error: Invalid API key",
+    "Search error: API key not authorized",
+    "Search API Error",
+)
+
+
 def search_web(q: str, num_results: int = 5) -> str:
     """
-    Execute a Google search via SerpAPI and return structured results.
+    Execute a web search and return structured results.
+    
+    Backend priority:
+      1. Primary: serper (default) or serpapi (set SEARCH_BACKEND env var)
+      2. Fallback: DuckDuckGo (automatic if primary fails with credit/auth errors)
     
     Args:
         q: Search query string
         num_results: Number of results to return (default: 5)
     
     Returns:
-        Formatted string with top search results or error message
+        Formatted string with top search results or error message.
+        Results from the DDG fallback are prefixed with [DDG fallback].
     """
-    api_key = os.getenv("SERP_API_KEY", "")
-    
-    if not api_key:
-        return "Error: SerpAPI key not configured. Set SERP_API_KEY environment variable."
-    
-    url = "https://serpapi.com/search"
-    params = {
-        "engine": "google",
-        "q": q,
-        "api_key": api_key,
-        "num": min(num_results, 10),  # SerpAPI default is 10, cap at 10
-        "hl": "en",
-        "gl": "us",
-    }
-    
-    try:
-        logger.info(f"Executing search query: {q}")
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Check for API errors
-        if "error" in data:
-            return f"Search API Error: {data.get('error', 'Unknown error')}"
-        
-        # Extract organic results
-        results = data.get("organic_results", [])
-        
-        if not results:
-            return f"No results found for query: {q}"
-        
-        # Format results for readability
-        formatted_results = f"Search Results for '{q}':\n\n"
-        for i, result in enumerate(results[:num_results], 1):
-            title = result.get("title", "No title")
-            link = result.get("link", "No link")
-            snippet = result.get("snippet", "No snippet")
-            formatted_results += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
-        
-        logger.info(f"Successfully retrieved {len(results[:num_results])} search results")
-        return formatted_results
-        
-    except requests.exceptions.Timeout:
-        error_msg = f"Search timeout: Query '{q}' took too long to complete"
-        logger.error(error_msg)
-        return error_msg
-    except requests.exceptions.ConnectionError:
-        error_msg = "Search error: Could not connect to SerpAPI. Check internet connection."
-        logger.error(error_msg)
-        return error_msg
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            return "Search error: Invalid API key. Check SERPAPI_KEY."
-        elif e.response.status_code == 403:
-            return "Search error: API key not authorized for this request."
-        elif e.response.status_code == 429:
-            return "Search error: Rate limit exceeded. Please try again later."
-        else:
-            error_msg = f"Search HTTP error {e.response.status_code}"
-            logger.error(error_msg)
-            return error_msg
-    except json.JSONDecodeError:
-        error_msg = "Search error: Invalid JSON response from API"
-        logger.error(error_msg)
-        return error_msg
-    except Exception as e:
-        error_msg = f"Search error: {type(e).__name__}: {str(e)}"
-        logger.error(error_msg)
-        return error_msg
+    backend = os.getenv("SEARCH_BACKEND", "serper").lower()
+    if backend == "serpapi":
+        result = _search_serpapi(q, num_results)
+    else:
+        result = _search_serper(q, num_results)
+
+    # If primary backend failed with a credit/auth/rate error, fall back to DDG
+    if any(result.startswith(err) for err in _SEARCH_FALLBACK_ERRORS):
+        primary_error = result
+        logger.warning(f"Primary search failed ({primary_error}), falling back to DuckDuckGo")
+        ddg_result = _search_ddg(q, num_results)
+        if ddg_result.startswith("Search error:") or ddg_result.startswith("DDG search error:"):
+            # DDG also failed — return both errors
+            return f"{primary_error}\n[DDG fallback also failed: {ddg_result}]"
+        return f"[DDG fallback — primary search unavailable: {primary_error}]\n{ddg_result}"
+
+    return result
 
 def fetch_url(url: str, max_chars: int = 8000) -> str:
     """Fetch and extract readable text from a URL."""
@@ -148,6 +305,7 @@ def spawn_agent(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     _depth: int = 0,
+    _sandbox_files: Optional[dict] = None,
 ) -> ToolReturn:
     """
     Spawn a sub-agent to handle a subtask. Calls dispatch() recursively.
@@ -186,6 +344,7 @@ def spawn_agent(
         model=model,
         reasoning_effort=reasoning_effort,
         _depth=_depth + 1,       # increment depth for recursive calls
+        _sandbox_files=_sandbox_files,
     )
 
     # Extract child trace from the result
@@ -204,8 +363,8 @@ def execute_code(
     completion: str,
     stdin: Optional[str] = '',
     compile_timeout: int = 10,
-    run_timeout: int = 5,
-    memory_limit_mb: int = 128,
+    run_timeout: int = 15,
+    memory_limit_mb: int = 512,
     language: str = "python",
     files: Optional[dict[str, str]] = None,      # filename -> base64 content
     fetch_files: Optional[list[str]] = None,      # list of filenames to return
@@ -447,7 +606,7 @@ def search_web_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, **kwargs):
+def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, **kwargs):
     """Wrapper for spawn_agent tool. Injects _depth, _model, _reasoning_effort from the parent dispatch loop.
     Returns (output_str, child_trace) where child_trace is an EpisodeTrace."""
     try:
@@ -465,6 +624,7 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
             model=_model,
             reasoning_effort=_reasoning_effort,
             _depth=_depth,
+            _sandbox_files=_sandbox_files,
         )
         return output, child_trace
     except Exception as e:
@@ -544,7 +704,7 @@ def read_pdf_wrapper(**kwargs):
     
 
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -555,12 +715,19 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         _depth: Current recursion depth (injected by the agent loop, invisible to the model)
         model: Model name to propagate to sub-agents
         reasoning_effort: Reasoning effort level to propagate to sub-agents
+        _sandbox_files: Files to auto-inject into every execute_code sandbox call.
+                        Dict of {filename: base64_content}. Merged with model-provided files.
     
     Returns:
         Tuple of (output_string, child_trace) where child_trace is an
         EpisodeTrace if the tool was spawn_agent, otherwise None.
     """
     if tool_name == "execute_code":
+        # Merge framework-injected sandbox files with any model-provided files
+        if _sandbox_files:
+            model_files = tool_args.get("files") or {}
+            merged = {**_sandbox_files, **model_files}  # model files take precedence
+            tool_args = {**tool_args, "files": merged}
         return execute_code_wrapper(**tool_args)
     elif tool_name == "get_current_time":
         return get_current_time_wrapper(**tool_args)
@@ -569,7 +736,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
-        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, **tool_args)
+        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, **tool_args)
     elif tool_name == "final_answer":
         return final_answer_wrapper(**tool_args)
     elif tool_name == "search_available_tools":
@@ -659,13 +826,13 @@ TOOLS = [
                 },
                 "run_timeout": {
                     "type": "integer",
-                    "description": "Execution timeout in seconds (default: 5).",
-                    "default": 5
+                    "description": "Execution timeout in seconds (default: 15).",
+                    "default": 15
                 },
                 "memory_limit_mb": {
                     "type": "integer",
-                    "description": "Memory limit in megabytes (default: 128).",
-                    "default": 128
+                    "description": "Memory limit in megabytes (default: 512).",
+                    "default": 512
                 }
             },
             "required": ["completion"]
@@ -844,7 +1011,7 @@ TOOLS = [
             "description": (
                 "Submit your final answer to the user. You MUST call this tool when you are ready "
                 "to deliver your response. Do NOT produce a plain text response — always use this tool. "
-                "Put your complete, well-formatted answer in the 'answer' parameter."
+                "Put your complete, well-formatted answer in the 'answer' parameter. This should NOT be an empty answer."
             ),
             "parameters": {
                 "type": "object",
