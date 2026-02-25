@@ -5,6 +5,16 @@ model:
   name: "openai/gpt-oss-20b"
   api_url: "http://localhost:3030/v1"
 
+vllm:
+  port: 3030
+  gpu_devices: [2]
+  gpu_memory_utilization: 0.9
+  tool_call_parser: "openai"
+  reasoning_parser: null
+  extra_args: ["--async-scheduling"]
+  env:
+    TIKTOKEN_CACHE_DIR: "/VData/resources/huggingface/tiktoken-cache"
+
 agent:
   max_recursion_depth: 1
   sub_agent_turn_budget: 15
@@ -12,6 +22,10 @@ agent:
 
 sandbox:
   url: "http://localhost:8080/run_code"
+  port: 8080
+  sif_image: "sandbox-fusion_server-20250609.sif"
+  docker_uri: "docker://volcengine/sandbox-fusion:server-20250609"
+  sif_dir: "."
 
 traces:
   dir: "traces/"

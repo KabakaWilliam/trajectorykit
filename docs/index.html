@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>TrajectoryKit — Live Demos</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=Plus+Jakarta+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<style>
+:root {
+  --white: #ffffff;
+  --off: #f7f7f5;
+  --border: #e4e4e0;
+  --text: #222220;
+  --text-mid: #666662;
+  --text-light: #999994;
+  --accent: #2a5caa;
+  --accent-bg: #f0f4fb;
+  --sans: "Plus Jakarta Sans", system-ui, sans-serif;
+  --mono: "JetBrains Mono", monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--off); color: var(--text); font-family: var(--sans);
+  font-size: 15px; line-height: 1.6; font-weight: 300;
+  -webkit-font-smoothing: antialiased;
+  display: flex; justify-content: center; padding: 60px 20px;
+}
+
+.container { max-width: 640px; width: 100%; }
+
+h1 {
+  font-family: var(--sans); font-weight: 600; font-size: 28px;
+  margin-bottom: 8px;
+}
+.subtitle {
+  color: var(--text-mid); font-size: 14px; margin-bottom: 40px;
+}
+
+.card {
+  background: var(--white); border: 1px solid var(--border); border-radius: 6px;
+  padding: 24px; margin-bottom: 16px; text-decoration: none; color: inherit;
+  display: block; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.card:hover {
+  border-color: var(--accent); box-shadow: 0 2px 12px rgba(42,92,170,0.08);
+}
+
+.card-title {
+  font-weight: 500; font-size: 16px; margin-bottom: 6px;
+  display: flex; align-items: center; gap: 8px;
+}
+.card-title .arrow { color: var(--accent); font-size: 18px; }
+.card-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--text-light);
+  margin-bottom: 10px;
+}
+.card-desc {
+  font-size: 13px; color: var(--text-mid); line-height: 1.5;
+}
+
+.footer {
+  margin-top: 40px; font-family: var(--mono); font-size: 11px;
+  color: var(--text-light); text-align: center;
+}
+.footer a { color: var(--accent); text-decoration: none; }
+.footer a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>TrajectoryKit</h1>
+<p class="subtitle">Interactive agent trace demos — click to walk through a real execution.</p>
+
+<a class="card" href="demo_trace.html">
+  <div class="card-title">
+    <span>DeepSearchQA Sample — gpt-oss-20b</span>
+    <span class="arrow">→</span>
+  </div>
+  <div class="card-meta">q0168 · 15 turns · 38 tool calls · 168 KB</div>
+  <div class="card-desc">
+    A multi-turn research agent that searches the web, reads pages, executes Python
+    in a sandbox, and delegates to sub-agents — all traced turn-by-turn with a
+    clickable sidebar timeline.
+  </div>
+</a>
+
+<div class="footer">
+  <a href="https://github.com/KabakaWilliam/trajectorykit">GitHub</a>
+  &nbsp;·&nbsp; MIT License
+</div>
+
+</div>
+</body>
+</html>
