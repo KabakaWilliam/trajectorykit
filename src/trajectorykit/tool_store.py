@@ -201,34 +201,82 @@ def _search_serpapi(q: str, num_results: int = 5) -> str:
 
 
 def _search_ddg(q: str, num_results: int = 5) -> str:
-    """Fallback search via DuckDuckGo (no API key needed)."""
+    """
+    Resilient DDG search with caching, dedup, backoff, and concurrency control.
+    """
+    import random
+    from .utils import _ddg_cache, _ddg_rate, _ddg_sem, _inflight, _inflight_lock, _normalize_query
     try:
         from ddgs import DDGS
     except ImportError:
-        return "Search error: duckduckgo-search package not installed. Run: pip install ddgs"
+        return "Search error: package not installed. Run: pip install ddgs"
 
+    nq = _normalize_query(q)
+    cache_key = f"ddg::{nq}::k{min(num_results,10)}"
+
+    # 1) cache hit
+    cached = _ddg_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # 2) in-flight dedup: if same query already running, wait for it
+    with _inflight_lock:
+        if cache_key in _inflight:
+            evt = _inflight[cache_key]
+        else:
+            evt = threading.Event()
+            _inflight[cache_key] = evt
+            evt = None
+
+    if evt is not None:
+        # wait for the first caller to fill cache
+        evt.wait(timeout=30)
+        cached = _ddg_cache.get(cache_key)
+        return cached if cached is not None else f"Search error: in-flight query timed out for '{q}'"
+
+    # We are the first caller
     try:
-        # with DDGS() as ddgs:
-            # results = list(ddgs.text(q, max_results=min(num_results, 10)))
-        results = DDGS().text(q, max_results=min(num_results, 10))
+        with _ddg_sem:  # 3) concurrency control
+            max_results = min(max(num_results, 1), 10)
 
-        if not results:
-            return f"No results found for query: {q}"
+            # 4) retries with backoff
+            last_err = None
+            for attempt in range(5):
+                _ddg_rate.wait()  # 5) global rate limiting across threads
 
-        formatted = f"Search Results for '{q}':\n\n"
-        for i, r in enumerate(results[:num_results], 1):
-            title = r.get("title", "No title")
-            link = r.get("href", r.get("link", "No link"))
-            snippet = r.get("body", r.get("snippet", "No snippet"))
-            formatted += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+                try:
+                    with DDGS() as ddgs:
+                        results = list(ddgs.text(q, max_results=max_results))
 
-        logger.info(f"DDG fallback returned {len(results[:num_results])} results for: {q}")
-        return formatted
+                    if not results:
+                        out = f"No results found for query: {q}"
+                        _ddg_cache.set(cache_key, out)
+                        return out
 
-    except Exception as e:
-        error_msg = f"DDG search error: {type(e).__name__}: {str(e)}"
-        logger.error(error_msg)
-        return error_msg
+                    formatted = f"Search Results for '{q}':\n\n"
+                    for i, r in enumerate(results[:num_results], 1):
+                        title = r.get("title") or "No title"
+                        link = r.get("href") or r.get("link") or "No link"
+                        snippet = r.get("body") or r.get("snippet") or "No snippet"
+                        formatted += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+
+                    _ddg_cache.set(cache_key, formatted)
+                    return formatted
+
+                except Exception as e:
+                    last_err = e
+                    # exponential backoff + jitter
+                    sleep_s = min(8.0, (0.5 * (2 ** attempt))) + random.uniform(0, 0.25)
+                    time.sleep(sleep_s)
+
+            return f"DDG search error after retries: {type(last_err).__name__}: {last_err}"
+
+    finally:
+        # release waiters
+        with _inflight_lock:
+            evt = _inflight.pop(cache_key, None)
+            if evt:
+                evt.set()
 
 
 # Error patterns that indicate the primary search backend is exhausted/broken

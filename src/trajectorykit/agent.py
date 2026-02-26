@@ -261,8 +261,23 @@ def dispatch(
         if max_completion:
             effective_max_tokens = min(effective_max_tokens, max_completion)
 
+        # ── Periodic question reminder (every 8 turns) ────────────────────
+        # During long horizons the model can lose sight of the original question.
+        _REMINDER_INTERVAL = 8
+        if turn > 1 and turn % _REMINDER_INTERVAL == 0:
+            q_snippet = user_input[:300] + ("…" if len(user_input) > 300 else "")
+            messages.append({"role": "system", "content": (
+                f"🔎 REMINDER — You are answering this question:\n"
+                f"{q_snippet}\n\n"
+                "Stay focused on gathering information relevant to this question. "
+                "If you already have enough, call final_answer."
+            )})
+            if verbose:
+                print(f"🔎  Injected periodic question reminder (turn {turn})")
+
         # ── Budget-aware tool restriction ─────────────────────────────────
         # Progressive warnings at multiple checkpoints, then force final_answer.
+        q_echo = user_input[:500] + ("…" if len(user_input) > 500 else "")
         tools_for_turn = None  # None = use full TOOLS list
         if turn_length is not None:
             remaining = turn_length - turn
@@ -270,8 +285,9 @@ def dispatch(
                 # Early warning
                 messages.append({"role": "system", "content": (
                     "📋 BUDGET CHECK: You have 5 turns remaining (including this one). "
-                    "Start consolidating your findings. If you have enough information "
-                    "to answer, consider calling final_answer soon."
+                    "Start consolidating your findings toward answering this question:\n"
+                    f"{q_echo}\n\n"
+                    "If you have enough information, consider calling final_answer soon."
                 )})
                 if verbose:
                     print(f"📋  Injected budget check (5 turns left)")
@@ -279,8 +295,9 @@ def dispatch(
                 # Urgent warning
                 messages.append({"role": "system", "content": (
                     "⚠️ BUDGET WARNING: You have 3 turns remaining (including this one). "
-                    "If you have enough to answer, call final_answer NOW. "
-                    "Do not start new research — synthesize what you have."
+                    "Synthesize what you have to answer this question:\n"
+                    f"{q_echo}\n\n"
+                    "Call final_answer NOW. Do not start new research."
                 )})
                 if verbose:
                     print(f"⚠️  Injected budget warning (3 turns left)")
@@ -289,7 +306,8 @@ def dispatch(
                 messages.append({"role": "system", "content": (
                     "🚨 LAST CHANCE: You have 2 turns remaining (including this one). "
                     "On your next turn you will be FORCED to call final_answer. "
-                    "Finish any last tool call NOW, then call final_answer."
+                    "Finish any last tool call NOW, then call final_answer for:\n"
+                    f"{q_echo}"
                 )})
                 if verbose:
                     print(f"🚨  Injected last chance warning (2 turns left)")
@@ -675,13 +693,16 @@ def dispatch(
               f"{stats['base64_chars']:,} compressed chars "
               f"({stats['savings_pct']}% savings)")
     
+    q_echo_synth = user_input[:500] + ("…" if len(user_input) > 500 else "")
     messages.append({
         "role": "user",
         "content": (
             "You have run out of turns. Call final_answer NOW with your best "
-            "response based on everything gathered so far."
+            "response based on everything gathered so far.\n\n"
+            f"ORIGINAL QUESTION:\n{q_echo_synth}\n"
             f"{findings_block}\n"
-            "Synthesize these findings into a clear, well-cited answer."
+            "Synthesize these findings into a clear, well-cited answer to the "
+            "question above."
         ),
     })
     

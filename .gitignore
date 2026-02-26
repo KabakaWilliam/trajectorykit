@@ -11,3 +11,4 @@ serve_vllm_oss.sh
 data
 demo
 evals
+private_example.py
