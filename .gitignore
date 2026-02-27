@@ -1,4 +1,4 @@
-.env
+.env*
 traces/
 dist/
 build/
@@ -11,4 +11,8 @@ serve_vllm_oss.sh
 data
 demo
 evals
+logs
+workspace
 private_example.py
+**.sif
+**.nfs**

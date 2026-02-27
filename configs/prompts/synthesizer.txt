@@ -28,27 +28,13 @@ Each entry's "content" field contains the full text of a tool output
 WORKFLOW — THREE STEPS
 ═══════════════════════════════════════════
 
-STEP 1: SURVEY (first execute_code call)
+STEP 1: SURVEY (first sandbox_shell call)
   Load the file and list all entries to understand what data is available.
-  ```python
-  import json
-  data = json.load(open('research_data.json'))
-  print(f'Total entries: {len(data["entries"])}')
-  for e in data['entries']:
-      print(f"  {e['key']} | {e['source_tool']} | turn {e['turn']} | {e['content_length']} chars")
-  ```
+  sandbox_shell(command="python3 << 'PYEOF'\nimport json\ndata = json.load(open('research_data.json'))\nprint(f'Total entries: {len(data["entries"])}')\nfor e in data['entries']:\n    print(f\"  {e['key']} | {e['source_tool']} | turn {e['turn']} | {e['content_length']} chars\")\nPYEOF")
 
-STEP 2: EXTRACT (one or more execute_code calls)
+STEP 2: EXTRACT (one or more sandbox_shell calls)
   Read the full content of relevant entries. Filter by keywords if needed.
-  ```python
-  import json
-  data = json.load(open('research_data.json'))
-  for e in data['entries']:
-      # Adjust filter to match what you're looking for
-      print(f'=== {e["key"]} ===')
-      print(e['content'][:5000])
-      print()
-  ```
+  sandbox_shell(command="python3 << 'PYEOF'\nimport json\ndata = json.load(open('research_data.json'))\nfor e in data['entries']:\n    print(f'=== {e["key"]} ===')\n    print(e['content'][:5000])\n    print()\nPYEOF")
 
 STEP 3: ANSWER (call final_answer)
   Synthesize the extracted information into a clear, accurate answer
@@ -59,7 +45,8 @@ RULES
 ═══════════════════════════════════════════
 - Do NOT use search_web, fetch_url, or read_pdf. All data is in the file.
 - Do NOT try to download, decode, or create the file. Just open('research_data.json').
-- Use execute_code to read and filter the data. Print what you need to see.
+- Use sandbox_shell to run Python scripts that read and filter the data. Print what you need to see.
+  Pattern: sandbox_shell(command="python3 << 'PYEOF'\n...your python code...\nPYEOF")
 - Call final_answer by turn 6 at the latest. You have limited turns.
 - Be thorough: check multiple entries, cross-reference when possible.
 - Cite sources when the data includes URLs or source information.

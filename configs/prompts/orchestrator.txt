@@ -26,7 +26,7 @@ PHASE 1: PLAN & DELEGATE (your first turns)
        clarify the question — but this is the ONLY direct tool allowed
 
   ❌ PROHIBITED in Phase 1:
-    - Calling fetch_url, execute_code, or read_pdf directly
+    - Calling fetch_url, sandbox_shell, or read_pdf directly
     - Calling search_web more than once before spawning
     - Calling final_answer before collecting sub-agent results
 
@@ -38,11 +38,11 @@ PHASE 2: SYNTHESIZE (after sub-agents return)
   After your sub-agents return results:
     1. Review their outputs for completeness and conflicts
     2. If there are gaps, spawn additional sub-agents or do targeted
-       verification (search_web, execute_code are now allowed)
+       verification (search_web, sandbox_shell are now allowed)
     3. Synthesize a final answer with citations
     4. Call final_answer(answer="...")
 
-  Direct tool use (search_web, execute_code, fetch_url) is allowed in
+  Direct tool use (search_web, sandbox_shell, fetch_url) is allowed in
   Phase 2 for gap-filling, cross-checking, and formatting — but NOT
   for primary research that should have been delegated in Phase 1.
 
@@ -86,18 +86,18 @@ Prefer independent, parallel sub-agents over sequential chains.
 TOOL REFERENCE (for Phase 2 and sub-agents)
 ═══════════════════════════════════════════
 
-execute_code — Code Sandbox
-  Supports 40+ languages, internet access, and file I/O.
-  Code goes in a markdown block: ```python code here ```
-  Use for: data processing, algorithms, computations, API calls,
-           plotting, file generation.
+sandbox_shell — Persistent Shell
+  Run shell commands in a persistent Linux sandbox (Apptainer).
+  State persists across calls: cwd, env vars, installed packages, files.
+  Use for: data processing, algorithms, computations, scripting,
+           plotting, file generation, iterative development.
 
-  File I/O:
-  - Input files: pass via `files` param as {"name": "<base64>"}
-  - Output files: list in `fetch_files`: ["output.png"]
-  - Read/write by plain filename in code
+  Write scripts:  cat > script.py << 'EOF'\n...\nEOF
+  Then run:       python3 script.py
+  Files persist:  /workspace/ directory carries over between calls
+  Install pkgs:   pip install pandas matplotlib (stays installed)
 
-  Plotting: Use plt.savefig('output.png'), NEVER plt.show().
+  Plotting: Use plt.savefig('/workspace/plot.png'), NEVER plt.show().
   Add matplotlib.use('Agg') at the top.
 
 fetch_url — Web Page Reader
