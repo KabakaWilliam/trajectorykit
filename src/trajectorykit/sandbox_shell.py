@@ -16,6 +16,7 @@ Usage (interactive demo):
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shlex
@@ -28,6 +29,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Global registry of all live SandboxShell instances for cleanup
+_LIVE_SHELLS: list[SandboxShell] = []
+_LIVE_SHELLS_LOCK = threading.Lock()
+
+
+def _cleanup_all_shells():
+    """atexit handler: kill all live sandbox shells."""
+    with _LIVE_SHELLS_LOCK:
+        for sh in _LIVE_SHELLS:
+            try:
+                sh._force_kill()
+            except Exception:
+                pass
+        _LIVE_SHELLS.clear()
+
+atexit.register(_cleanup_all_shells)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -110,6 +128,10 @@ class SandboxShell:
         self._log = open(log_path, "a", buffering=1)
 
         self._start_shell()
+        
+        # Register for global cleanup
+        with _LIVE_SHELLS_LOCK:
+            _LIVE_SHELLS.append(self)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -181,19 +203,108 @@ class SandboxShell:
                 f"Check that Apptainer is installed and the image is valid."
             )
 
+    @property
+    def is_alive(self) -> bool:
+        """Return True if the shell process is still running."""
+        return self._proc is not None and self._proc.poll() is None
+
+    def ensure_alive(self) -> None:
+        """Restart the shell process if it has died.
+
+        The session workspace is bind-mounted from the host, so all files
+        survive a restart — only in-memory shell state (env vars, cwd) is lost.
+        After restart the working directory is reset to /workspace.
+        """
+        if self.is_alive:
+            return
+        self._log_event("RESTART", "Shell process died — restarting")
+        # Clean up the old process (might be a zombie)
+        if self._proc is not None:
+            try:
+                self._proc.wait(timeout=1)
+            except Exception:
+                pass
+        self._start_shell()
+        # Restore working directory to /workspace after restart
+        try:
+            self._proc.stdin.write("cd /workspace\n")
+            self._proc.stdin.flush()
+            time.sleep(0.1)
+        except Exception:
+            pass
+        self._log_event("RESTART", "Shell restarted successfully")
+
     def close(self) -> None:
         """Terminate the shell session and clean up."""
+        # Unregister from global cleanup
+        with _LIVE_SHELLS_LOCK:
+            try:
+                _LIVE_SHELLS.remove(self)
+            except ValueError:
+                pass
+        self._force_kill()
+        self._log_event("SESSION_END", f"session={self.session_id}")
+        try:
+            self._log.close()
+        except Exception:
+            pass
+    
+    def _force_kill(self) -> None:
+        """Kill the shell process and all its children (SIGTERM then SIGKILL)."""
         if self._proc and self._proc.poll() is None:
             try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                pgid = os.getpgid(self._proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
                 self._proc.wait(timeout=5)
             except Exception:
                 try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    pgid = os.getpgid(self._proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                    self._proc.wait(timeout=2)
                 except Exception:
-                    pass
-        self._log_event("SESSION_END", f"session={self.session_id}")
-        self._log.close()
+                    # Last resort: kill just the process
+                    try:
+                        self._proc.kill()
+                        self._proc.wait(timeout=2)
+                    except Exception:
+                        pass
+    
+    def __del__(self) -> None:
+        """Safety net: kill shell if object is garbage-collected without close()."""
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._force_kill()
+        except Exception:
+            pass
+    
+    @classmethod
+    def kill_orphans(cls) -> int:
+        """Find and kill any orphaned apptainer exec processes.
+        
+        Useful after a crash or Ctrl-C that didn't trigger atexit.
+        Returns the number of processes killed.
+        """
+        import subprocess as _sp
+        killed = 0
+        try:
+            result = _sp.run(
+                ["pgrep", "-f", "apptainer exec.*agent_sandbox"],
+                capture_output=True, text=True, timeout=5
+            )
+            for pid_str in result.stdout.strip().split("\n"):
+                pid_str = pid_str.strip()
+                if pid_str and pid_str.isdigit():
+                    pid = int(pid_str)
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        killed += 1
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        pass
+        except Exception:
+            pass
+        return killed
 
     def __enter__(self) -> SandboxShell:
         return self
@@ -224,6 +335,7 @@ class SandboxShell:
         timeout = timeout if timeout is not None else self.timeout
 
         with self._lock:
+            self.ensure_alive()
             return self._execute(command, timeout)
 
     def _execute(self, command: str, timeout: int) -> CommandResult:
@@ -252,7 +364,20 @@ class SandboxShell:
             self._proc.stdin.write(wrapped)
             self._proc.stdin.flush()
         except BrokenPipeError:
-            return CommandResult(command, "", "Shell process died", -1, 0.0)
+            # Shell died between ensure_alive() and write — restart and retry once
+            self._log_event("RESTART", "BrokenPipeError during write — restarting")
+            try:
+                self.ensure_alive()
+                sentinel = f"__SANDBOX_DONE_{uuid.uuid4().hex}__"
+                wrapped = (
+                    f"{command}\n"
+                    f"__ec__=$?\n"
+                    f"echo '{sentinel}' $__ec__\n"
+                )
+                self._proc.stdin.write(wrapped)
+                self._proc.stdin.flush()
+            except Exception:
+                return CommandResult(command, "", "Shell process died and could not be restarted", -1, 0.0)
 
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []

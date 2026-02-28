@@ -329,11 +329,17 @@ def search_web(q: str, num_results: int = DEFAULT_NUM_SEARCHES) -> str:
 
     return result
 
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 def fetch_url(url: str, max_chars: int = 8000) -> str:
     """Fetch and extract readable text from a URL."""
     import httpx
     from bs4 import BeautifulSoup
-    resp = httpx.get(url, timeout=15, follow_redirects=True)
+    resp = httpx.get(url, timeout=15, follow_redirects=True, headers=_BROWSER_HEADERS)
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
@@ -344,7 +350,7 @@ def read_pdf(url: str, max_chars: int = 8000) -> str:
     """Download and extract text from a PDF at a URL."""
     import httpx, io
     import pypdf
-    resp = httpx.get(url, timeout=30)
+    resp = httpx.get(url, timeout=30, headers=_BROWSER_HEADERS)
     reader = pypdf.PdfReader(io.BytesIO(resp.content))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
     return text[:max_chars]
@@ -360,6 +366,7 @@ def spawn_agent(
     _depth: int = 0,
     _sandbox_files: Optional[dict] = None,
     _shell=None,
+    _progress_fn=None,
 ) -> ToolReturn:
     """
     Spawn a sub-agent to handle a subtask. Calls dispatch() recursively.
@@ -400,6 +407,8 @@ def spawn_agent(
         _depth=_depth + 1,       # increment depth for recursive calls
         _sandbox_files=_sandbox_files,
         _shell=_shell,           # share parent's persistent shell
+        _progress_fn=_progress_fn,
+        _wall_clock_limit=600,   # 10-minute wall-clock limit for sub-agents
     )
 
     # Extract child trace from the result
@@ -661,7 +670,7 @@ def search_web_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _shell=None, **kwargs):
+def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _shell=None, _progress_fn=None, **kwargs):
     """Wrapper for spawn_agent tool. Injects _depth, _model, _reasoning_effort from the parent dispatch loop.
     Returns (output_str, child_trace) where child_trace is an EpisodeTrace."""
     try:
@@ -681,6 +690,7 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
             _depth=_depth,
             _sandbox_files=_sandbox_files,
             _shell=_shell,
+            _progress_fn=_progress_fn,
         )
         return output, child_trace
     except Exception as e:
@@ -789,7 +799,7 @@ def sandbox_shell_wrapper(_shell=None, **kwargs):
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _shell=None):
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _shell=None, _progress_fn=None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -825,11 +835,23 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
-        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _shell=_shell, **tool_args)
+        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _shell=_shell, _progress_fn=_progress_fn, **tool_args)
     elif tool_name == "final_answer":
         return final_answer_wrapper(**tool_args)
     elif tool_name == "search_available_tools":
         return search_available_tools_wrapper(**tool_args)
+    elif tool_name == "create_plan":
+        # Handled inline by agent.py — this is a fallback if dispatch is called directly
+        return f"Plan created: {tool_args.get('plan', '')[:200]}", None
+    elif tool_name == "update_plan":
+        # Handled inline by agent.py — this is a fallback if dispatch is called directly
+        return f"Plan updated: {tool_args.get('plan', '')[:200]}", None
+    elif tool_name == "recall":
+        # Handled inline by agent.py (needs access to memory store)
+        return "ERROR: recall must be handled by the agent loop", None
+    elif tool_name == "store_memory":
+        # Handled inline by agent.py (needs access to memory store)
+        return "ERROR: store_memory must be handled by the agent loop", None
     elif tool_name == "fetch_url":
         return fetch_url_wrapper(**tool_args)
     elif tool_name == "read_pdf":
@@ -974,6 +996,59 @@ TOOLS = [
         }
     }
 },
+{
+    "type": "function",
+    "function": {
+        "name": "recall",
+        "description": (
+            "Retrieve the FULL content of a previously stored memory entry by its key. "
+            "When tool outputs are too long, they are automatically summarized in your context "
+            "and the full content is stored on disk. Use this tool to retrieve any stored output "
+            "you need to re-examine in full.\n\n"
+            "Pass the exact key shown in the memory reference (e.g. 'page_t3_wikipedia_lagos'). "
+            "You can also pass 'index' to see a list of all stored memory keys."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": (
+                        "The memory key to retrieve (e.g. 'search_t1_population_lagos'), "
+                        "or 'index' to list all stored keys."
+                    )
+                }
+            },
+            "required": ["key"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "store_memory",
+        "description": (
+            "Explicitly store a piece of information in persistent memory with a descriptive label. "
+            "Use this to save important findings, intermediate results, or extracted data "
+            "that you want to reference later without it taking up context space.\n\n"
+            "The content is saved to disk and you get back a memory key you can use with recall()."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The content to store (facts, data, intermediate results, etc.)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "A short label describing what this memory contains (e.g. 'Lagos population data 2010-2023')"
+                }
+            },
+            "required": ["content", "description"]
+        }
+    }
+},
     {
         "type": "function",
         "function": {
@@ -1062,6 +1137,14 @@ TOOLS = [
                         "type": "string",
                         "description": "Clear description of the subtask the sub-agent should accomplish"
                     },
+                    "subtask_id": {
+                        "type": "integer",
+                        "description": (
+                            "ID of the plan subtask this agent is working on (shown in plan display). "
+                            "When provided, the subtask is auto-marked in-progress on dispatch and "
+                            "done when the sub-agent returns. Omit if not tied to a specific subtask."
+                        )
+                    },
                     "context": {
                         "type": "string",
                         "description": (
@@ -1107,6 +1190,81 @@ TOOLS = [
                     }
                 },
                 "required": ["answer"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_plan",
+            "description": (
+                "Create a structured research plan BEFORE beginning any research. "
+                "This MUST be your first tool call. The plan is stored and displayed back to you "
+                "on every turn as a checklist so you always know your goal and progress.\n\n"
+                "Provide a clear goal and a list of subtasks. Each subtask should be specific and "
+                "independently completable where possible. The system auto-tracks progress: "
+                "subtasks are automatically marked in-progress when you spawn_agent for them, "
+                "and done when the sub-agent returns.\n\n"
+                "Example:\n"
+                "  goal: 'Find the population growth rate of Lagos 2010-2023'\n"
+                "  subtasks: ['Find 2010 census data for Lagos', 'Find 2023 population estimate', "
+                "'Calculate compound annual growth rate', 'Cross-verify with UN data']"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Clear statement of what you are trying to answer or accomplish."
+                    },
+                    "subtasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of specific subtasks to complete. Each should be actionable and have clear success criteria."
+                    }
+                },
+                "required": ["goal", "subtasks"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_plan",
+            "description": (
+                "Update your research plan. Use this for strategic changes:\n"
+                "- Mark a subtask done/failed/skipped (with an optional result note)\n"
+                "- Add a new subtask when direction changes\n"
+                "- Revise the goal if needed\n\n"
+                "NOTE: You do NOT need to call this for routine progress — subtasks are "
+                "automatically marked in-progress/done when you use spawn_agent with a subtask_id. "
+                "Use update_plan only for strategic decisions: failures, pivots, new subtasks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subtask_id": {
+                        "type": "integer",
+                        "description": "ID of the subtask to update (shown in plan display). Omit when adding a new subtask or revising the goal."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["done", "failed", "skipped", "in_progress", "not_started"],
+                        "description": "New status for the subtask."
+                    },
+                    "result": {
+                        "type": "string",
+                        "description": "Brief note about the result or reason for status change (e.g., 'Introduced from England, 16th century' or 'No data available')."
+                    },
+                    "add_subtask": {
+                        "type": "string",
+                        "description": "Text of a NEW subtask to add to the plan."
+                    },
+                    "new_goal": {
+                        "type": "string",
+                        "description": "Revised goal statement (only if the goal itself needs changing)."
+                    }
+                }
             }
         }
     },

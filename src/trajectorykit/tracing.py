@@ -74,6 +74,8 @@ class EpisodeTrace:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
+    # Plan history: list of {"turn": int, "plan": str, "action": "create"|"update"}
+    plan_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the full trace tree to a dict (JSON-safe)."""

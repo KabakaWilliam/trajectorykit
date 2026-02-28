@@ -11,9 +11,10 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT, TOKEN_SAFETY_MARGIN, get_model_profile
-from .memory import MemoryStore
+from .memory import MemoryStore, extract_summary, build_memory_index
 from .tool_store import TOOLS, EXECUTE_CODE_TOOL, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import logging
 logger = logging.getLogger(__name__)
@@ -102,6 +103,8 @@ def dispatch(
     _depth: int = 0,
     _sandbox_files: Optional[Dict[str, str]] = None,
     _shell=None,
+    _progress_fn=None,
+    _wall_clock_limit: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Run an agentic loop with iterative tool calling and response refinement.
@@ -119,6 +122,10 @@ def dispatch(
         _sandbox_files: Files to auto-inject into every execute_code sandbox call.
                         Dict of {filename: base64_content}. Used by synthesis sub-agent
                         to access research data without polluting the LLM context.
+        _progress_fn: Optional callback(msg: str) for reporting progress to parent.
+                      Used by sub-agents so the orchestrator can print live updates.
+        _wall_clock_limit: Optional wall-clock timeout in seconds. When exceeded,
+                           the agent loop exits gracefully. Used for sub-agents (600s).
     
     Returns:
         Dictionary with:
@@ -190,8 +197,11 @@ def dispatch(
         system_prompt = SYSTEM_PROMPT
         available_tools = TOOLS
     else:
+        # Sub-agents: no spawn_agent, no planning tools, no memory tools
+        # (they get focused tasks and should just work, not plan)
+        _ORCHESTRATOR_ONLY = {"spawn_agent", "create_plan", "update_plan", "recall", "store_memory"}
         system_prompt = WORKER_PROMPT
-        available_tools = [t for t in TOOLS if t["function"]["name"] != "spawn_agent"]
+        available_tools = [t for t in TOOLS if t["function"]["name"] not in _ORCHESTRATOR_ONLY]
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -200,6 +210,41 @@ def dispatch(
 
     # Schema for the final_answer tool only — used when forcing termination
     FINAL_ANSWER_TOOL = next(t for t in available_tools if t["function"]["name"] == "final_answer")
+
+    # Schema for create_plan only — used during free planning turn
+    CREATE_PLAN_TOOL = next((t for t in available_tools if t["function"]["name"] == "create_plan"), None)
+
+    # ── Plan state ────────────────────────────────────────────────────
+    # Structured plan object with goal + subtasks (each with status + result).
+    # Set by the free planning turn (create_plan) and updated via update_plan
+    # or auto-marked by spawn_agent when subtask_id is provided.
+    current_plan: Optional[dict] = None  # {"goal": str, "subtasks": [{"id": int, "task": str, "status": str, "result": str|None}]}
+    plan_history: list[dict] = []  # [{"turn": int, "action": str, "detail": str}]
+
+    _STATUS_ICONS = {
+        "not_started": "⬜", "in_progress": "🔄",
+        "done": "✅", "failed": "❌", "skipped": "⏭️",
+    }
+
+    def _render_plan() -> str:
+        """Render the structured plan as a readable checklist string."""
+        if current_plan is None:
+            return ""
+        lines = [f"Goal: {current_plan['goal']}"]
+        counts = {"done": 0, "in_progress": 0, "not_started": 0, "failed": 0, "skipped": 0}
+        for st in current_plan["subtasks"]:
+            icon = _STATUS_ICONS.get(st["status"], "⬜")
+            counts[st["status"]] = counts.get(st["status"], 0) + 1
+            line = f"  {st['id']}. {icon} {st['task']}"
+            if st.get("result"):
+                line += f"\n     → {st['result']}"
+            lines.append(line)
+        total = len(current_plan["subtasks"])
+        done = counts["done"]
+        prog = counts["in_progress"]
+        fail = counts["failed"]
+        lines.append(f"\nProgress: {done}/{total} done" + (f", {prog} in progress" if prog else "") + (f", {fail} failed" if fail else ""))
+        return "\n".join(lines)
 
     def _call_api(effective_max_tokens, tools_override=None):
         """Build payload and call the chat completions API.
@@ -210,10 +255,16 @@ def dispatch(
                             of the full TOOLS list. Used to restrict the model
                             to only final_answer on the last turn.
         """
+        # Filter out create_plan from regular turns (only available during planning turn)
+        effective_tools = tools_override if tools_override is not None else available_tools
+        if tools_override is None and current_plan is not None:
+            # After plan is created, remove create_plan from available tools
+            effective_tools = [t for t in available_tools if t["function"]["name"] != "create_plan"]
+        
         payload = {
             "model": model,
             "messages": messages,
-            "tools": tools_override if tools_override is not None else available_tools,
+            "tools": effective_tools,
             "tool_choice": "required",
             "temperature": temperature,
             "max_tokens": effective_max_tokens,
@@ -224,7 +275,7 @@ def dispatch(
         chat_template_kwargs = profile.get("chat_template_kwargs")
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
-        return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
+        return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload, timeout=300)
     
     turn = 0
     total_tool_calls = 0
@@ -258,6 +309,9 @@ def dispatch(
         episode.total_tool_calls = total_tool_calls
         episode.ended_at = datetime.now().isoformat()
         episode.duration_s = round(time.time() - episode_start, 3)
+        # Store plan history in the trace for observability
+        if plan_history:
+            episode.plan_history = plan_history
         episode.compute_recursive_stats()
         return {
             'final_response': final_content,
@@ -267,11 +321,189 @@ def dispatch(
             'trace': episode,
         }
     
+    # ── Free planning turn ────────────────────────────────────────────
+    # Before the main loop, give the model a free turn to create a plan.
+    # This doesn't count against the turn budget.
+    # Only for the root orchestrator (depth 0) — sub-agents skip planning.
+    if CREATE_PLAN_TOOL is not None and _depth == 0:
+        if verbose:
+            print(f"\n{'─'*70}")
+            print(f"PLANNING TURN (free — does not count against budget)")
+            print(f"{'─'*70}")
+        
+        # Inject a planning instruction
+        messages.append({"role": "system", "content": (
+            "Before you begin research, create a plan. Call create_plan with:\n"
+            "- goal: A clear statement of what you're answering\n"
+            "- subtasks: A list of specific, actionable subtasks\n\n"
+            "Example: create_plan(goal='Find population growth rate of Lagos 2010-2023', "
+            "subtasks=['Find 2010 census data', 'Find 2023 estimate', 'Calculate CAGR', 'Cross-verify with UN data'])\n\n"
+            "The plan is shown as a checklist on every turn. Subtasks are auto-marked "
+            "when you use spawn_agent(subtask_id=N)."
+        )})
+        
+        # Call API with only create_plan + final_answer (for trivial questions)
+        planning_tools = [CREATE_PLAN_TOOL, FINAL_ANSWER_TOOL]
+        approx_input_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 4
+        planning_max_tokens = max(context_window - approx_input_tokens - TOKEN_SAFETY_MARGIN, 256)
+        planning_max_tokens = min(planning_max_tokens, max_tokens)
+        max_completion = profile.get("max_completion_tokens")
+        if max_completion:
+            planning_max_tokens = min(planning_max_tokens, max_completion)
+        
+        planning_payload = {
+            "model": model,
+            "messages": messages,
+            "tools": planning_tools,
+            "tool_choice": "required",
+            "temperature": temperature,
+            "max_tokens": planning_max_tokens,
+        }
+        if reasoning_effort and profile.get("supports_reasoning_effort"):
+            planning_payload["reasoning_effort"] = reasoning_effort
+        chat_template_kwargs = profile.get("chat_template_kwargs")
+        if chat_template_kwargs:
+            planning_payload["chat_template_kwargs"] = chat_template_kwargs
+        
+        try:
+            if verbose:
+                print(f"⏳ Calling vLLM (planning)...")
+            planning_response = requests.post(f"{VLLM_API_URL}/chat/completions", json=planning_payload, timeout=300)
+            if planning_response.status_code == 200:
+                planning_result = planning_response.json()
+                planning_choices = planning_result.get("choices", [])
+                if planning_choices:
+                    planning_msg = planning_choices[0].get("message", {})
+                    
+                    # Clean and append assistant message
+                    clean_planning_msg = {
+                        "role": planning_msg["role"],
+                        "content": planning_msg.get("content") or "",
+                    }
+                    if planning_msg.get("tool_calls"):
+                        clean_planning_msg["tool_calls"] = planning_msg["tool_calls"]
+                    messages.append(clean_planning_msg)
+                    
+                    # Record planning turn in trace
+                    planning_usage = planning_result.get("usage", {})
+                    planning_record = TurnRecord(
+                        turn_number=0,  # planning turn is turn 0
+                        assistant_content=planning_msg.get("content"),
+                        raw_assistant_message=planning_msg,
+                        prompt_tokens=planning_usage.get("prompt_tokens", 0),
+                        completion_tokens=planning_usage.get("completion_tokens", 0),
+                        total_tokens=planning_usage.get("total_tokens", 0),
+                    )
+                    planning_start = time.time()
+                    
+                    # Process tool calls from planning turn
+                    planning_tool_calls = planning_msg.get("tool_calls") or []
+                    for ptc in planning_tool_calls:
+                        ptc_name = ptc["function"]["name"]
+                        if "<|" in ptc_name:
+                            ptc_name = ptc_name.split("<|")[0]
+                        raw_args = ptc["function"].get("arguments", "")
+                        try:
+                            ptc_args = json.loads(raw_args) if raw_args else {}
+                        except json.JSONDecodeError:
+                            ptc_args = {}
+                        
+                        if ptc_name == "create_plan":
+                            # Parse structured plan: goal + subtasks list
+                            goal = ptc_args.get("goal", "")
+                            subtasks_raw = ptc_args.get("subtasks", [])
+                            # Fallback: if model used old format (single "plan" string), parse it
+                            if not goal and not subtasks_raw and ptc_args.get("plan"):
+                                plan_text = ptc_args["plan"]
+                                lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
+                                goal = lines[0] if lines else "Research"
+                                subtasks_raw = lines[1:] if len(lines) > 1 else [goal]
+                                # Strip leading numbering like "1. " or "- "
+                                import re as _re
+                                subtasks_raw = [_re.sub(r"^[\d]+[\.\)]\s*", "", s).strip() for s in subtasks_raw]
+                                subtasks_raw = [_re.sub(r"^[-*]\s*", "", s).strip() for s in subtasks_raw]
+                            if isinstance(subtasks_raw, str):
+                                subtasks_raw = [s.strip() for s in subtasks_raw.split("\n") if s.strip()]
+                            
+                            current_plan = {
+                                "goal": goal or "Research",
+                                "subtasks": [
+                                    {"id": i + 1, "task": t, "status": "not_started", "result": None}
+                                    for i, t in enumerate(subtasks_raw) if t
+                                ]
+                            }
+                            plan_history.append({"turn": 0, "action": "create", "detail": goal})
+                            
+                            rendered = _render_plan()
+                            confirmation = (
+                                f"Plan created and stored. It will be shown as a checklist on every turn.\n\n"
+                                f"{rendered}\n\n"
+                                "Tip: Use spawn_agent(task='...', subtask_id=N) to auto-mark subtasks. "
+                                "Use update_plan for strategic changes (failures, pivots, new subtasks)."
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": ptc["id"],
+                                "content": confirmation
+                            })
+                            
+                            tc_record = ToolCallRecord(
+                                tool_name="create_plan",
+                                tool_args=ptc_args,
+                                tool_call_id=ptc["id"],
+                                output=confirmation,
+                                duration_s=0,
+                                child_trace=None,
+                            )
+                            planning_record.tool_calls.append(tc_record)
+                            
+                            if verbose:
+                                print(f"📋 Plan created:")
+                                for line in rendered.split("\n"):
+                                    print(f"   {line}")
+                        
+                        elif ptc_name == "final_answer":
+                            # Trivial question — model chose to answer directly
+                            final_content = ptc_args.get("answer", "")
+                            tc_record = ToolCallRecord(
+                                tool_name="final_answer",
+                                tool_args=ptc_args,
+                                tool_call_id=ptc["id"],
+                                output=final_content,
+                                duration_s=0,
+                                child_trace=None,
+                            )
+                            planning_record.tool_calls.append(tc_record)
+                            planning_record.duration_s = round(time.time() - planning_start, 3)
+                            episode.turns.append(planning_record)
+                            if verbose:
+                                print(f"   ✅ Trivial question — answering directly")
+                                print(f"\n📝 Final Response:\n{final_content}")
+                            return _finalize(final_content)
+                    
+                    planning_record.duration_s = round(time.time() - planning_start, 3)
+                    episode.turns.append(planning_record)
+                    total_tool_calls += len(planning_tool_calls)
+            else:
+                if verbose:
+                    print(f"⚠️  Planning turn failed (HTTP {planning_response.status_code}) — proceeding without plan")
+        except Exception as e:
+            if verbose:
+                print(f"⚠️  Planning turn failed ({e}) — proceeding without plan")
+    
     while True:
         # Check turn limit
         if turn_length is not None and turn >= turn_length:
             if verbose:
                 print(f"\n⏹️  Reached maximum turns ({turn_length})")
+            break
+        
+        # Check wall-clock timeout (for sub-agents)
+        if _wall_clock_limit and (time.time() - episode_start) > _wall_clock_limit:
+            if _progress_fn:
+                _progress_fn(f"wall-clock timeout ({_wall_clock_limit:.0f}s)")
+            if verbose:
+                print(f"\n⏱️  Wall-clock timeout ({_wall_clock_limit:.0f}s) — forcing completion")
             break
         
         turn += 1
@@ -293,10 +525,26 @@ def dispatch(
         if max_completion:
             effective_max_tokens = min(effective_max_tokens, max_completion)
 
-        # ── Periodic question reminder (every 8 turns) ────────────────────
-        # During long horizons the model can lose sight of the original question.
-        _REMINDER_INTERVAL = 8
-        if turn > 1 and turn % _REMINDER_INTERVAL == 0:
+        # ── Plan injection (every turn) ──────────────────────────────────
+        # If there's an active plan, inject it as a system message so the
+        # model always has its goal and progress visible.
+        if current_plan and turn > 1:
+            _PLAN_INJECT_INTERVAL = 3  # inject plan every N turns to save tokens
+            if turn % _PLAN_INJECT_INTERVAL == 1 or turn <= 3:
+                rendered = _render_plan()
+                q_snippet = user_input[:300] + ("…" if len(user_input) > 300 else "")
+                messages.append({"role": "system", "content": (
+                    f"📋 CURRENT PLAN (turn {turn}"
+                    + (f"/{turn_length}" if turn_length else "")
+                    + f"):\n{rendered}\n\n"
+                    f"🔎 QUESTION: {q_snippet}\n\n"
+                    "Use spawn_agent(task='...', subtask_id=N) to work on ⬜ subtasks. "
+                    "If you have enough info, call final_answer."
+                )})
+                if verbose:
+                    print(f"📋  Injected plan reminder (turn {turn})")
+        elif turn > 1 and turn % 8 == 0:
+            # Fallback: if no plan was created, use the old question-only reminder
             q_snippet = user_input[:300] + ("…" if len(user_input) > 300 else "")
             messages.append({"role": "system", "content": (
                 f"🔎 REMINDER — You are answering this question:\n"
@@ -350,7 +598,33 @@ def dispatch(
                     print(f"🔒 Restricting tools to final_answer only (last turn)")
 
         # Call vLLM with tools
-        response = _call_api(effective_max_tokens, tools_override=tools_for_turn)
+        if verbose:
+            print(f"⏳ Calling vLLM...")
+        if _progress_fn:
+            _progress_fn(f"turn {turn}: thinking...")
+        try:
+            response = _call_api(effective_max_tokens, tools_override=tools_for_turn)
+        except requests.exceptions.Timeout:
+            if verbose:
+                print(f"⏱️  vLLM request timed out (>300s) — retrying once")
+            try:
+                response = _call_api(effective_max_tokens, tools_override=tools_for_turn)
+            except requests.exceptions.Timeout:
+                if verbose:
+                    print(f"⏱️  vLLM request timed out again — skipping turn")
+                messages.append({"role": "user", "content": (
+                    "Your previous request timed out. Try a simpler approach, "
+                    "or call final_answer with what you have so far."
+                )})
+                turn_record = TurnRecord(
+                    turn_number=turn,
+                    assistant_content=None,
+                    raw_assistant_message={"error": "vLLM timeout after 2 attempts (>300s each)"},
+                    prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                )
+                turn_record.duration_s = round(time.time() - turn_start, 3)
+                episode.turns.append(turn_record)
+                continue
         
         result = response.json()
         
@@ -535,6 +809,153 @@ def dispatch(
         
         # Process each tool call
         final_answer_result = None
+        
+        # ── Helper: post-dispatch processing (shared by sync + parallel paths) ──
+        _FAILURE_PATTERNS = (
+            "exit code: 1", "exit code: 2", "error:", "traceback",
+            "exception", "failed", "could not", "unable to",
+            "no such file", "command not found", "permission denied",
+        )
+        def _handle_tool_output(tool_name, tool_args, tool_call, output, child_trace, tc_duration, _spawn_subtask_id):
+            """Process a completed tool dispatch: auto-mark done/failed, error-track, trace, memory, message."""
+            nonlocal consecutive_error_count, last_error_signature
+            
+            # Auto-mark plan subtask on spawn_agent return
+            if _spawn_subtask_id is not None and current_plan is not None and not output.startswith("ERROR:"):
+                matched = [s for s in current_plan["subtasks"] if s["id"] == _spawn_subtask_id]
+                if matched:
+                    # Parse spawn_agent JSON to detect success vs failure
+                    _mark_status = "done"
+                    try:
+                        parsed_output = json.loads(output)
+                        result_snippet = str(parsed_output.get("response", ""))[:150]
+                        turns_used = parsed_output.get("turns_used", 0)
+                        # Detect failure: budget exhausted + error-looking response
+                        from .config import SUB_AGENT_TURN_BUDGET
+                        budget = tool_args.get("turn_length", SUB_AGENT_TURN_BUDGET)
+                        response_lower = result_snippet.lower()
+                        if turns_used >= budget and any(p in response_lower for p in _FAILURE_PATTERNS):
+                            _mark_status = "failed"
+                        elif any(p in response_lower for p in ("exit code: 1", "exit code: 2")) and "success" not in response_lower:
+                            _mark_status = "failed"
+                    except (json.JSONDecodeError, AttributeError):
+                        result_snippet = output[:150]
+                    
+                    matched[0]["status"] = _mark_status
+                    matched[0]["result"] = result_snippet
+                    action_tag = "auto_done" if _mark_status == "done" else "auto_failed"
+                    icon = "✅" if _mark_status == "done" else "❌"
+                    plan_history.append({"turn": turn, "action": action_tag, "detail": f"Subtask {_spawn_subtask_id}: {result_snippet[:80]}"})
+                    if verbose:
+                        print(f"   {icon} Auto-marked subtask {_spawn_subtask_id} as {_mark_status}")
+            
+            if verbose and len(output) < 200:
+                print(f"       → {output}")
+            elif verbose:
+                print(f"       → {output[:200]}...")
+            
+            # Progress callback for parent visibility
+            if _progress_fn:
+                _progress_fn(f"turn {turn}: {tool_name} ({tc_duration:.1f}s)")
+            
+            # Track consecutive identical errors
+            if output.startswith("ERROR:"):
+                error_sig = f"{tool_name}:{output[:200]}"
+                if error_sig == last_error_signature:
+                    consecutive_error_count += 1
+                else:
+                    consecutive_error_count = 1
+                    last_error_signature = error_sig
+                
+                if consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
+                    output += (
+                        f"\n\nFATAL: This same error has occurred {consecutive_error_count} times in a row. "
+                        "STOP retrying. Either try a completely different approach, simplify your code, "
+                        "or call final_answer with what you have so far."
+                    )
+                    if verbose:
+                        print(f"       ⚠️  Degenerate retry loop detected ({consecutive_error_count}x)")
+            else:
+                consecutive_error_count = 0
+                last_error_signature = None
+            
+            # Record tool call in trace
+            tc_record = ToolCallRecord(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_call_id=tool_call["id"],
+                output=output,
+                duration_s=tc_duration,
+                child_trace=child_trace,
+            )
+            turn_record.tool_calls.append(tc_record)
+            
+            # Symbolic memory: store full output, summarize for context
+            if not output.startswith("ERROR:") and tool_name not in ("search_available_tools", "get_current_time", "add_numbers"):
+                desc = ""
+                if tool_name == "search_web":
+                    desc = str(tool_args.get("q", ""))[:60]
+                elif tool_name == "fetch_url":
+                    desc = str(tool_args.get("url", ""))[:60]
+                elif tool_name == "read_pdf":
+                    desc = str(tool_args.get("url", ""))[:60]
+                elif tool_name == "spawn_agent":
+                    desc = str(tool_args.get("task", ""))[:60]
+                elif tool_name == "sandbox_shell":
+                    desc = str(tool_args.get("command", ""))[:60]
+                
+                mem_key = memory.add(
+                    tool_name=tool_name,
+                    turn=turn,
+                    content=output,
+                    description=desc,
+                )
+                
+                if shell is not None:
+                    try:
+                        mem_dir = shell.session_workspace / "memory"
+                        mem_dir.mkdir(exist_ok=True)
+                        mem_file = mem_dir / f"{mem_key}.txt"
+                        mem_file.write_text(output)
+                    except Exception as e:
+                        logger.debug(f"Could not write memory file: {e}")
+                
+                snippet = output[:1500].strip()
+                if snippet:
+                    findings.append(f"[{tool_name}] {snippet}")
+                
+                summary = extract_summary(tool_name, output, tool_args)
+                
+                if len(summary) < len(output):
+                    msg_output = f"{summary}\n\n📦 Full output stored as: {mem_key} (use recall to retrieve)"
+                else:
+                    msg_output = summary
+            else:
+                msg_output = output
+            
+            msg_output = re.sub(
+                r"(--- .+? \(base64\) ---\n).+?(\n---|$)",
+                r"\1[file content saved to trace]\2",
+                msg_output, flags=re.DOTALL
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": str(msg_output)
+            })
+        
+        # ── Pre-scan for parallel spawn optimization ──────────────────
+        _spawn_tc_count = sum(
+            1 for tc in tool_calls_in_msg
+            if tc["function"]["name"].split("<|")[0] == "spawn_agent"
+        )
+        _spawn_executor = None
+        _deferred_spawns = []
+        if _spawn_tc_count >= 2:
+            _spawn_executor = ThreadPoolExecutor(max_workers=_spawn_tc_count)
+            if verbose:
+                print(f"   ⚡ {_spawn_tc_count} spawn_agents detected — will dispatch in parallel")
+        
         for i, tool_call in enumerate(tool_calls_in_msg, 1):
             tool_name = tool_call["function"]["name"]
             # Sanitize: strip leaked channel tokens (e.g. "search_web<|channel|>commentary")
@@ -544,9 +965,41 @@ def dispatch(
             try:
                 tool_args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
-                tool_args = {}
-                if verbose:
-                    print(f"   ⚠️  Malformed tool arguments for {tool_name}, using empty args")
+                # Fallback 1: try Python literal (model sometimes emits single-quoted dicts)
+                import ast as _ast
+                try:
+                    parsed = _ast.literal_eval(raw_args)
+                    tool_args = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    tool_args = {}
+                
+                if not tool_args:
+                    # Could not recover — tell the model what went wrong
+                    if verbose:
+                        print(f"   ⚠️  Malformed tool arguments for {tool_name}: {raw_args[:200]}")
+                    error_msg = (
+                        f"ERROR: Your arguments for {tool_name} were malformed JSON and could not be parsed.\n"
+                        f"Raw arguments received: {raw_args[:300]}\n\n"
+                        f"FIX: Call {tool_name} again with valid JSON arguments. "
+                        f"Make sure to use double quotes for strings and escape any special characters."
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": error_msg
+                    })
+                    tc_record = ToolCallRecord(
+                        tool_name=tool_name,
+                        tool_args={"_raw_malformed": raw_args[:500]},
+                        tool_call_id=tool_call["id"],
+                        output=error_msg,
+                        duration_s=0,
+                        child_trace=None,
+                    )
+                    turn_record.tool_calls.append(tc_record)
+                    continue
+                elif verbose:
+                    print(f"   ⚠️  Recovered tool arguments for {tool_name} via ast.literal_eval")
             
             if verbose:
                 print(f"   [{i}] {tool_name}")
@@ -601,93 +1054,289 @@ def dispatch(
                 # but we'll finalize after the loop
                 continue
             
-            # Execute tool (pass _depth so spawn_agent knows its recursion level)
+            # ── Check for create_plan / update_plan ───────────────────
+            if tool_name == "create_plan":
+                # Parse structured plan: goal + subtasks list
+                goal = tool_args.get("goal", "")
+                subtasks_raw = tool_args.get("subtasks", [])
+                # Fallback: if model used old format (single "plan" string)
+                if not goal and not subtasks_raw and tool_args.get("plan"):
+                    plan_text = tool_args["plan"]
+                    lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
+                    goal = lines[0] if lines else "Research"
+                    subtasks_raw = lines[1:] if len(lines) > 1 else [goal]
+                    import re as _re
+                    subtasks_raw = [_re.sub(r"^[\d]+[\.\)]\s*", "", s).strip() for s in subtasks_raw]
+                    subtasks_raw = [_re.sub(r"^[-*]\s*", "", s).strip() for s in subtasks_raw]
+                if isinstance(subtasks_raw, str):
+                    subtasks_raw = [s.strip() for s in subtasks_raw.split("\n") if s.strip()]
+                
+                current_plan = {
+                    "goal": goal or "Research",
+                    "subtasks": [
+                        {"id": i + 1, "task": t, "status": "not_started", "result": None}
+                        for i, t in enumerate(subtasks_raw) if t
+                    ]
+                }
+                plan_history.append({"turn": turn, "action": "create", "detail": goal})
+                
+                rendered = _render_plan()
+                confirmation = (
+                    f"Plan created and stored.\n\n{rendered}\n\n"
+                    "Tip: Use spawn_agent(task='...', subtask_id=N) to auto-mark subtasks."
+                )
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": confirmation
+                })
+                tc_record = ToolCallRecord(
+                    tool_name=tool_name, tool_args=tool_args,
+                    tool_call_id=tool_call["id"], output=confirmation,
+                    duration_s=0, child_trace=None,
+                )
+                turn_record.tool_calls.append(tc_record)
+                
+                if verbose:
+                    print(f"   📋 Plan created:")
+                    for line in rendered.split("\n"):
+                        print(f"      {line}")
+                continue
+            
+            if tool_name == "update_plan":
+                if current_plan is None:
+                    confirmation = "ERROR: No plan exists yet. Call create_plan first."
+                else:
+                    changes = []
+                    # Handle subtask status update
+                    st_id = tool_args.get("subtask_id")
+                    if st_id is not None:
+                        matched = [s for s in current_plan["subtasks"] if s["id"] == st_id]
+                        if matched:
+                            st = matched[0]
+                            new_status = tool_args.get("status", st["status"])
+                            result_note = tool_args.get("result")
+                            old_status = st["status"]
+                            st["status"] = new_status
+                            if result_note:
+                                st["result"] = result_note
+                            changes.append(f"Subtask {st_id}: {old_status} → {new_status}" + (f" ({result_note})" if result_note else ""))
+                        else:
+                            changes.append(f"Warning: subtask_id {st_id} not found in plan")
+                    
+                    # Handle adding a new subtask
+                    new_subtask = tool_args.get("add_subtask")
+                    if new_subtask:
+                        next_id = max(s["id"] for s in current_plan["subtasks"]) + 1 if current_plan["subtasks"] else 1
+                        current_plan["subtasks"].append({
+                            "id": next_id, "task": new_subtask,
+                            "status": "not_started", "result": None
+                        })
+                        changes.append(f"Added subtask {next_id}: {new_subtask}")
+                    
+                    # Handle goal revision
+                    new_goal = tool_args.get("new_goal")
+                    if new_goal:
+                        current_plan["goal"] = new_goal
+                        changes.append(f"Goal revised: {new_goal}")
+                    
+                    # Fallback: old-style full plan replacement
+                    if not changes and tool_args.get("plan"):
+                        plan_text = tool_args["plan"]
+                        current_plan["goal"] = plan_text
+                        changes.append("Plan replaced (free-text)")
+                    
+                    plan_history.append({"turn": turn, "action": "update", "detail": "; ".join(changes)})
+                    rendered = _render_plan()
+                    confirmation = f"Plan updated: {'; '.join(changes)}\n\n{rendered}"
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": confirmation
+                })
+                tc_record = ToolCallRecord(
+                    tool_name=tool_name, tool_args=tool_args,
+                    tool_call_id=tool_call["id"], output=confirmation,
+                    duration_s=0, child_trace=None,
+                )
+                turn_record.tool_calls.append(tc_record)
+                
+                if verbose:
+                    print(f"   📝 Plan updated: {'; '.join(changes) if current_plan else 'no plan'}")
+                    if current_plan:
+                        for line in _render_plan().split("\n"):
+                            print(f"      {line}")
+                continue
+            
+            # ── Check for recall ──────────────────────────────────────
+            if tool_name == "recall":
+                recall_key = tool_args.get("key", "")
+                
+                if recall_key == "index":
+                    # Return the memory index
+                    recall_output = build_memory_index(memory.entries)
+                else:
+                    # Look up the key in memory store
+                    recall_content = memory.get(recall_key)
+                    if recall_content is not None:
+                        recall_output = recall_content
+                    else:
+                        # Try reading from disk
+                        recall_output = None
+                        if shell is not None:
+                            try:
+                                mem_file = shell.session_workspace / "memory" / f"{recall_key}.txt"
+                                if mem_file.exists():
+                                    recall_output = mem_file.read_text()
+                            except Exception:
+                                pass
+                        if recall_output is None:
+                            available_keys = memory.keys()
+                            recall_output = (
+                                f"ERROR: Key '{recall_key}' not found in memory.\n"
+                                f"Available keys: {', '.join(available_keys) if available_keys else '(none)'}\n"
+                                "Use recall(key='index') to see all stored entries."
+                            )
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": str(recall_output)
+                })
+                
+                tc_record = ToolCallRecord(
+                    tool_name="recall",
+                    tool_args=tool_args,
+                    tool_call_id=tool_call["id"],
+                    output=str(recall_output)[:500],
+                    duration_s=0,
+                    child_trace=None,
+                )
+                turn_record.tool_calls.append(tc_record)
+                
+                if verbose:
+                    preview = str(recall_output)[:150]
+                    print(f"   🔍 Recalled {recall_key}: {preview}...")
+                continue
+            
+            # ── Check for store_memory ────────────────────────────────
+            if tool_name == "store_memory":
+                store_content = tool_args.get("content", "")
+                store_desc = tool_args.get("description", "user_note")
+                
+                mem_key = memory.add(
+                    tool_name="store_memory",
+                    turn=turn,
+                    content=store_content,
+                    description=store_desc,
+                )
+                
+                # Write to disk
+                if shell is not None:
+                    try:
+                        mem_dir = shell.session_workspace / "memory"
+                        mem_dir.mkdir(exist_ok=True)
+                        mem_file = mem_dir / f"{mem_key}.txt"
+                        mem_file.write_text(store_content)
+                    except Exception as e:
+                        logger.debug(f"Could not write memory file: {e}")
+                
+                confirmation = f"Stored as: {mem_key} ({len(store_content):,} chars). Use recall(key='{mem_key}') to retrieve."
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": confirmation
+                })
+                
+                tc_record = ToolCallRecord(
+                    tool_name="store_memory",
+                    tool_args=tool_args,
+                    tool_call_id=tool_call["id"],
+                    output=confirmation,
+                    duration_s=0,
+                    child_trace=None,
+                )
+                turn_record.tool_calls.append(tc_record)
+                
+                if verbose:
+                    print(f"   💾 Stored: {mem_key} ({len(store_content):,} chars)")
+                continue
+            
+            # Execute tool
             tc_start = time.time()
             child_trace = None
+            
+            # ── Auto-mark plan subtask on spawn_agent dispatch ────────
+            _spawn_subtask_id = None
+            if tool_name == "spawn_agent" and current_plan is not None:
+                _spawn_subtask_id = tool_args.get("subtask_id")
+                if _spawn_subtask_id is not None:
+                    matched = [s for s in current_plan["subtasks"] if s["id"] == _spawn_subtask_id]
+                    if matched:
+                        matched[0]["status"] = "in_progress"
+                        plan_history.append({"turn": turn, "action": "auto_in_progress", "detail": f"Subtask {_spawn_subtask_id}"})
+                        if verbose:
+                            print(f"   🔄 Auto-marked subtask {_spawn_subtask_id} as in_progress")
+            
+            # Build progress callback for sub-agent visibility (Fix A)
+            _sub_progress = None
+            if verbose and tool_name == "spawn_agent":
+                _stid = _spawn_subtask_id  # capture for closure
+                _sub_progress = lambda msg, _id=_stid: print(
+                    f"   ↳ [sub{'' if _id is None else f' #{_id}'}] {msg}")
+            
+            # ── Parallel dispatch for concurrent spawn_agents (Fix B) ──
+            if _spawn_executor is not None and tool_name == "spawn_agent":
+                future = _spawn_executor.submit(
+                    dispatch_tool_call, tool_name, tool_args,
+                    _depth=_depth, model=model, reasoning_effort=reasoning_effort,
+                    _sandbox_files=_sandbox_files, _shell=shell,
+                    _progress_fn=_sub_progress
+                )
+                _deferred_spawns.append({
+                    'future': future, 'tool_name': tool_name,
+                    'tool_args': tool_args, 'tool_call': tool_call,
+                    'subtask_id': _spawn_subtask_id, 'tc_start': tc_start,
+                })
+                if verbose:
+                    print(f"   ⏳ Queued for parallel dispatch ({len(_deferred_spawns)}/{_spawn_tc_count})")
+                continue
+            
+            # ── Synchronous dispatch ──────────────────────────────────
             try:
-                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _shell=shell)
-                if verbose and len(output) < 200:
-                    print(f"       → {output}")
-                elif verbose:
-                    print(f"       → {output[:200]}...")
+                output, child_trace = dispatch_tool_call(
+                    tool_name, tool_args, _depth=_depth, model=model,
+                    reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files,
+                    _shell=shell, _progress_fn=_sub_progress
+                )
             except Exception as e:
                 output = f"ERROR: {str(e)}"
+                child_trace = None
                 if verbose:
                     print(f"       → ❌ {output}")
             tc_duration = round(time.time() - tc_start, 3)
-            
-            # Track consecutive identical errors to break degenerate retry loops
-            if output.startswith("ERROR:"):
-                error_sig = f"{tool_name}:{output[:200]}"
-                if error_sig == last_error_signature:
-                    consecutive_error_count += 1
-                else:
-                    consecutive_error_count = 1
-                    last_error_signature = error_sig
-                
-                if consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
-                    output += (
-                        f"\n\nFATAL: This same error has occurred {consecutive_error_count} times in a row. "
-                        "STOP retrying. Either try a completely different approach, simplify your code, "
-                        "or call final_answer with what you have so far."
-                    )
+            _handle_tool_output(tool_name, tool_args, tool_call, output, child_trace, tc_duration, _spawn_subtask_id)
+        
+        # ── Process parallel spawn results ────────────────────────────
+        if _deferred_spawns:
+            if verbose:
+                print(f"   ⌛ Waiting for {len(_deferred_spawns)} parallel sub-agents...")
+            for ds in _deferred_spawns:
+                try:
+                    output, child_trace = ds['future'].result(timeout=660)
+                except Exception as e:
+                    output, child_trace = f"ERROR: {str(e)}", None
                     if verbose:
-                        print(f"       ⚠️  Degenerate retry loop detected ({consecutive_error_count}x)")
-            else:
-                consecutive_error_count = 0
-                last_error_signature = None
-            
-            # Record tool call in trace
-            tc_record = ToolCallRecord(
-                tool_name=tool_name,
-                tool_args=tool_args,
-                tool_call_id=tool_call["id"],
-                output=output,
-                duration_s=tc_duration,
-                child_trace=child_trace,
-            )
-            turn_record.tool_calls.append(tc_record)
-            
-            # ── Track findings for synthesis fallback ─────────────────
-            # Keep a compact log of non-error tool outputs so we can
-            # inject them into the synthesis prompt if the model runs out.
-            if not output.startswith("ERROR:") and tool_name not in ("search_available_tools", "get_current_time", "add_numbers"):
-                snippet = output[:1500].strip()
-                if snippet:
-                    findings.append(f"[{tool_name}] {snippet}")
-                
-                # ── Memory store: full-fidelity capture ───────────────
-                # Store the FULL output (not truncated) for zero-loss synthesis.
-                # Description is auto-extracted from the tool args when available.
-                desc = ""
-                if tool_name == "search_web":
-                    desc = str(tool_args.get("q", ""))[:60]
-                elif tool_name == "fetch_url":
-                    desc = str(tool_args.get("url", ""))[:60]
-                elif tool_name == "read_pdf":
-                    desc = str(tool_args.get("url", ""))[:60]
-                elif tool_name == "spawn_agent":
-                    desc = str(tool_args.get("task", ""))[:60]
-                memory.add(
-                    tool_name=tool_name,
-                    turn=turn,
-                    content=output,
-                    description=desc,
+                        print(f"       → ❌ {output}")
+                tc_duration = round(time.time() - ds['tc_start'], 3)
+                _handle_tool_output(
+                    ds['tool_name'], ds['tool_args'], ds['tool_call'],
+                    output, child_trace, tc_duration, ds['subtask_id']
                 )
-            
-            # Add tool result to messages (strip base64 blobs to avoid
-            # blowing up the context window — the trace keeps the full output)
-            msg_output = re.sub(
-                r"(--- .+? \(base64\) ---\n).+?(\n---|$)",
-                r"\1[file content saved to trace]\2",
-                output, flags=re.DOTALL
-            )
-            tool_message = {
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": str(msg_output)
-            }
-            messages.append(tool_message)
+            _spawn_executor.shutdown(wait=False)
+            _deferred_spawns.clear()
         
         turn_record.duration_s = round(time.time() - turn_start, 3)
         episode.turns.append(turn_record)

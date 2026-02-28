@@ -4,6 +4,10 @@ MemoryStore: Zero-information-loss storage for agent tool outputs.
 Accumulates full tool outputs during the agent loop, then serializes
 them as a gzip+base64 compressed archive that synthesis sub-agents
 can programmatically decode and query via execute_code.
+
+Symbolic Memory: Tool outputs are stored on the sandbox filesystem
+and only summaries + symbolic references go into the LLM context.
+The model can recall full outputs via the recall() tool.
 """
 
 import base64
@@ -245,3 +249,138 @@ class MemoryStore:
             store.entries.append(entry)
             store._total_chars += entry.content_length
         return store
+
+
+# ── Summary extraction ────────────────────────────────────────────────────
+# Heuristic extractors that produce ~200-800 char summaries from full
+# tool outputs. These go into the LLM context instead of the full output.
+
+# Max chars to keep in LLM context per tool result (hybrid approach)
+CONTEXT_TRUNCATE_CHARS = 800
+
+
+def extract_summary(tool_name: str, content: str, tool_args: dict = None) -> str:
+    """Extract a compact summary from a tool output.
+    
+    Returns a string suitable for injection into the LLM context in place
+    of the full output. Includes the most informative parts + a note about
+    how to recall the full content.
+    
+    Args:
+        tool_name: The tool that produced this output
+        content: Full output text
+        tool_args: Original tool arguments (for context)
+        
+    Returns:
+        Summary string, typically 200-800 chars
+    """
+    if not content or content.startswith("ERROR:"):
+        return content  # errors go through verbatim
+    
+    tool_args = tool_args or {}
+    
+    if tool_name == "search_web":
+        return _summarize_search(content)
+    elif tool_name == "fetch_url":
+        return _summarize_page(content, tool_args.get("url", ""))
+    elif tool_name == "read_pdf":
+        return _summarize_page(content, tool_args.get("url", ""))
+    elif tool_name == "spawn_agent":
+        return _summarize_agent(content)
+    elif tool_name == "sandbox_shell":
+        return _summarize_shell(content)
+    else:
+        return _summarize_generic(content)
+
+
+def _summarize_search(content: str) -> str:
+    """Extract titles + URLs from search results, skip snippets."""
+    lines = content.split("\n")
+    summary_lines = []
+    for line in lines:
+        line = line.strip()
+        # Keep header, numbered titles, and URLs
+        if line.startswith("Search Results for"):
+            summary_lines.append(line)
+        elif re.match(r'^\d+\.', line):
+            summary_lines.append(line)
+        elif line.startswith("URL:"):
+            summary_lines.append(f"   {line}")
+    
+    result = "\n".join(summary_lines)
+    if len(result) > CONTEXT_TRUNCATE_CHARS:
+        result = result[:CONTEXT_TRUNCATE_CHARS] + "\n... (truncated — use recall to see full results)"
+    return result
+
+
+def _summarize_page(content: str, url: str) -> str:
+    """First ~600 chars of a fetched page, plus a note about the full content."""
+    total = len(content)
+    # Take the first meaningful chunk
+    preview = content[:600].strip()
+    # Try to cut at a sentence boundary
+    last_period = preview.rfind(".")
+    if last_period > 200:
+        preview = preview[:last_period + 1]
+    
+    lines = [preview]
+    if total > 600:
+        lines.append(f"\n... [{total:,} chars total — use recall to read the full page]")
+    return "\n".join(lines)
+
+
+def _summarize_agent(content: str) -> str:
+    """Sub-agent results: keep first 800 chars (usually concise already)."""
+    if len(content) <= CONTEXT_TRUNCATE_CHARS:
+        return content
+    preview = content[:CONTEXT_TRUNCATE_CHARS]
+    last_period = preview.rfind(".")
+    if last_period > 400:
+        preview = preview[:last_period + 1]
+    return preview + f"\n... [{len(content):,} chars total — use recall for full result]"
+
+
+def _summarize_shell(content: str) -> str:
+    """Shell output: keep exit code + first/last lines of stdout."""
+    lines = content.split("\n")
+    
+    # Always keep exit code and duration lines
+    header_lines = []
+    body_lines = []
+    for line in lines:
+        if line.startswith(("Exit Code:", "Duration:", "⚠️ TIMED OUT", "STDOUT:", "STDERR:")):
+            header_lines.append(line)
+        else:
+            body_lines.append(line)
+    
+    if len(body_lines) <= 15:
+        # Short output — keep it all
+        return content
+    
+    # Long output — keep first 8 and last 5 lines
+    kept = body_lines[:8] + [f"... ({len(body_lines) - 13} lines omitted — use recall for full output)"] + body_lines[-5:]
+    return "\n".join(header_lines + kept)
+
+
+def _summarize_generic(content: str) -> str:
+    """Generic fallback: first 800 chars."""
+    if len(content) <= CONTEXT_TRUNCATE_CHARS:
+        return content
+    preview = content[:CONTEXT_TRUNCATE_CHARS]
+    return preview + f"\n... [{len(content):,} chars total — use recall for full output]"
+
+
+def build_memory_index(entries: List[MemoryEntry]) -> str:
+    """Build a scannable index of all stored memories.
+    
+    Returns a compact string listing all entries with their keys,
+    sources, turn numbers, and content lengths. This can be injected
+    into the LLM context periodically.
+    """
+    if not entries:
+        return "📦 Memory: empty"
+    
+    lines = [f"📦 Memory Index ({len(entries)} items stored on disk):"]
+    for e in entries:
+        lines.append(f"  • {e.key} | {e.source_tool} | turn {e.turn} | {e.content_length:,} chars")
+    return "\n".join(lines)
