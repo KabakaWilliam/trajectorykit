@@ -281,10 +281,12 @@ def extract_summary(tool_name: str, content: str, tool_args: dict = None) -> str
     
     if tool_name == "search_web":
         return _summarize_search(content)
-    elif tool_name == "fetch_url":
+    elif tool_name in ("fetch_url", "smart_fetch"):
         return _summarize_page(content, tool_args.get("url", ""))
     elif tool_name == "read_pdf":
         return _summarize_page(content, tool_args.get("url", ""))
+    elif tool_name == "download_file":
+        return _summarize_generic(content)  # download results are already compact JSON
     elif tool_name == "spawn_agent":
         return _summarize_agent(content)
     elif tool_name == "sandbox_shell":

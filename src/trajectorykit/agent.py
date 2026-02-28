@@ -197,9 +197,9 @@ def dispatch(
         system_prompt = SYSTEM_PROMPT
         available_tools = TOOLS
     else:
-        # Sub-agents: no spawn_agent, no planning tools, no memory tools
-        # (they get focused tasks and should just work, not plan)
-        _ORCHESTRATOR_ONLY = {"spawn_agent", "create_plan", "update_plan", "recall", "store_memory"}
+        # Sub-agents: no spawn_agent, no planning tools, no store_memory
+        # They keep recall (read-only) so they can retrieve truncated outputs
+        _ORCHESTRATOR_ONLY = {"spawn_agent", "create_plan", "update_plan", "store_memory"}
         system_prompt = WORKER_PROMPT
         available_tools = [t for t in TOOLS if t["function"]["name"] not in _ORCHESTRATOR_ONLY]
 
@@ -555,6 +555,29 @@ def dispatch(
             if verbose:
                 print(f"🔎  Injected periodic question reminder (turn {turn})")
 
+        # ── Memory index injection (sub-agents) ──────────────────────────
+        # Every 4 turns, remind the agent what's stored in memory so it
+        # knows it can use recall() to retrieve full content.
+        _MEMORY_INJECT_INTERVAL = 4
+        if (
+            _depth > 0
+            and turn > 1
+            and turn % _MEMORY_INJECT_INTERVAL == 0
+            and memory.entries
+        ):
+            mem_index = build_memory_index(memory.entries)
+            messages.append({"role": "system", "content": (
+                f"{mem_index}\n\n"
+                "⚠️ The summaries above are TRUNCATED. To get the full content, "
+                "you MUST call the recall tool: recall(key=\"<key>\").\n"
+                "recall is a real tool in your toolbox — issue it as a tool call, "
+                "do NOT just describe or discuss it in your response.\n"
+                "For large pages stored on disk, prefer sandbox_shell with grep/head "
+                "to extract only what you need (see the 📦 hints after each fetch)."
+            )})
+            if verbose:
+                print(f"📦  Injected memory index ({len(memory.entries)} entries, turn {turn})")
+
         # ── Budget-aware tool restriction ─────────────────────────────────
         # Progressive warnings at multiple checkpoints, then force final_answer.
         q_echo = user_input[:500] + ("…" if len(user_input) > 500 else "")
@@ -820,6 +843,12 @@ def dispatch(
             """Process a completed tool dispatch: auto-mark done/failed, error-track, trace, memory, message."""
             nonlocal consecutive_error_count, last_error_signature
             
+            # Detect metadata dict returned by smart_fetch_wrapper (not a real child trace)
+            _tool_meta = None
+            if isinstance(child_trace, dict):
+                _tool_meta = child_trace
+                child_trace = None
+            
             # Auto-mark plan subtask on spawn_agent return
             if _spawn_subtask_id is not None and current_plan is not None and not output.startswith("ERROR:"):
                 matched = [s for s in current_plan["subtasks"] if s["id"] == _spawn_subtask_id]
@@ -895,7 +924,7 @@ def dispatch(
                 desc = ""
                 if tool_name == "search_web":
                     desc = str(tool_args.get("q", ""))[:60]
-                elif tool_name == "fetch_url":
+                elif tool_name in ("fetch_url", "smart_fetch"):
                     desc = str(tool_args.get("url", ""))[:60]
                 elif tool_name == "read_pdf":
                     desc = str(tool_args.get("url", ""))[:60]
@@ -916,7 +945,10 @@ def dispatch(
                         mem_dir = shell.session_workspace / "memory"
                         mem_dir.mkdir(exist_ok=True)
                         mem_file = mem_dir / f"{mem_key}.txt"
-                        mem_file.write_text(output)
+                        # If the tool provided full (un-truncated) content, save that to disk
+                        # so agents can selectively grep/head through it.
+                        disk_content = (_tool_meta or {}).get("_full_content") or output
+                        mem_file.write_text(disk_content)
                     except Exception as e:
                         logger.debug(f"Could not write memory file: {e}")
                 
@@ -927,7 +959,17 @@ def dispatch(
                 summary = extract_summary(tool_name, output, tool_args)
                 
                 if len(summary) < len(output):
-                    msg_output = f"{summary}\n\n📦 Full output stored as: {mem_key} (use recall to retrieve)"
+                    has_full = bool((_tool_meta or {}).get("_full_content"))
+                    if has_full:
+                        msg_output = (
+                            f"{summary}\n\n"
+                            f"📦 Full page stored on disk: /workspace/memory/{mem_key}.txt\n"
+                            f"   → Use sandbox_shell to search: grep -i 'keyword' /workspace/memory/{mem_key}.txt\n"
+                            f"   → Or peek: head -200 /workspace/memory/{mem_key}.txt\n"
+                            f"   → Or recall(key=\"{mem_key}\") for the truncated version"
+                        )
+                    else:
+                        msg_output = f"{summary}\n\n📦 Full output stored as: {mem_key} (use recall to retrieve)"
                 else:
                     msg_output = summary
             else:

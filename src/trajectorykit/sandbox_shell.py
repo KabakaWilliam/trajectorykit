@@ -128,12 +128,63 @@ class SandboxShell:
         self._log = open(log_path, "a", buffering=1)
 
         self._start_shell()
+        self._provision_tools()
         
         # Register for global cleanup
         with _LIVE_SHELLS_LOCK:
             _LIVE_SHELLS.append(self)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def _provision_tools(self) -> None:
+        """Write helper scripts into the session workspace so they are
+        available inside the container at /workspace/bin/."""
+        bin_dir = self.session_workspace / "bin"
+        bin_dir.mkdir(exist_ok=True)
+
+        # ── wcurl: browser-grade curl wrapper ─────────────────────────────
+        wcurl_script = bin_dir / "wcurl"
+        wcurl_script.write_text(
+            '#!/usr/bin/env bash\n'
+            '# wcurl — curl with browser-grade defaults\n'
+            '# Automatically sets User-Agent, cookie jar, follow redirects,\n'
+            '# compression, and reasonable timeouts.\n'
+            'set -euo pipefail\n'
+            '\n'
+            'COOKIE_JAR="/workspace/.cookie_jar"\n'
+            '\n'
+            'exec curl \\\n'
+            '  -L \\\n'
+            '  --max-time 60 \\\n'
+            '  --connect-timeout 10 \\\n'
+            '  --retry 2 \\\n'
+            '  --retry-delay 2 \\\n'
+            '  --compressed \\\n'
+            '  -b "$COOKIE_JAR" \\\n'
+            '  -c "$COOKIE_JAR" \\\n'
+            '  -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \\\n'
+            '  -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \\\n'
+            '  -H "Accept-Language: en-US,en;q=0.9" \\\n'
+            '  -H "Accept-Encoding: gzip, deflate, br" \\\n'
+            '  -H "Sec-Fetch-Dest: document" \\\n'
+            '  -H "Sec-Fetch-Mode: navigate" \\\n'
+            '  -H "Sec-Fetch-Site: none" \\\n'
+            '  -H "Sec-Fetch-User: ?1" \\\n'
+            '  -H "Upgrade-Insecure-Requests: 1" \\\n'
+            '  "$@"\n'
+        )
+        wcurl_script.chmod(0o755)
+
+        # Add bin to PATH inside the container
+        if self.is_alive:
+            try:
+                self._proc.stdin.write(
+                    'export PATH="/workspace/bin:$PATH"\n'
+                )
+                self._proc.stdin.flush()
+                time.sleep(0.1)
+            except Exception:
+                pass  # best-effort
 
     def _build_apptainer_cmd(self) -> list[str]:
         cmd = ["apptainer", "exec"]
@@ -233,6 +284,19 @@ class SandboxShell:
         except Exception:
             pass
         self._log_event("RESTART", "Shell restarted successfully")
+
+    def cleanup_session(self) -> None:
+        """Remove all files from this session's workspace directory.
+
+        Call after an eval finishes to reclaim disk space.
+        The session workspace is bind-mounted as /workspace inside the
+        container, so this wipes everything the agent downloaded or created.
+        """
+        import shutil as _shutil
+        if self.session_workspace.exists():
+            _shutil.rmtree(self.session_workspace, ignore_errors=True)
+            self.session_workspace.mkdir(parents=True, exist_ok=True)
+            self._log_event("CLEANUP", f"Wiped session workspace: {self.session_workspace}")
 
     def close(self) -> None:
         """Terminate the shell session and clean up."""

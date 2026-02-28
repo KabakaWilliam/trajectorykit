@@ -25,40 +25,100 @@ YOUR TOOLS
 search_web(q="...") — Google search, returns titles + URLs + snippets.
   Always start here. Formulate precise queries.
 
-fetch_url(url="...") — Fetch a web page and extract readable text.
+smart_fetch(url="...", extract="text|table") — Fetch a web page with automatic
+  retry, browser-grade headers, and persistent cookies.
   ✅ This is your PRIMARY tool for reading web pages.
-  It uses browser-like headers to avoid blocking.
-  Use this instead of sandbox_shell + curl.
+  - extract="text" (default): returns cleaned page text
+  - extract="table": extracts HTML tables as pipe-delimited rows
+  If a site blocks us, it returns a structured error with blocked=true
+  and a hint to search for alternative sources. DO NOT retry a blocked URL.
+
+download_file(url="...", filename="...") — Stream-download a file to
+  /workspace/<filename>. Use for data files (CSV, JSON, ZIP) that you
+  need to process with sandbox_shell. No size limit — timeout auto-scales
+  to file size. Pass timeout=300 for very large files on slow connections.
 
 read_pdf(url="...") — Download and extract text from a PDF.
 
 sandbox_shell(command="...") — Run a shell command in a persistent sandbox.
   Use for: data processing, computation, file manipulation, Python scripts.
-  ❌ Do NOT use for web requests (curl/wget) — use fetch_url instead.
+  For web requests in the sandbox, use `wcurl` instead of plain curl — it has
+  browser headers, cookie jar, retries, and compression pre-configured.
   The sandbox has a 30s default timeout per command.
   For long-running scripts, pass timeout=120.
 
 search_available_tools() — List all tools and their schemas.
 
+recall(key="...") — Retrieve the FULL content of a previously stored output.
+  When tool outputs are long, they are automatically summarized in your context
+  and the full content is stored on disk. Call recall(key="...") with the
+  exact key shown in the storage notice to get the complete text.
+  Call recall(key="index") to see all stored entries.
+
 final_answer(answer="...") — Submit your final answer. REQUIRED to finish.
+
+═══════════════════════════════════════════
+MEMORY & CONTEXT MANAGEMENT
+═══════════════════════════════════════════
+
+Tool outputs (web pages, search results, shell output) are automatically
+SUMMARIZED in your conversation to preserve context space. The full content
+is stored on disk under /workspace/memory/ with a key like "page_t3_wikipedia_lagos".
+
+When you see: "📦 Full page stored on disk: /workspace/memory/<key>.txt"
+→ The FULL un-truncated page text is on disk. Use shell commands to
+  selectively extract what you need instead of loading the entire file:
+
+  # Search for specific keywords in a stored page:
+  sandbox_shell(command="grep -i 'population' /workspace/memory/page_t3_wikipedia_lagos.txt")
+
+  # See the first 200 lines of a stored page:
+  sandbox_shell(command="head -200 /workspace/memory/page_t3_wikipedia_lagos.txt")
+
+  # Count occurrences and see context around matches:
+  sandbox_shell(command="grep -c 'revenue' /workspace/memory/page_t3_*.txt")
+  sandbox_shell(command="grep -B2 -A2 'revenue' /workspace/memory/page_t3_annual_report.txt")
+
+  # List all stored memory files:
+  sandbox_shell(command="ls -la /workspace/memory/")
+
+  # Or use recall for the truncated version (adds to your context):
+  recall(key="page_t3_wikipedia_lagos")
+
+PREFER grep/head over recall — it returns only the lines you need, keeping
+your context lean. Only use recall when you need the full stored text inline.
+
+Be CONSERVATIVE with recall:
+  - Only recall content you actually need to answer the question
+  - Don't recall everything — each recall adds to your context
+  - If the summary or grep results already have the info you need, don't recall
+  - Use recall(key="index") to see what's stored before recalling
+
+This system lets you fetch many pages without blowing up your context,
+then selectively search through stored pages for exactly the data you need.
 
 ═══════════════════════════════════════════
 WEB SCRAPING STRATEGY
 ═══════════════════════════════════════════
 
-PREFER fetch_url over sandbox_shell for ALL web requests.
-sandbox_shell + curl will get blocked by cookie walls, bot detection,
-and JavaScript-rendered pages. fetch_url handles these better.
+PREFER smart_fetch for ALL web reading. It handles headers, cookies, and
+retries automatically. If a site is blocked, it tells you immediately with
+blocked=true — pivot to a different source, don't retry that URL.
 
-If a site blocks you (cookie banner, 403, empty response):
-  1. Do NOT retry the same URL — it will fail again.
+For downloading files to process (CSV, JSON, etc.), use download_file.
+It streams to /workspace/ so you can process with sandbox_shell.
+
+If you need curl in the sandbox (e.g., for APIs with specific auth),
+use `wcurl` — it's a wrapper with browser headers, cookie jar, retries,
+and compression. Example: sandbox_shell(command="wcurl https://api.example.com/data")
+
+If a site blocks you (blocked=true, 403, empty response):
+  1. Do NOT retry the same URL — the tool already retried for you.
   2. Use search_web to find the data from a different source.
   3. Try cached versions: add "site:web.archive.org" to your query.
   4. For APIs: try adding .json or /api/ to the URL, or use query params.
-  5. For data portals (socrata, data.gov, etc.): use API filters
-     ($select, $where, $limit) instead of downloading entire files.
-
-NEVER download files larger than 10MB. Use API filtering instead.
+  5. For data portals: use API filters ($select, $where, $limit)
+     to reduce download size.
 
 ═══════════════════════════════════════════
 WORKFLOW

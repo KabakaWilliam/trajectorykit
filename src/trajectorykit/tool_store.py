@@ -330,21 +330,383 @@ def search_web(q: str, num_results: int = DEFAULT_NUM_SEARCHES) -> str:
     return result
 
 _BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Linux"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
 }
 
-def fetch_url(url: str, max_chars: int = 8000) -> str:
-    """Fetch and extract readable text from a URL."""
+# ── Per-session cookie jar (shared across all smart_fetch calls) ─────────
+_cookie_jar = None
+
+def _get_cookie_jar():
+    """Lazy-init a persistent cookie jar for the session."""
+    global _cookie_jar
+    if _cookie_jar is None:
+        import httpx
+        _cookie_jar = httpx.Cookies()
+    return _cookie_jar
+
+# Patterns that indicate a page is blocked / useless
+_BLOCK_PATTERNS = [
+    "enable javascript",
+    "enable cookies",
+    "cookie consent",
+    "cookies are disabled",
+    "access denied",
+    "403 forbidden",
+    "please verify you are a human",
+    "captcha",
+    "cloudflare",
+    "just a moment",
+    "checking your browser",
+    "robot or human",
+    "unusual traffic",
+    "bot detection",
+]
+
+
+def _is_blocked(text: str, status_code: int) -> tuple[bool, str]:
+    """Check if a page response looks like a block/wall. Returns (is_blocked, reason)."""
+    if status_code == 403:
+        return True, "HTTP 403 Forbidden"
+    if status_code == 429:
+        return True, "HTTP 429 Too Many Requests"
+    if status_code == 451:
+        return True, "HTTP 451 Unavailable For Legal Reasons"
+    if status_code >= 400:
+        return True, f"HTTP {status_code}"
+    # Very short page with no real content → likely a wall/redirect page
+    text_lower = text.lower() if text else ""
+    if len(text_lower) < 200:
+        for pattern in _BLOCK_PATTERNS:
+            if pattern in text_lower:
+                return True, f"Blocked page (matched: '{pattern}')"
+    # Slightly larger pages can still be walls
+    for pattern in _BLOCK_PATTERNS:
+        # Only match if the page is short enough that the pattern is a major part
+        if pattern in text_lower and len(text_lower) < 2000:
+            return True, f"Blocked page (matched: '{pattern}')"
+    return False, ""
+
+
+def _jina_reader_fallback(url: str, max_chars: int = 8000) -> tuple[str | None, str | None]:
+    """Try fetching a page via Jina Reader (r.jina.ai) as a JS-rendering fallback.
+
+    Returns (truncated_content, full_content) on success, (None, None) on failure.
+    This is a free public API — no key needed for basic use (~20 RPM).
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(
+            f"https://r.jina.ai/{url}",
+            timeout=15,
+            headers={
+                "Accept": "text/plain",
+                "User-Agent": _BROWSER_HEADERS["User-Agent"],
+            },
+        )
+        if resp.status_code == 200 and len(resp.text.strip()) > 200:
+            full = resp.text.strip()
+            logger.info(f"Jina reader fallback succeeded for {url[:80]} ({len(full)} chars)")
+            return full[:max_chars], full
+    except Exception as e:
+        logger.debug(f"Jina reader fallback failed for {url[:80]}: {e}")
+    return None, None
+
+
+def smart_fetch(
+    url: str,
+    max_chars: int = 8000,
+    extract: str = "text",
+    max_retries: int = 2,
+    timeout: int = 20,
+) -> dict:
+    """Fetch a web page with browser-grade headers, cookie jar, retries, and
+    structured error reporting.
+
+    Returns a dict with keys:
+      - ok: bool
+      - content: str (extracted text or table data)
+      - url: str (final URL after redirects)
+      - blocked: bool (True if the site appears to be blocking us)
+      - reason: str (if blocked or error, explains why)
+      - status_code: int
+      - retries: int (how many retries were used)
+    """
     import httpx
     from bs4 import BeautifulSoup
-    resp = httpx.get(url, timeout=15, follow_redirects=True, headers=_BROWSER_HEADERS)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    return text[:max_chars]
+    import time
+
+    cookies = _get_cookie_jar()
+    last_error = ""
+    last_status = 0
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = httpx.get(
+                url,
+                timeout=timeout,
+                follow_redirects=True,
+                headers=_BROWSER_HEADERS,
+                cookies=cookies,
+            )
+            # Store any cookies the server set
+            cookies.update(resp.cookies)
+            last_status = resp.status_code
+            final_url = str(resp.url)
+
+            # Pick the right parser based on content type
+            ctype = resp.headers.get("content-type", "")
+            if "xml" in ctype or resp.text.lstrip().startswith("<?xml"):
+                # XML document (RSS, API response, sitemap, etc.)
+                try:
+                    soup = BeautifulSoup(resp.text, "xml")
+                except Exception:
+                    # lxml not installed — fall back to html.parser with warning suppressed
+                    import warnings
+                    from bs4 import XMLParsedAsHTMLWarning
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+                        soup = BeautifulSoup(resp.text, "html.parser")
+            else:
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+            for tag in soup(["script", "style", "nav", "footer", "noscript"]):
+                tag.decompose()
+
+            if extract == "table":
+                # Extract tables as structured data
+                tables = soup.find_all("table")
+                if tables:
+                    rows = []
+                    for table in tables[:3]:  # max 3 tables
+                        for tr in table.find_all("tr"):
+                            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                            if cells:
+                                rows.append(" | ".join(cells))
+                    full_text = "\n".join(rows)
+                else:
+                    full_text = soup.get_text(separator="\n", strip=True)
+            else:
+                full_text = soup.get_text(separator="\n", strip=True)
+
+            content = full_text[:max_chars]
+
+            # Check for blocking
+            blocked, reason = _is_blocked(content, resp.status_code)
+
+            # Also flag suspiciously short pages (likely JS-rendered shells)
+            suspiciously_short = (
+                len(content.strip()) < 200
+                and resp.status_code == 200
+                and not blocked
+            )
+
+            if blocked or suspiciously_short:
+                if attempt < max_retries:
+                    time.sleep(1.5 * (attempt + 1))  # backoff: 1.5s, 3s
+                    continue
+
+                # Last resort: try Jina Reader as a fallback renderer
+                jina_content, jina_full = _jina_reader_fallback(url, max_chars)
+                if jina_content:
+                    return {
+                        "ok": True,
+                        "content": jina_content,
+                        "_full_content": jina_full or jina_content,
+                        "url": final_url,
+                        "blocked": False,
+                        "reason": "",
+                        "status_code": 200,
+                        "retries": attempt,
+                        "source": "jina_reader",
+                    }
+
+                if blocked:
+                    return {
+                        "ok": False,
+                        "content": "",
+                        "url": final_url,
+                        "blocked": True,
+                        "reason": reason,
+                        "status_code": last_status,
+                        "retries": attempt,
+                        "hint": "This site is blocking automated access. Search for the same information from a different source instead of retrying this URL.",
+                    }
+                # Suspiciously short but not blocked — return what we have
+                return {
+                    "ok": True,
+                    "content": content,
+                    "_full_content": full_text,
+                    "url": final_url,
+                    "blocked": False,
+                    "reason": "Page returned very little text (possibly JS-rendered). Jina fallback also failed.",
+                    "status_code": resp.status_code,
+                    "retries": attempt,
+                }
+
+            return {
+                "ok": True,
+                "content": content,
+                "_full_content": full_text,
+                "url": final_url,
+                "blocked": False,
+                "reason": "",
+                "status_code": resp.status_code,
+                "retries": attempt,
+            }
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            if attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+
+    return {
+        "ok": False,
+        "content": "",
+        "url": url,
+        "blocked": False,
+        "reason": last_error,
+        "status_code": last_status,
+        "retries": max_retries,
+        "hint": "Request failed after retries. Try a different URL or source.",
+    }
+
+
+def download_file(
+    url: str,
+    filename: str | None = None,
+    timeout: int | None = None,
+    _shell=None,
+) -> dict:
+    """Download a file via streaming to the sandbox workspace.
+
+    No hard size cap — time is the constraint, not bytes. Timeout scales
+    automatically based on Content-Length (min 60s, ~10 MB/s assumed).
+    The model can override with an explicit timeout.
+
+    Returns a dict with keys:
+      - ok: bool
+      - path: str (path in sandbox workspace, /workspace/<filename>)
+      - size_mb: float
+      - note: str (advisory, e.g. large-file warning)
+      - reason: str (if error)
+    """
+    import httpx
+    import os
+    import shutil
+    import tempfile
+
+    if not filename:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        filename = os.path.basename(parsed.path) or "download"
+
+    # Estimate timeout from Content-Length if not explicitly set.
+    # We do a HEAD first to get size without downloading.
+    estimated_mb = 0.0
+    note = ""
+    if timeout is None:
+        try:
+            head = httpx.head(url, timeout=10, follow_redirects=True, headers=_BROWSER_HEADERS)
+            cl = head.headers.get("content-length")
+            if cl:
+                estimated_mb = int(cl) / (1024 * 1024)
+                # ~10 MB/s conservative, minimum 60s, max 600s
+                timeout = max(60, min(600, int(estimated_mb / 10 * 1.5)))
+                if estimated_mb > 500:
+                    note = f"Large file (~{estimated_mb:.0f} MB). Download may take a few minutes."
+                elif estimated_mb > 100:
+                    note = f"File is ~{estimated_mb:.0f} MB."
+        except Exception:
+            pass
+        if timeout is None:
+            timeout = 120  # Unknown size — generous default
+
+    try:
+        with httpx.stream("GET", url, timeout=timeout, follow_redirects=True, headers=_BROWSER_HEADERS) as resp:
+            if resp.status_code >= 400:
+                return {
+                    "ok": False,
+                    "path": "",
+                    "size_mb": 0,
+                    "note": "",
+                    "reason": f"HTTP {resp.status_code}",
+                }
+
+            total = 0
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}")
+            try:
+                for chunk in resp.iter_bytes(chunk_size=65536):
+                    total += len(chunk)
+                    tmp.write(chunk)
+                tmp.close()
+            except Exception:
+                tmp.close()
+                os.unlink(tmp.name)
+                raise
+
+            # Move to sandbox workspace (bind-mounted as /workspace in container)
+            dest_path = f"/workspace/{filename}"
+            if _shell is not None and hasattr(_shell, 'session_workspace'):
+                host_dest = str(_shell.session_workspace / filename)
+                shutil.move(tmp.name, host_dest)
+            else:
+                os.makedirs("workspace", exist_ok=True)
+                local_dest = f"workspace/{filename}"
+                shutil.move(tmp.name, local_dest)
+                dest_path = os.path.abspath(local_dest)
+
+            size_mb = round(total / (1024 * 1024), 2)
+            if not note and size_mb > 100:
+                note = f"Downloaded {size_mb} MB."
+
+            return {
+                "ok": True,
+                "path": dest_path,
+                "size_mb": size_mb,
+                "note": note,
+                "reason": "",
+            }
+
+    except httpx.TimeoutException:
+        return {
+            "ok": False,
+            "path": "",
+            "size_mb": estimated_mb,
+            "note": "",
+            "reason": f"Download timed out after {timeout}s. Try passing a larger timeout= value.",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "path": "",
+            "size_mb": 0,
+            "note": "",
+            "reason": f"{type(e).__name__}: {e}",
+        }
+
+
+# Keep old name as alias so nothing breaks
+def fetch_url(url: str, max_chars: int = 8000) -> str:
+    """Legacy wrapper — calls smart_fetch and returns plain text."""
+    result = smart_fetch(url=url, max_chars=max_chars)
+    if result["ok"]:
+        return result["content"]
+    return f"ERROR: {result['reason']}"
+
 
 def read_pdf(url: str, max_chars: int = 8000) -> str:
     """Download and extract text from a PDF at a URL."""
@@ -741,16 +1103,56 @@ def search_available_tools_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
     
-def fetch_url_wrapper(**kwargs):
-    """Wrapper for fetch_url tool. Returns (output, None)."""
+def smart_fetch_wrapper(**kwargs):
+    """Wrapper for smart_fetch tool. Returns structured JSON output.
+    
+    Returns (output_str, metadata_dict) where metadata_dict may contain
+    '_full_content' with the un-truncated page text for disk storage.
+    """
     try:
         url = kwargs.get("url")
         if not url:
             return "ERROR: 'url' parameter is required", None
 
         max_chars = kwargs.get("max_chars", 8000)
-        text = fetch_url(url=url, max_chars=max_chars)
-        return text, None
+        extract = kwargs.get("extract", "text")
+        result = smart_fetch(url=url, max_chars=max_chars, extract=extract)
+
+        if result["ok"]:
+            # Return content directly when successful (cleaner for the model)
+            output = result["content"]
+            if result["retries"] > 0:
+                output = f"[Succeeded after {result['retries']} retry(ies), final URL: {result['url']}]\n\n{output}"
+            # Pass full content as metadata for disk storage (not shown to model)
+            full_content = result.get("_full_content")
+            meta = {"_full_content": full_content} if full_content and len(full_content) > len(result["content"]) else None
+            return output, meta
+        else:
+            # Return structured error so the model knows to pivot
+            import json as _json
+            return _json.dumps(result, indent=2), None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
+def fetch_url_wrapper(**kwargs):
+    """Legacy wrapper — routes to smart_fetch."""
+    return smart_fetch_wrapper(**kwargs)
+
+
+def download_file_wrapper(_shell=None, **kwargs):
+    """Wrapper for download_file tool. Returns structured JSON output."""
+    try:
+        url = kwargs.get("url")
+        if not url:
+            return "ERROR: 'url' parameter is required", None
+
+        filename = kwargs.get("filename")
+        timeout = kwargs.get("timeout")
+        result = download_file(url=url, filename=filename, timeout=timeout, _shell=_shell)
+
+        import json as _json
+        return _json.dumps(result, indent=2), None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
@@ -852,8 +1254,13 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
     elif tool_name == "store_memory":
         # Handled inline by agent.py (needs access to memory store)
         return "ERROR: store_memory must be handled by the agent loop", None
+    elif tool_name == "smart_fetch":
+        return smart_fetch_wrapper(**tool_args)
     elif tool_name == "fetch_url":
-        return fetch_url_wrapper(**tool_args)
+        # Legacy alias — routes through smart_fetch
+        return smart_fetch_wrapper(**tool_args)
+    elif tool_name == "download_file":
+        return download_file_wrapper(_shell=_shell, **tool_args)
     elif tool_name == "read_pdf":
         return read_pdf_wrapper(**tool_args)
     else:
@@ -949,10 +1356,16 @@ TOOLS = [
 {
     "type": "function",
     "function": {
-        "name": "fetch_url",
+        "name": "smart_fetch",
         "description": (
-            "Fetch a web page by URL and extract readable text content (HTML cleaned). "
-            "Use this after finding a relevant link via search_web, to pull the page text into context."
+            "Fetch a web page with browser-grade headers, persistent cookies, and automatic retry with backoff. "
+            "Returns extracted text content on success. On failure (403, cookie wall, bot detection), returns a "
+            "structured error with a 'blocked' flag and 'hint' — DO NOT retry the same URL, search for an alternative source.\n\n"
+            "MODES:\n"
+            "- extract='text' (default): Clean text from the page\n"
+            "- extract='table': Extract HTML tables as pipe-delimited rows\n\n"
+            "This tool retries up to 2 times automatically before reporting failure. "
+            "If it says 'blocked', the site is actively blocking us — pivot to a different source immediately."
         ),
         "parameters": {
             "type": "object",
@@ -965,6 +1378,44 @@ TOOLS = [
                     "type": "integer",
                     "description": "Maximum number of characters of extracted text to return (default: 8000).",
                     "default": 8000
+                },
+                "extract": {
+                    "type": "string",
+                    "description": "Extraction mode: 'text' (default) for cleaned page text, 'table' for HTML tables as pipe-delimited rows.",
+                    "enum": ["text", "table"],
+                    "default": "text"
+                }
+            },
+            "required": ["url"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "download_file",
+        "description": (
+            "Download a file from a URL to the sandbox workspace via streaming. "
+            "Use this for data files (CSV, JSON, ZIP, etc.) that you need to process with sandbox_shell. "
+            "The file is saved to /workspace/<filename> and the path is returned.\n\n"
+            "No hard size limit — download any file you need. Timeout auto-scales based on file size "
+            "(checks Content-Length first). For very large files (>500 MB) you'll see an advisory note "
+            "but the download proceeds. Override timeout if needed for slow connections."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Direct URL to the file to download."
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Filename to save as in /workspace/ (auto-derived from URL if omitted)."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Download timeout in seconds. Auto-scaled from file size if omitted (min 60s, max 600s)."
                 }
             },
             "required": ["url"]

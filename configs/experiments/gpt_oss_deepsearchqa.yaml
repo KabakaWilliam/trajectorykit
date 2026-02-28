@@ -54,7 +54,7 @@ default_profile:
 dataset:
   name: "google/deepsearchqa"
   split: "eval"
-  sample_n: 5
+  sample_n: 10
   seed: 42
 
 eval:
