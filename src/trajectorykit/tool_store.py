@@ -327,16 +327,206 @@ def search_web(q: str, num_results: int = 5) -> str:
 
     return result
 
-def fetch_url(url: str, max_chars: int = 8000) -> str:
-    """Fetch and extract readable text from a URL."""
+# ── Browser-grade HTTP infrastructure ─────────────────────────────────
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "DNT": "1",
+}
+
+# Persistent cookie jar — survives across requests within one agent run
+import httpx as _httpx
+_cookie_jar = _httpx.Cookies()
+
+def _get_cookie_jar():
+    return _cookie_jar
+
+# Patterns that indicate a site blocked us
+_BLOCK_PATTERNS = [
+    "access denied", "403 forbidden", "just a moment",
+    "checking your browser", "enable javascript", "captcha",
+    "cloudflare", "blocked", "unusual traffic", "bot detection",
+    "please verify", "security check", "are you a robot",
+]
+
+def _is_blocked(text: str, status_code: int) -> tuple[bool, str]:
+    """Check if a response looks like a bot-block page."""
+    if status_code in (403, 429, 503):
+        return True, f"HTTP {status_code}"
+    lower = text[:3000].lower()
+    for pat in _BLOCK_PATTERNS:
+        if pat in lower:
+            return True, f"block pattern: {pat}"
+    return False, ""
+
+
+def _jina_reader_fallback(url: str, max_chars: int = 8000) -> str | None:
+    """Last-resort fallback: use Jina Reader to render JS-heavy pages.
+    
+    Returns cleaned text or None on failure.
+    """
+    import httpx
+    jina_url = f"https://r.jina.ai/{url}"
+    try:
+        resp = httpx.get(
+            jina_url,
+            headers={"Accept": "text/plain", "User-Agent": _BROWSER_HEADERS["User-Agent"]},
+            timeout=25,
+            follow_redirects=True,
+        )
+        if resp.status_code == 200 and len(resp.text.strip()) > 50:
+            return resp.text.strip()[:max_chars]
+    except Exception as e:
+        logger.debug(f"Jina Reader fallback failed for {url}: {e}")
+    return None
+
+
+def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
+              max_retries: int = 2, timeout: int = 20) -> dict:
+    """Fetch a web page with browser-grade headers, retries, and Jina fallback.
+
+    3-tier strategy:
+      1. Direct fetch with browser headers + persistent cookies
+      2. Retry with exponential backoff (if blocked / transient error)
+      3. Jina Reader fallback (JS rendering, last resort)
+
+    Args:
+        url: URL to fetch.
+        max_chars: Max characters of extracted text to return.
+        extract: "text" for cleaned page text, "table" for pipe-delimited tables.
+        max_retries: Number of retry attempts on failure.
+        timeout: Per-request timeout in seconds.
+
+    Returns:
+        Dict with keys: ok, content, url, blocked, reason, status_code, retries,
+        and optionally source, hint.
+    """
     import httpx
     from bs4 import BeautifulSoup
-    resp = httpx.get(url, timeout=15, follow_redirects=True)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    return text[:max_chars]
+    import warnings
+
+    cookies = _get_cookie_jar()
+    last_error = ""
+    last_status = 0
+    retries_done = 0
+
+    for attempt in range(1 + max_retries):
+        try:
+            resp = httpx.get(
+                url, headers=_BROWSER_HEADERS, cookies=cookies,
+                timeout=timeout, follow_redirects=True,
+            )
+            # Persist any cookies the server set
+            cookies.update(resp.cookies)
+            last_status = resp.status_code
+
+            if resp.status_code >= 400:
+                blocked, reason = True, f"HTTP {resp.status_code}"
+                last_error = reason
+                retries_done = attempt
+                if attempt < max_retries:
+                    time.sleep(1.5 * (attempt + 1))  # backoff
+                    continue
+                break  # fall through to Jina
+
+            # Check for soft blocks (200 but Cloudflare challenge page, etc.)
+            blocked, reason = _is_blocked(resp.text, resp.status_code)
+            if blocked:
+                last_error = reason
+                retries_done = attempt
+                if attempt < max_retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break  # fall through to Jina
+
+            # ── Parse successfully ────────────────────────────────────
+            content_type = resp.headers.get("content-type", "")
+            raw = resp.text
+
+            # Detect XML vs HTML
+            if "xml" in content_type or raw.lstrip()[:20].startswith("<?xml"):
+                parser = "xml"
+            else:
+                parser = "html.parser"
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+                soup = BeautifulSoup(raw, parser)
+
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+
+            if extract == "table":
+                tables = soup.find_all("table")
+                rows = []
+                for tbl in tables:
+                    for tr in tbl.find_all("tr"):
+                        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                        rows.append(" | ".join(cells))
+                content = "\n".join(rows)[:max_chars] if rows else ""
+                if not content:
+                    content = soup.get_text(separator="\n", strip=True)[:max_chars]
+            else:
+                content = soup.get_text(separator="\n", strip=True)[:max_chars]
+
+            # Suspiciously short? Might be a JS-only page
+            if len(content) < 200 and resp.status_code == 200:
+                jina_text = _jina_reader_fallback(url, max_chars)
+                if jina_text and len(jina_text) > len(content):
+                    return {
+                        "ok": True, "content": jina_text, "url": str(resp.url),
+                        "blocked": False, "reason": "", "status_code": 200,
+                        "retries": attempt, "source": "jina_reader",
+                    }
+
+            return {
+                "ok": True, "content": content, "url": str(resp.url),
+                "blocked": False, "reason": "", "status_code": resp.status_code,
+                "retries": attempt,
+            }
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            retries_done = attempt
+            if attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+
+    # ── All direct attempts failed — try Jina Reader ──────────────────
+    jina_text = _jina_reader_fallback(url, max_chars)
+    if jina_text:
+        return {
+            "ok": True, "content": jina_text, "url": url,
+            "blocked": False, "reason": "", "status_code": last_status,
+            "retries": retries_done, "source": "jina_reader",
+        }
+
+    # ── Total failure ─────────────────────────────────────────────────
+    return {
+        "ok": False, "content": "", "url": url,
+        "blocked": True, "reason": last_error, "status_code": last_status,
+        "retries": retries_done,
+        "hint": (
+            "This site blocked automated access. Do NOT retry this URL. "
+            "Search for the same information from a different source, "
+            "or try site:web.archive.org in your search query."
+        ),
+    }
 
 def read_pdf(url: str, max_chars: int = 8000) -> str:
     """Download and extract text from a PDF at a URL."""
@@ -734,8 +924,18 @@ def fetch_url_wrapper(**kwargs):
             return "ERROR: 'url' parameter is required", None
 
         max_chars = kwargs.get("max_chars", 8000)
-        text = fetch_url(url=url, max_chars=max_chars)
-        return text, None
+        extract = kwargs.get("extract", "text")
+        result = fetch_url(url=url, max_chars=max_chars, extract=extract)
+
+        if result["ok"]:
+            output = result["content"]
+            if result["retries"] > 0:
+                output = f"[Succeeded after {result['retries']} retry(ies), final URL: {result['url']}]\n\n{output}"
+            if result.get("source") == "jina_reader":
+                output = f"[Rendered via Jina Reader]\n\n{output}"
+            return output, None
+        else:
+            return json.dumps(result, indent=2), None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
@@ -895,8 +1095,11 @@ TOOLS = [
     "function": {
         "name": "fetch_url",
         "description": (
-            "Fetch a web page by URL and extract readable text content (HTML cleaned). "
-            "Use this after finding a relevant link via search_web, to pull the page text into context."
+            "Fetch a web page with automatic retry, browser-grade headers, and "
+            "persistent cookies. Falls back to Jina Reader for JS-heavy pages.\n\n"
+            "Returns page text on success. On failure (site blocks, 403, etc.) returns "
+            "a structured error with blocked=true and a hint to search elsewhere.\n"
+            "DO NOT retry a URL that returns blocked=true — pivot to a different source."
         ),
         "parameters": {
             "type": "object",
@@ -907,8 +1110,14 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum number of characters of extracted text to return (default: 8000).",
+                    "description": "Maximum characters of extracted text to return (default: 8000).",
                     "default": 8000
+                },
+                "extract": {
+                    "type": "string",
+                    "description": "What to extract: 'text' for page text (default), 'table' for HTML tables as pipe-delimited rows.",
+                    "enum": ["text", "table"],
+                    "default": "text"
                 }
             },
             "required": ["url"]
