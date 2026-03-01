@@ -345,6 +345,8 @@ Settings are loaded from YAML with fallback chain: explicit path → `TRAJECTORY
 |----------|---------|
 | `SERPER_API_KEY` | Primary web search (Serper.dev). Falls back to DuckDuckGo if not set or credits exhausted. |
 | `OPENAI_API_KEY` | LLM judge (GPT-4.1-mini by default). Only needed if `judge.enabled: true`. |
+| `GEMINI_API_KEY` | LLM judge (Gemini-2.5-Flash by default). Only needed if `judge.enabled: true`. |
+| `SERPER_API_KEY` | Serper API key |
 | `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, set `SEARCH_BACKEND=serpapi`). |
 
 ---
