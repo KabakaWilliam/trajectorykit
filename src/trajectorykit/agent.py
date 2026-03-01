@@ -15,6 +15,9 @@ from .memory import MemoryStore
 from .tool_store import TOOLS, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 def _recover_final_answer_from_raw(raw_args: str) -> str | None:
     """Try to extract the answer text from a malformed JSON arguments string.
@@ -746,7 +749,7 @@ def dispatch(
             # ── Track findings for synthesis fallback ─────────────────
             # Keep a compact log of non-error tool outputs so we can
             # inject them into the synthesis prompt if the model runs out.
-            if not output.startswith("ERROR:") and tool_name not in ("search_available_tools", "get_current_time", "add_numbers"):
+            if not output.startswith("ERROR:") and tool_name not in ("search_available_tools",):
                 snippet = output[:1500].strip()
                 if snippet:
                     findings.append(f"[{tool_name}] {snippet}")

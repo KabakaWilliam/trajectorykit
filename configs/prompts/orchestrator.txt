@@ -112,6 +112,24 @@ execute_code — Code Sandbox
 
 fetch_url — Web Page Reader
   Fetches a URL and extracts readable text.
+  Use css_selector="..." to target specific parts of large pages.
+
+extract_tables — Structured Table Extractor
+  Extracts HTML tables as JSON arrays of row-dicts with proper column
+  names. Far better than fetch_url(extract='table') for data analysis.
+  Feed the result into execute_code for filtering/computation.
+  Use css_selector="table.wikitable" to target specific tables.
+
+wikipedia_lookup — Wikipedia Reader
+  Direct API access to Wikipedia articles. Returns article text,
+  section list, and infobox data as structured key-value pairs.
+  Use section="History" to get only a specific section.
+  Prefer this over search→fetch for Wikipedia content.
+
+fetch_cached — Wayback Machine
+  Fetches archived page versions from the Wayback Machine.
+  Use when sites block access or when you need historical content.
+  Optionally specify date="YYYYMMDD" for a specific snapshot.
 
 read_pdf — PDF Reader
   Downloads a PDF from a URL and extracts text.

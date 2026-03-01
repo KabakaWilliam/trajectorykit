@@ -10,6 +10,7 @@ import time
 import traceback
 import uuid
 import json
+import random
 from datetime import datetime
 
 
@@ -25,18 +26,7 @@ logger = logging.getLogger(__name__)
 
 ToolReturn = Tuple[str, Optional[EpisodeTrace]]
 
-
-# Define tool implementations
-def get_current_time() -> str:
-    """Get the current date and time"""
-    from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def add_numbers(a: float, b: float) -> str:
-    """Add two numbers together"""
-    result = a + b
-    return f"{a} + {b} = {result}"
-
+DEFAULT_NUM_SEARCHES = 5
 
 # ── Search backend selection ─────────────────────────────────────────────
 # Set SEARCH_BACKEND env var to switch: "serper" (default) or "serpapi"
@@ -396,7 +386,7 @@ def _jina_reader_fallback(url: str, max_chars: int = 8000) -> str | None:
 
 
 def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
-              max_retries: int = 2, timeout: int = 20) -> dict:
+              css_selector: str = "", max_retries: int = 2, timeout: int = 20) -> dict:
     """Fetch a web page with browser-grade headers, retries, and Jina fallback.
 
     3-tier strategy:
@@ -408,6 +398,7 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
         url: URL to fetch.
         max_chars: Max characters of extracted text to return.
         extract: "text" for cleaned page text, "table" for pipe-delimited tables.
+        css_selector: Optional CSS selector to target specific elements.
         max_retries: Number of retry attempts on failure.
         timeout: Per-request timeout in seconds.
 
@@ -496,6 +487,14 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
             for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 tag.decompose()
 
+            # Apply CSS selector if provided
+            if css_selector:
+                selected = soup.select(css_selector)
+                if selected:
+                    from bs4 import BeautifulSoup as BS
+                    combined = "\n".join(str(el) for el in selected)
+                    soup = BS(combined, "html.parser")
+
             if extract == "table":
                 tables = soup.find_all("table")
                 rows = []
@@ -559,9 +558,290 @@ def read_pdf(url: str, max_chars: int = 8000) -> str:
     import httpx, io
     import pypdf
     resp = httpx.get(url, timeout=30)
-    reader = pypdf.PdfReader(io.BytesIO(resp.content))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    # Suppress noisy pypdf warnings ("Ignoring wrong pointing object")
+    pdf_logger = logging.getLogger("pypdf")
+    prev_level = pdf_logger.level
+    try:
+        pdf_logger.setLevel(logging.ERROR)
+        reader = pypdf.PdfReader(io.BytesIO(resp.content))
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    finally:
+        pdf_logger.setLevel(prev_level)
     return text[:max_chars]
+
+
+# ── extract_tables ────────────────────────────────────────────────────
+def extract_tables(url: str, max_chars: int = 12000, css_selector: str = "",
+                   timeout: int = 20) -> dict:
+    """Extract HTML tables from a URL as structured JSON arrays.
+
+    Returns a dict with 'ok', 'tables' (list of list-of-dicts), 'url', etc.
+    Each table is a list of row-dicts keyed by header names. If the table
+    has no <thead>/<th>, column names default to "col_0", "col_1", …
+
+    Args:
+        url: URL to fetch.
+        max_chars: Soft cap on total JSON output size.
+        css_selector: Optional CSS selector to target specific table(s).
+        timeout: Per-request timeout in seconds.
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+    import warnings
+
+    try:
+        resp = httpx.get(
+            url, headers=_BROWSER_HEADERS, cookies=_get_cookie_jar(),
+            timeout=timeout, follow_redirects=True,
+        )
+        _get_cookie_jar().update(resp.cookies)
+
+        if resp.status_code >= 400:
+            return {"ok": False, "tables": [], "url": str(resp.url),
+                    "reason": f"HTTP {resp.status_code}"}
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+        if css_selector:
+            containers = soup.select(css_selector)
+            tables_html = []
+            for c in containers:
+                if c.name == "table":
+                    tables_html.append(c)
+                else:
+                    tables_html.extend(c.find_all("table"))
+        else:
+            tables_html = soup.find_all("table")
+
+        if not tables_html:
+            return {"ok": False, "tables": [], "url": str(resp.url),
+                    "reason": "No <table> elements found on page",
+                    "hint": "Try fetch_url with extract='text' instead."}
+
+        all_tables = []
+        total_chars = 0
+        for tbl in tables_html:
+            # Determine headers
+            headers = []
+            thead = tbl.find("thead")
+            if thead:
+                headers = [th.get_text(strip=True) for th in thead.find_all(["th", "td"])]
+            if not headers:
+                first_row = tbl.find("tr")
+                if first_row and first_row.find("th"):
+                    headers = [th.get_text(strip=True) for th in first_row.find_all("th")]
+
+            rows_data = []
+            body_rows = tbl.find_all("tr")
+            start_idx = 1 if headers else 0  # skip header row
+            for tr in body_rows[start_idx:]:
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if not cells or all(c == "" for c in cells):
+                    continue
+                if headers:
+                    row_dict = {}
+                    for i, h in enumerate(headers):
+                        row_dict[h or f"col_{i}"] = cells[i] if i < len(cells) else ""
+                    for i in range(len(headers), len(cells)):
+                        row_dict[f"col_{i}"] = cells[i]
+                    rows_data.append(row_dict)
+                else:
+                    row_dict = {f"col_{i}": c for i, c in enumerate(cells)}
+                    rows_data.append(row_dict)
+
+            if rows_data:
+                chunk = json.dumps(rows_data, ensure_ascii=False)
+                total_chars += len(chunk)
+                all_tables.append(rows_data)
+                if total_chars > max_chars:
+                    break
+
+        return {
+            "ok": True,
+            "tables": all_tables,
+            "table_count": len(all_tables),
+            "url": str(resp.url),
+        }
+
+    except Exception as e:
+        return {"ok": False, "tables": [], "url": url,
+                "reason": f"{type(e).__name__}: {e}"}
+
+
+# ── wikipedia_lookup ──────────────────────────────────────────────────
+def wikipedia_lookup(title: str, section: str = "", max_chars: int = 8000) -> dict:
+    """Look up a Wikipedia article via the MediaWiki API.
+
+    Returns parsed wikitext for the whole article or a specific section.
+    Uses the REST API to get clean HTML, then extracts text. Also pulls
+    the infobox as structured key-value pairs when available.
+
+    Args:
+        title: Wikipedia article title (e.g. "Blue-Eyes White Dragon").
+        section: Optional section heading to extract (case-insensitive substring match).
+        max_chars: Maximum characters of text to return.
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    try:
+        api_url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "parse",
+            "page": title,
+            "prop": "text|sections",
+            "format": "json",
+            "redirects": 1,
+            "disabletoc": 1,
+        }
+        wiki_headers = {
+            "User-Agent": "TrajectoryKit/1.0 (research agent; https://github.com/KabakaWilliam/trajectorykit)",
+            "Accept": "application/json",
+        }
+        resp = httpx.get(api_url, params=params, headers=wiki_headers, timeout=15, follow_redirects=True)
+        data = resp.json()
+
+        if "error" in data:
+            return {"ok": False, "content": "", "title": title,
+                    "reason": data["error"].get("info", "Article not found"),
+                    "hint": "Check spelling or try searching with search_web."}
+
+        html = data["parse"]["text"]["*"]
+        actual_title = data["parse"].get("title", title)
+        sections_list = [s["line"] for s in data["parse"].get("sections", [])]
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove navboxes, metadata, edit links, etc.
+        for tag in soup.select(".navbox, .metadata, .mw-editsection, .reference, "
+                                ".reflist, .sistersitebox, .noprint, style, script"):
+            tag.decompose()
+
+        # Extract infobox as structured data
+        infobox = {}
+        infobox_el = soup.select_one(".infobox")
+        if infobox_el:
+            for row in infobox_el.find_all("tr"):
+                th = row.find("th")
+                td = row.find("td")
+                if th and td:
+                    key = th.get_text(strip=True)
+                    val = td.get_text(separator=" ", strip=True)
+                    if key and val:
+                        infobox[key] = val
+
+        # Section targeting
+        if section:
+            section_lower = section.lower()
+            target = None
+            for heading in soup.find_all(["h2", "h3", "h4"]):
+                heading_text = heading.get_text(strip=True)
+                if section_lower in heading_text.lower():
+                    target = heading
+                    break
+
+            if target:
+                tag_name = target.name
+                # Modern MediaWiki wraps headings in <div class="mw-heading">.
+                # Content paragraphs are siblings of that wrapper div.
+                anchor = target.parent if target.parent and "mw-heading" in " ".join(target.parent.get("class", [])) else target
+
+                content_parts = []
+                for sibling in anchor.find_next_siblings():
+                    if sibling.name in ["h2", "h3", "h4"] and sibling.name <= tag_name:
+                        break
+                    if sibling.name == "div" and "mw-heading" in " ".join(sibling.get("class", [])):
+                        inner = sibling.find(["h2", "h3", "h4"])
+                        if inner and inner.name <= tag_name:
+                            break
+                    text = sibling.get_text(separator=" ", strip=True)
+                    if text:
+                        content_parts.append(text)
+                content = "\n\n".join(content_parts)[:max_chars]
+            else:
+                content = f"Section '{section}' not found. Available sections: {', '.join(sections_list)}"
+        else:
+            content = soup.get_text(separator="\n", strip=True)[:max_chars]
+
+        result = {
+            "ok": True,
+            "title": actual_title,
+            "content": content,
+            "sections": sections_list,
+        }
+        if infobox:
+            result["infobox"] = infobox
+        return result
+
+    except Exception as e:
+        return {"ok": False, "content": "", "title": title,
+                "reason": f"{type(e).__name__}: {e}"}
+
+
+# ── fetch_cached (Wayback Machine) ───────────────────────────────────
+def fetch_cached(url: str, date: str = "", max_chars: int = 8000) -> dict:
+    """Fetch a cached version of a URL from the Wayback Machine.
+
+    Args:
+        url: Original URL to look up in the Wayback Machine.
+        date: Optional target date as YYYYMMDD. If empty, returns most recent snapshot.
+        max_chars: Maximum characters of extracted text to return.
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+    import warnings
+
+    try:
+        avail_url = "https://archive.org/wayback/available"
+        params = {"url": url}
+        if date:
+            params["timestamp"] = date
+        resp = httpx.get(avail_url, params=params, timeout=15)
+        data = resp.json()
+
+        snapshots = data.get("archived_snapshots", {})
+        closest = snapshots.get("closest")
+        if not closest or not closest.get("available"):
+            return {"ok": False, "content": "", "url": url,
+                    "reason": "No Wayback Machine snapshot found for this URL",
+                    "hint": "Try a different URL or date."}
+
+        archive_url = closest["url"]
+        snapshot_date = closest.get("timestamp", "")
+
+        resp2 = httpx.get(
+            archive_url, headers=_BROWSER_HEADERS,
+            timeout=20, follow_redirects=True,
+        )
+        if resp2.status_code >= 400:
+            return {"ok": False, "content": "", "url": archive_url,
+                    "reason": f"HTTP {resp2.status_code} fetching archived page"}
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+            soup = BeautifulSoup(resp2.text, "html.parser")
+
+        for wb_el in soup.select("#wm-ipp-base, #wm-ipp, #donato, .wb-autocomplete-suggestions"):
+            wb_el.decompose()
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+
+        content = soup.get_text(separator="\n", strip=True)[:max_chars]
+
+        return {
+            "ok": True,
+            "content": content,
+            "url": archive_url,
+            "original_url": url,
+            "snapshot_date": snapshot_date,
+        }
+
+    except Exception as e:
+        return {"ok": False, "content": "", "url": url,
+                "reason": f"{type(e).__name__}: {e}"}
+
 
 def spawn_agent(
     task: str,
@@ -841,33 +1121,11 @@ def execute_code_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def get_current_time_wrapper(**kwargs):
-    """Wrapper for get_current_time tool. Returns (output, None)."""
-    try:
-        result = get_current_time()
-        return f"Current time: {result}", None
-    except Exception as e:
-        return f"ERROR: {str(e)}", None
-
-def add_numbers_wrapper(**kwargs):
-    """Wrapper for add_numbers tool. Returns (output, None)."""
-    try:
-        a = kwargs.get("a")
-        b = kwargs.get("b")
-        
-        if a is None or b is None:
-            return "ERROR: Both 'a' and 'b' parameters are required", None
-        
-        result = add_numbers(a, b)
-        return result, None
-    except Exception as e:
-        return f"ERROR: {str(e)}", None
-
 def search_web_wrapper(**kwargs):
     """Wrapper for search_web tool. Returns (output, None)."""
     try:
         q = kwargs.get("q")
-        num_results = kwargs.get("num_results", 5)
+        num_results = kwargs.get("num_results", DEFAULT_NUM_SEARCHES)
 
         return search_web(q=q, num_results=num_results), None
     except Exception as e:
@@ -951,7 +1209,8 @@ def fetch_url_wrapper(**kwargs):
 
         max_chars = kwargs.get("max_chars", 8000)
         extract = kwargs.get("extract", "text")
-        result = fetch_url(url=url, max_chars=max_chars, extract=extract)
+        css_selector = kwargs.get("css_selector", "")
+        result = fetch_url(url=url, max_chars=max_chars, extract=extract, css_selector=css_selector)
 
         if result["ok"]:
             output = result["content"]
@@ -978,7 +1237,78 @@ def read_pdf_wrapper(**kwargs):
         return text, None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
-    
+
+
+def extract_tables_wrapper(**kwargs):
+    """Wrapper for extract_tables tool. Returns (output, None)."""
+    try:
+        url = kwargs.get("url")
+        if not url:
+            return "ERROR: 'url' parameter is required", None
+
+        max_chars = kwargs.get("max_chars", 12000)
+        css_selector = kwargs.get("css_selector", "")
+        result = extract_tables(url=url, max_chars=max_chars, css_selector=css_selector)
+
+        if result["ok"]:
+            output = json.dumps({
+                "table_count": result["table_count"],
+                "url": result["url"],
+                "tables": result["tables"],
+            }, ensure_ascii=False, indent=2)
+            return output, None
+        else:
+            return json.dumps(result, indent=2), None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
+def wikipedia_lookup_wrapper(**kwargs):
+    """Wrapper for wikipedia_lookup tool. Returns (output, None)."""
+    try:
+        title = kwargs.get("title")
+        if not title:
+            return "ERROR: 'title' parameter is required", None
+
+        section = kwargs.get("section", "")
+        max_chars = kwargs.get("max_chars", 8000)
+        result = wikipedia_lookup(title=title, section=section, max_chars=max_chars)
+
+        if result["ok"]:
+            parts = [f"Wikipedia: {result['title']}"]
+            if result.get("infobox"):
+                parts.append("\n[Infobox]")
+                for k, v in result["infobox"].items():
+                    parts.append(f"  {k}: {v}")
+            parts.append(f"\n{result['content']}")
+            if result.get("sections"):
+                parts.append(f"\n[Sections: {', '.join(result['sections'][:20])}]")
+            return "\n".join(parts), None
+        else:
+            return json.dumps(result, indent=2), None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
+def fetch_cached_wrapper(**kwargs):
+    """Wrapper for fetch_cached tool. Returns (output, None)."""
+    try:
+        url = kwargs.get("url")
+        if not url:
+            return "ERROR: 'url' parameter is required", None
+
+        date = kwargs.get("date", "")
+        max_chars = kwargs.get("max_chars", 8000)
+        result = fetch_cached(url=url, date=date, max_chars=max_chars)
+
+        if result["ok"]:
+            header = f"[Wayback Machine snapshot: {result.get('snapshot_date', '?')}]\n"
+            header += f"[Original URL: {result.get('original_url', url)}]\n\n"
+            return header + result["content"], None
+        else:
+            return json.dumps(result, indent=2), None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
 
 
 def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None):
@@ -1006,10 +1336,6 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
             merged = {**_sandbox_files, **model_files}  # model files take precedence
             tool_args = {**tool_args, "files": merged}
         return execute_code_wrapper(**tool_args)
-    elif tool_name == "get_current_time":
-        return get_current_time_wrapper(**tool_args)
-    elif tool_name == "add_numbers":
-        return add_numbers_wrapper(**tool_args)
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
@@ -1022,6 +1348,12 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return fetch_url_wrapper(**tool_args)
     elif tool_name == "read_pdf":
         return read_pdf_wrapper(**tool_args)
+    elif tool_name == "extract_tables":
+        return extract_tables_wrapper(**tool_args)
+    elif tool_name == "wikipedia_lookup":
+        return wikipedia_lookup_wrapper(**tool_args)
+    elif tool_name == "fetch_cached":
+        return fetch_cached_wrapper(**tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
 
@@ -1125,7 +1457,9 @@ TOOLS = [
             "persistent cookies. Falls back to Jina Reader for JS-heavy pages.\n\n"
             "Returns page text on success. On failure (site blocks, 403, etc.) returns "
             "a structured error with blocked=true and a hint to search elsewhere.\n"
-            "DO NOT retry a URL that returns blocked=true — pivot to a different source."
+            "DO NOT retry a URL that returns blocked=true — pivot to a different source.\n\n"
+            "TIP: Use css_selector to extract only the relevant part of a large page "
+            "(e.g. css_selector='table.data-table' or css_selector='div#content')."
         ),
         "parameters": {
             "type": "object",
@@ -1144,6 +1478,53 @@ TOOLS = [
                     "description": "What to extract: 'text' for page text (default), 'table' for HTML tables as pipe-delimited rows.",
                     "enum": ["text", "table"],
                     "default": "text"
+                },
+                "css_selector": {
+                    "type": "string",
+                    "description": (
+                        "Optional CSS selector to extract only matching elements "
+                        "(e.g. 'table.wikitable', 'div#mw-content-text', 'article'). "
+                        "Reduces noise on large pages. Omit to get the full page."
+                    ),
+                    "default": ""
+                }
+            },
+            "required": ["url"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "extract_tables",
+        "description": (
+            "Extract HTML tables from a URL as structured JSON (list of row-dicts). "
+            "Much better than fetch_url(extract='table') for data analysis — returns "
+            "proper column names and cell values you can directly process in code.\n\n"
+            "Use this when the answer requires reading specific values from tables "
+            "(statistics, rankings, comparisons). Feed the JSON result into "
+            "execute_code for filtering, sorting, or computation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL of the page containing HTML tables."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Soft cap on total JSON output size (default: 12000).",
+                    "default": 12000
+                },
+                "css_selector": {
+                    "type": "string",
+                    "description": (
+                        "Optional CSS selector to target specific table(s) "
+                        "(e.g. 'table.wikitable', 'table#stats'). "
+                        "Omit to extract all tables on the page."
+                    ),
+                    "default": ""
                 }
             },
             "required": ["url"]
@@ -1175,18 +1556,80 @@ TOOLS = [
         }
     }
 },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "Get the current date and time in YYYY-MM-DD HH:MM:SS format",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+{
+    "type": "function",
+    "function": {
+        "name": "wikipedia_lookup",
+        "description": (
+            "Look up a Wikipedia article directly via the MediaWiki API. "
+            "Faster and more reliable than search→fetch for Wikipedia content.\n\n"
+            "Returns: article text, section list, and infobox data (structured key-value pairs). "
+            "Use the 'section' parameter to get only a specific section.\n\n"
+            "PREFER THIS over fetch_url when the question references Wikipedia or "
+            "when you need structured facts (dates, stats, lists) from a well-known topic."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Wikipedia article title (e.g. 'Blue-Eyes White Dragon', 'Python (programming language)')."
+                },
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Optional section heading to extract (case-insensitive substring match). "
+                        "Omit to get the full article. Example: 'History', 'Demographics'."
+                    ),
+                    "default": ""
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters of text to return (default: 8000).",
+                    "default": 8000
+                }
+            },
+            "required": ["title"]
         }
-    },
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "fetch_cached",
+        "description": (
+            "Fetch an archived version of a URL from the Wayback Machine.\n\n"
+            "Use this when:\n"
+            "- A site blocks automated access (403, Cloudflare) but you need its content\n"
+            "- You need historical page content from a specific date\n"
+            "- The original page has been taken down or modified\n\n"
+            "Returns the page text from the closest available snapshot."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Original URL to look up in the Wayback Machine."
+                },
+                "date": {
+                    "type": "string",
+                    "description": (
+                        "Target date as YYYYMMDD (e.g. '20231015'). Returns the closest "
+                        "snapshot to this date. Omit for the most recent snapshot."
+                    ),
+                    "default": ""
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters of extracted text to return (default: 8000).",
+                    "default": 8000
+                }
+            },
+            "required": ["url"]
+        }
+    }
+},
     {
         "type": "function",
         "function": {
@@ -1212,27 +1655,6 @@ TOOLS = [
                 "required": ["q"]
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "add_numbers",
-            "description": "Add two numbers together and return the result",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {
-                        "type": "number",
-                        "description": "First number to add"
-                    },
-                    "b": {
-                        "type": "number",
-                        "description": "Second number to add"
-                    }
-                },
-                "required": ["a", "b"]
-            }
-        }
     },
     {
         "type": "function",
