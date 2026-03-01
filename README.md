@@ -312,12 +312,12 @@ Evaluated on **DeepSearchQA** (n = 62) with `gpt-oss-20b` served via vLLM, judge
 
 | Metric | Value |
 |--------|-------|
-| Fully Correct | 30.65 ± 11.48% |
-| Fully Incorrect | 45.16 ± 12.39% |
-| Correct w/ Extraneous | 6.45 ± 6.12% |
-| F1 | 46.44% |
+| Fully Correct | 46.88 ± 9.98% |
+| Fully Incorrect | 31.25 ± 9.27% |
+| Correct w/ Extraneous | 5.21 ± 4.44% |
+| F1 | 61.08% |
 
-> **Caveats:** ~42% of samples hit search credit limits mid-run (pre-DuckDuckGo fallback). Small sample size (n = 62) gives wide CIs. This validates architectural stability, not leaderboard performance.
+> **Caveats:** Small sample size (n = 100) gives wide CIs. This validates architectural stability, not leaderboard performance.
 
 ---
 

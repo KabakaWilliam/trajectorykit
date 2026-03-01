@@ -62,6 +62,7 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: null
+  workers: 5  # parallel dispatch calls (1 = sequential, 3-5 = sweet spot for 1 GPU)
 
 judge:
   enabled: true
