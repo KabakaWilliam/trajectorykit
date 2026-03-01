@@ -12,8 +12,11 @@ from typing import Optional, Dict, Any
 
 from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT, TOKEN_SAFETY_MARGIN, get_model_profile
 from .memory import MemoryStore
-from .tool_store import TOOLS, dispatch_tool_call
+from .tool_store import TOOLS, EXECUTE_CODE_TOOL, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def _recover_final_answer_from_raw(raw_args: str) -> str | None:
@@ -127,6 +130,7 @@ def dispatch(
     example_id: Optional[str] = None,
     _depth: int = 0,
     _sandbox_files: Optional[Dict[str, str]] = None,
+    _shell=None,
 ) -> Dict[str, Any]:
     """
     Run an agentic loop with iterative tool calling and response refinement.
@@ -184,13 +188,33 @@ def dispatch(
     )
     episode_start = time.time()
     
+    # ── Persistent sandbox shell ──────────────────────────────────────────
+    # Root dispatch creates a SandboxShell; sub-agents inherit it via _shell.
+    # Synthesis sub-agents (with _sandbox_files) use sandbox_shell (or execute_code fallback).
+    owns_shell = False          # True only if *this* dispatch created the shell
+    shell = _shell              # May be inherited from parent
+    if shell is None and _depth == 0 and not _sandbox_files:
+        try:
+            from .sandbox_shell import SandboxShell
+            shell = SandboxShell(timeout=30, network=True)
+            owns_shell = True
+            if verbose:
+                print(f"\U0001f4e6 Sandbox shell session started: {shell.session_id}")
+        except Exception as e:
+            logger.warning(f"Could not start sandbox shell: {e}")
+            # Agent will still work — sandbox_shell calls will return an error
+
     # ── Depth-aware prompt & tool selection ──────────────────────────────
-    # Root agent (depth 0): orchestrator prompt, full tool list
+    # Root agent (depth 0): orchestrator prompt, full tool list (sandbox_shell)
     # Sub-agents (depth >= 1): worker prompt, spawn_agent hidden
-    # Synthesis sub-agent (_sandbox_files set): synthesizer prompt, code + final_answer only
+    # Synthesis sub-agent (_sandbox_files set): synthesizer prompt, sandbox_shell + final_answer
+    #   Falls back to legacy execute_code if no shell is available.
     if _sandbox_files:
         system_prompt = SYNTHESIZER_PROMPT
-        available_tools = [t for t in TOOLS if t["function"]["name"] in ("execute_code", "final_answer", "search_available_tools")]
+        if shell is not None:
+            available_tools = [t for t in TOOLS if t["function"]["name"] in ("sandbox_shell", "final_answer", "search_available_tools")]
+        else:
+            available_tools = [EXECUTE_CODE_TOOL] + [t for t in TOOLS if t["function"]["name"] in ("final_answer", "search_available_tools")]
     elif _depth == 0:
         system_prompt = SYSTEM_PROMPT
         available_tools = TOOLS
@@ -262,6 +286,14 @@ def dispatch(
     
     def _finalize(final_content: str) -> Dict[str, Any]:
         """Build the return dict and finalize the trace."""
+        # Close the persistent sandbox shell only if this dispatch created it
+        if shell is not None and owns_shell:
+            try:
+                shell.close()
+                if verbose:
+                    print(f"\U0001f4e6 Sandbox shell session closed: {shell.session_id}")
+            except Exception:
+                pass
         episode.final_response = final_content
         episode.total_turns = turn
         episode.total_tool_calls = total_tool_calls
@@ -682,7 +714,7 @@ def dispatch(
             tc_start = time.time()
             child_trace = None
             try:
-                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files)
+                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _shell=shell)
                 if verbose and len(output) < 200:
                     print(f"       → {output}")
                 elif verbose:
@@ -908,12 +940,12 @@ def dispatch(
                 print(f"❌ Synthesis attempt {synth_attempt + 1} failed: {e}")
     
     # ── Synthesis sub-agent via sandbox file ────────────────────────
-    # Upload the full MemoryStore as a JSON file to the sandbox,
+    # Upload the full MemoryStore as a JSON file to the shell workspace,
     # then spawn a fresh sub-agent whose job is to query the data
-    # PROGRAMMATICALLY (via execute_code) and synthesize an answer.
+    # PROGRAMMATICALLY (via sandbox_shell) and synthesize an answer.
     #
     # Key insight: the research data never enters the LLM context.
-    # It lives on the sandbox filesystem. The sub-agent does programmatic
+    # It lives on the shell filesystem. The sub-agent does programmatic
     # search/filter, so it can handle arbitrarily large datasets without
     # context window corruption.
     
@@ -934,6 +966,14 @@ def dispatch(
         
         sandbox_files = {"research_data.json": memory_b64}
         
+        # Upload the file directly to the shell's workspace (if available).
+        # The synthesizer will read it with sandbox_shell(command="python3 ...").
+        # sandbox_files is still passed as a flag (+ fallback for execute_code
+        # in case shell is unavailable).
+        if shell is not None:
+            research_path = shell.session_workspace / "research_data.json"
+            research_path.write_text(memory_json)
+        
         try:
             from .config import SUB_AGENT_TURN_BUDGET
             synth_turn_budget = min(SUB_AGENT_TURN_BUDGET, 10)  # synthesis needs fewer turns
@@ -953,6 +993,7 @@ def dispatch(
                 example_id=example_id,
                 _depth=_depth + 1,
                 _sandbox_files=sandbox_files,
+                _shell=shell,
             )
             
             final_content = synth_result.get("final_response", "")

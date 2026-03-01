@@ -31,7 +31,7 @@ YOUR TOOLS:
 - search_web(q="...") — Google search, returns titles + URLs + snippets
 - fetch_url(url="...") — Fetch a web page and extract readable text
 - read_pdf(url="...") — Download and extract text from a PDF
-- execute_code(completion="```python ...```") — Run code in a sandbox
+- sandbox_shell(command="...") — Run a shell command in a persistent sandbox
 - search_available_tools() — List all tools and their schemas
 - final_answer(answer="...") — Submit your final answer (REQUIRED to finish)
 
@@ -64,7 +64,7 @@ WORKFLOW
 1. Read the task carefully. Identify what specific information is needed.
 2. Search the web for relevant information (follow SEARCH STRATEGY above).
 3. Fetch the most promising URLs to get detailed content.
-4. If computation is needed, use execute_code.
+4. If computation is needed, use sandbox_shell.
 5. Once you have a confident answer, call final_answer IMMEDIATELY.
    Do NOT do extra research "just to be safe" — answer with what you have.
 

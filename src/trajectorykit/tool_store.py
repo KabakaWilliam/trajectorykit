@@ -44,11 +44,13 @@ def add_numbers(a: float, b: float) -> str:
 #   - serper:  SERPER_API_KEY  (from serper.dev)
 #   - serpapi: SERP_API_KEY    (from serpapi.com)
 
+
 SEARCH_TIMEOUT = 25   # seconds — complex quoted queries need more time
 MAX_SEARCH_RETRIES = 2
+DEFAULT_NUM_SEARCHES = 10
 
 
-def _search_serper(q: str, num_results: int = 5) -> str:
+def _search_serper(q: str, num_results: int = DEFAULT_NUM_SEARCHES) -> str:
     """Google search via Serper.dev API."""
     api_key = os.getenv("SERPER_API_KEY", "")
     if not api_key:
@@ -123,7 +125,7 @@ def _search_serper(q: str, num_results: int = 5) -> str:
     return last_error or "Search error: Unknown failure after retries"
 
 
-def _search_serpapi(q: str, num_results: int = 5) -> str:
+def _search_serpapi(q: str, num_results: int = DEFAULT_NUM_SEARCHES) -> str:
     """Google search via SerpAPI.com."""
     api_key = os.getenv("SERP_API_KEY", "")
     if not api_key:
@@ -200,7 +202,7 @@ def _search_serpapi(q: str, num_results: int = 5) -> str:
     return last_error or "Search error: Unknown failure after retries"
 
 
-def _search_ddg(q: str, num_results: int = 5) -> str:
+def _search_ddg(q: str, num_results: int = DEFAULT_NUM_SEARCHES) -> str:
     """
     Resilient DDG search with caching, dedup, backoff, and concurrency control.
     """
@@ -291,7 +293,7 @@ _SEARCH_FALLBACK_ERRORS = (
 )
 
 
-def search_web(q: str, num_results: int = 5) -> str:
+def search_web(q: str, num_results: int = DEFAULT_NUM_SEARCHES) -> str:
     """
     Execute a web search and return structured results.
     
@@ -573,6 +575,7 @@ def spawn_agent(
     reasoning_effort: Optional[str] = None,
     _depth: int = 0,
     _sandbox_files: Optional[dict] = None,
+    _shell=None,
 ) -> ToolReturn:
     """
     Spawn a sub-agent to handle a subtask. Calls dispatch() recursively.
@@ -612,6 +615,7 @@ def spawn_agent(
         reasoning_effort=reasoning_effort,
         _depth=_depth + 1,       # increment depth for recursive calls
         _sandbox_files=_sandbox_files,
+        _shell=_shell,           # share parent's persistent shell
     )
 
     # Extract child trace from the result
@@ -867,13 +871,13 @@ def search_web_wrapper(**kwargs):
     """Wrapper for search_web tool. Returns (output, None)."""
     try:
         q = kwargs.get("q")
-        num_results = kwargs.get("num_results", 5)
+        num_results = kwargs.get("num_results", DEFAULT_NUM_SEARCHES)
 
         return search_web(q=q, num_results=num_results), None
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, **kwargs):
+def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _shell=None, **kwargs):
     """Wrapper for spawn_agent tool. Injects _depth, _model, _reasoning_effort from the parent dispatch loop.
     Returns (output_str, child_trace) where child_trace is an EpisodeTrace."""
     try:
@@ -892,6 +896,7 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
             reasoning_effort=_reasoning_effort,
             _depth=_depth,
             _sandbox_files=_sandbox_files,
+            _shell=_shell,
         )
         return output, child_trace
     except Exception as e:
@@ -978,10 +983,39 @@ def read_pdf_wrapper(**kwargs):
         return text, None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
-    
 
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None):
+def sandbox_shell_wrapper(_shell=None, **kwargs):
+    """Wrapper for sandbox_shell tool. Runs a command in a persistent shell session.
+    Returns (output_str, None)."""
+    try:
+        command = kwargs.get("command")
+        if not command:
+            return "ERROR: 'command' parameter is required", None
+        if _shell is None:
+            return "ERROR: No sandbox shell session available", None
+
+        timeout = kwargs.get("timeout", 30)
+        result = _shell.run(command, timeout=timeout)
+
+        # Format output like a terminal
+        output = f"Exit Code: {result.exit_code}\n"
+        output += f"Duration: {result.duration:.2f}s\n"
+        if result.timed_out:
+            output += "⚠️ TIMED OUT\n"
+        if result.stdout:
+            output += f"STDOUT:\n{result.stdout}"
+        if result.stderr:
+            output += f"STDERR:\n{result.stderr}"
+        if not result.stdout and not result.stderr:
+            output += "(no output)"
+
+        return output.strip(), None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _shell=None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -992,18 +1026,22 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         _depth: Current recursion depth (injected by the agent loop, invisible to the model)
         model: Model name to propagate to sub-agents
         reasoning_effort: Reasoning effort level to propagate to sub-agents
-        _sandbox_files: Files to auto-inject into every execute_code sandbox call.
-                        Dict of {filename: base64_content}. Merged with model-provided files.
+        _sandbox_files: Files to auto-load into the sandbox for synthesis sub-agents.
+                        When set, signals synthesis mode. Dict of {filename: base64_content}.
+                        If a shell is available, files are uploaded to the shell workspace
+                        instead; this dict is kept as a mode flag + fallback.
     
     Returns:
         Tuple of (output_string, child_trace) where child_trace is an
         EpisodeTrace if the tool was spawn_agent, otherwise None.
     """
-    if tool_name == "execute_code":
-        # Merge framework-injected sandbox files with any model-provided files
+    if tool_name == "sandbox_shell":
+        return sandbox_shell_wrapper(_shell=_shell, **tool_args)
+    elif tool_name == "execute_code":
+        # Legacy: still routed for backward compatibility / synthesis sub-agent
         if _sandbox_files:
             model_files = tool_args.get("files") or {}
-            merged = {**_sandbox_files, **model_files}  # model files take precedence
+            merged = {**_sandbox_files, **model_files}
             tool_args = {**tool_args, "files": merged}
         return execute_code_wrapper(**tool_args)
     elif tool_name == "get_current_time":
@@ -1013,7 +1051,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
-        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, **tool_args)
+        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _shell=_shell, **tool_args)
     elif tool_name == "final_answer":
         return final_answer_wrapper(**tool_args)
     elif tool_name == "search_available_tools":
@@ -1026,93 +1064,89 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return f"ERROR: Unknown tool '{tool_name}'", None
 
 
-# Define the tool schemas for vLLM
-TOOLS = [
-{
+# ── Legacy execute_code schema (kept for synthesis sub-agent) ─────────────
+EXECUTE_CODE_TOOL = {
     "type": "function",
     "function": {
         "name": "execute_code",
         "description": (
-            "Execute code in a sandboxed environment with support for multiple languages, "
-            "input/output handling, file I/O, and resource limits. "
-            "The code should be provided in a markdown code block (e.g., ```python code here ```). "
-            "Returns execution results including stdout, stderr, exit status, and any requested output files.\n\n"
-            "FILE HANDLING:\n"
-            "- `files`: Upload input files (e.g. CSVs, images, data) into the sandbox before execution. "
-            "Provide as a dict of {filename: base64_encoded_string}. "
-            "Files are placed in the working directory and can be read by name in your code.\n"
-            "- `fetch_files`: Retrieve output files generated by your code after execution (e.g. plots, reports, ZIPs). "
-            "Provide a list of filenames your code will write. "
-            "They are returned as base64-encoded strings in the response under the 'files' key.\n\n"
-            "EXAMPLE WORKFLOW: To generate a chart → write ```python ... plt.savefig('plot.png') ``` "
-            "and set fetch_files=['plot.png']. The plot will be returned as base64 for display."
+            "Execute code in a sandboxed environment. "
+            "Code must be in a markdown block (```python ...```). "
+            "Returns stdout, stderr, exit status, and any requested output files."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "completion": {
                     "type": "string",
-                    "description": (
-                        "Code to execute. MUST be wrapped in markdown code blocks "
-                        "(```python ... ``` or ``` ... ```). "
-                        "The code will be automatically extracted from the code block."
-                    )
-                },
-                "stdin": {
-                    "type": "string",
-                    "description": "Standard input to pipe into the program (default: '').",
-                    "default": ""
+                    "description": "Code to execute in a markdown code block."
                 },
                 "language": {
                     "type": "string",
-                    "description": "Programming language to use (default: 'python').",
+                    "description": "Programming language (default: 'python').",
                     "default": "python",
                     "enum": SUPPORTED_LANGUAGES
                 },
                 "files": {
                     "type": "object",
-                    "description": (
-                        "Input files to upload into the sandbox before execution. "
-                        "Keys are filenames (e.g. 'data.csv'), values are base64-encoded file contents. "
-                        "Files are written to the working directory and accessible by name in your code."
-                    ),
-                    "additionalProperties": {
-                        "type": "string",
-                        "description": "Base64-encoded file content."
-                    },
+                    "description": "Input files as {filename: base64_string}.",
+                    "additionalProperties": {"type": "string"},
                     "default": {}
                 },
                 "fetch_files": {
                     "type": "array",
-                    "description": (
-                        "List of filenames to retrieve from the sandbox after execution. "
-                        "Your code must write these files to the working directory. "
-                        "They are returned as base64-encoded strings in the response under the 'files' key. "
-                        "Use this to retrieve generated plots, CSVs, ZIPs, PDFs, etc."
-                    ),
-                    "items": {
-                        "type": "string",
-                        "description": "Filename to fetch (e.g. 'output.png', 'result.csv')."
-                    },
+                    "description": "Filenames to retrieve after execution.",
+                    "items": {"type": "string"},
                     "default": []
-                },
-                "compile_timeout": {
-                    "type": "integer",
-                    "description": "Compilation timeout in seconds (default: 10).",
-                    "default": 10
                 },
                 "run_timeout": {
                     "type": "integer",
                     "description": "Execution timeout in seconds (default: 15).",
                     "default": 15
-                },
-                "memory_limit_mb": {
-                    "type": "integer",
-                    "description": "Memory limit in megabytes (default: 512).",
-                    "default": 512
                 }
             },
             "required": ["completion"]
+        }
+    }
+}
+
+# Define the tool schemas for vLLM
+TOOLS = [
+{
+    "type": "function",
+    "function": {
+        "name": "sandbox_shell",
+        "description": (
+            "Run a shell command in a persistent Linux sandbox (Apptainer container). "
+            "State persists across calls within this conversation: working directory, "
+            "environment variables, installed packages, and created files all carry over.\n\n"
+            "USE THIS FOR:\n"
+            "- Running Python/Node/bash scripts and commands\n"
+            "- Installing packages (pip install, apt-get, npm)\n"
+            "- Iterative development: write code → run → inspect output → fix → re-run\n"
+            "- Data processing: download files, parse, transform, analyze\n"
+            "- Any multi-step workflow that builds on previous results\n\n"
+            "TIPS:\n"
+            "- Write Python scripts with: cat > script.py << 'EOF'\n...\nEOF\n"
+            "  then run with: python3 script.py\n"
+            "- For long scripts, write to a file first, then execute\n"
+            "- Files persist in /workspace/ across calls\n"
+            "- pip packages stay installed for the session"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute (runs in bash)"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 30). Increase for long-running tasks.",
+                    "default": 30
+                }
+            },
+            "required": ["command"]
         }
     }
 },
@@ -1254,7 +1288,7 @@ TOOLS = [
                 "PATTERN FOR MULTI-ITEM TASKS:\n"
                 "1. spawn_agent(task='[detailed task for item 1, specify return format]')\n"
                 "2. spawn_agent(task='[detailed task for item 2, specify return format]')\n"
-                "3. Collect results, then use execute_code yourself to visualize/synthesize"
+                "3. Collect results, then use sandbox_shell yourself to visualize/synthesize"
             ),
             "parameters": {
                 "type": "object",
