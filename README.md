@@ -92,14 +92,16 @@ result["trace"].save()  # → traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
 ┌──────────────▼───────────────────────────────────────────┐
 │  tool_store.py                                           │
 │                                                          │
-│  search_web      Serper → auto-fallback to DuckDuckGo   │
-│  fetch_url       HTTP fetch + HTML → text extraction     │
-│  read_pdf        PDF download + text extraction          │
-│  execute_code    Sandboxed execution via Apptainer       │
-│  spawn_agent     Recursive sub-agent (fresh context)     │
-│  final_answer    Terminates the agent loop               │
+│  search_web        Serper → auto-fallback to DuckDuckGo │
+│  fetch_url         HTTP fetch + HTML→text + CSS selector │
+│  extract_tables    HTML tables → structured JSON         │
+│  read_pdf          PDF download + text extraction        │
+│  wikipedia_lookup  MediaWiki API → article/section/info  │
+│  fetch_cached      Wayback Machine archived pages        │
+│  execute_code      Sandboxed execution via Apptainer     │
+│  spawn_agent       Recursive sub-agent (fresh context)   │
+│  final_answer      Terminates the agent loop             │
 │  search_available_tools  Self-introspection              │
-│  get_current_time / add_numbers  Utility tools           │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -210,7 +212,8 @@ trajectorykit/
 ├── evals/
 │   ├── eval.py                       # Dataset evaluation runner
 │   ├── llm_judge.py                  # LLM-as-judge grading
-│   └── recover_parquet.py            # Rebuild results from trace JSONs
+│   ├── recover_parquet.py            # Rebuild results from trace JSONs
+│   └── traces_to_parquet.py          # Convert trace JSONs → parquet
 │
 ├── data/                             # Evaluation outputs (parquets, traces)
 ├── traces/                           # Ad-hoc trace storage
@@ -225,13 +228,14 @@ trajectorykit/
 |------|-------------|
 | `execute_code` | Run code in an Apptainer sandbox (Python + 40 languages). Supports file upload/download as base64. |
 | `search_web` | Web search via Serper (primary) with automatic DuckDuckGo fallback. |
-| `fetch_url` | Fetch a web page and extract readable text. |
+| `fetch_url` | Fetch a web page and extract readable text. Supports an optional `css_selector` parameter for targeted extraction. |
+| `extract_tables` | Extract HTML tables from a URL as structured JSON (list of row-dicts). Much more reliable than parsing raw HTML in code. |
 | `read_pdf` | Download and extract text from a PDF. |
+| `wikipedia_lookup` | Look up a Wikipedia article directly via the MediaWiki API. Returns article text, section list, and structured infobox data. Supports targeting a specific section. |
+| `fetch_cached` | Fetch an archived version of a URL from the Wayback Machine. Useful when live pages are paywalled, deleted, or have changed. |
 | `spawn_agent` | Spawn a recursive sub-agent with fresh context and its own trace. |
 | `final_answer` | Submit the final answer (terminates the loop). |
 | `search_available_tools` | Self-introspection — list tools or get full schema for any tool. |
-| `get_current_time` | Current date and time. |
-| `add_numbers` | Add two numbers (demo/testing). |
 
 ---
 
@@ -246,20 +250,27 @@ result["trace"].pretty_print()
 ```
 
 ```
-🏁 Agent [root]  trace_id=154b9f2e
-  Input: What is the current time? What is 123 + 456?
-  Duration: 8.42s | Turns: 2 | Tool calls: 2
+🏁 Agent [root]  trace_id=a3f7c912
+  Input: What country has the largest population in Africa?
+  Duration: 22.14s | Turns: 3 | Tool calls: 4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ┌─ Turn 1 (4.00s)
-  │  🔧 get_current_time({}) [0.01s]
-  │     → 2026-02-19 21:04:29
-  │  🔧 add_numbers({"a": 123, "b": 456}) [0.00s]
-  │     → 579
+  ┌─ Turn 1 (6.21s)
+  │  🔧 search_web({"query": "largest population Africa"}) [1.03s]
+  │     → 1. Nigeria — 223.8 million (2024) ...
+  │  🔧 wikipedia_lookup({"title": "Nigeria", "section": "Demographics"}) [0.84s]
+  │     → Population: 223,804,632 (2024 estimate) ...
+  └─
+  ┌─ Turn 2 (4.12s)
+  │  🔧 extract_tables({"url": "https://en.wikipedia.org/wiki/..."}) [1.22s]
+  │     → [{"Country": "Nigeria", "Population": "223804632", ...}, ...]
+  └─
+  ┌─ Turn 3 (3.80s)
+  │  🔧 final_answer({"answer": "Nigeria, with ~224 million people"}) [0.00s]
   └─
 📊 Episode Summary:
-  Prompt tokens:        3,621
-  Completion tokens:    686
-  Total tokens:         4,307
+  Prompt tokens:       12,450
+  Completion tokens:    1,820
+  Total tokens:        14,270
 ```
 
 ### JSON + HTML
@@ -306,18 +317,22 @@ python evals/llm_judge.py --results data/google_deepsearchqa/gpt_oss_20b/results
 python evals/recover_parquet.py
 ```
 
-### Preliminary Results
+### Results
 
-Evaluated on **DeepSearchQA** (n = 62) with `gpt-oss-20b` served via vLLM, judged by GPT-4.1-mini:
+Evaluated on **DeepSearchQA** (n = 100, eval split) with `gpt-oss-20b` (131K context) served via vLLM, judged by GPT-4.1-mini:
 
 | Metric | Value |
 |--------|-------|
-| Fully Correct | 30.65 ± 11.48% |
-| Fully Incorrect | 45.16 ± 12.39% |
-| Correct w/ Extraneous | 6.45 ± 6.12% |
-| F1 | 46.44% |
+| Fully Correct | 46.88 ± 9.98% (45/96) |
+| Fully Incorrect | 31.25 ± 9.27% (30/96) |
+| Correct w/ Extraneous | 5.21 ± 4.44% (5/96) |
+| Precision | 63.89% |
+| Recall | 61.14% |
+| F1 | 61.08% |
 
-> **Caveats:** ~42% of samples hit search credit limits mid-run (pre-DuckDuckGo fallback). Small sample size (n = 62) gives wide CIs. This validates architectural stability, not leaderboard performance.
+96 of 100 items received valid judge ratings (1 empty model response, 3 invalid rater responses).
+
+> **Note:** DeepSearchQA questions are multi-hop research tasks requiring the agent to search, synthesize, and reason over multiple sources. The dataset often expects multi-part answers (e.g. lists of names, dates, or figures).
 
 ---
 
@@ -346,6 +361,7 @@ Settings are loaded from YAML with fallback chain: explicit path → `TRAJECTORY
 | `SERPER_API_KEY` | Primary web search (Serper.dev). Falls back to DuckDuckGo if not set or credits exhausted. |
 | `OPENAI_API_KEY` | LLM judge (GPT-4.1-mini by default). Only needed if `judge.enabled: true`. |
 | `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, set `SEARCH_BACKEND=serpapi`). |
+| `GOOGLE_API_KEY` | Gemini API key. Required only when using Gemini models as the LLM judge. |
 
 ---
 
