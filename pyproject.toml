@@ -47,6 +47,7 @@ all = [
     "transformers",
     "matplotlib",
     "openai>=2.0",
+    "google-genai>=1.0.0",
     "pydantic",
 ]
 

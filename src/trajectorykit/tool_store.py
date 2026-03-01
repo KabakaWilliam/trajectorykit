@@ -443,6 +443,32 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
                     continue
                 break  # fall through to Jina
 
+            # ── Detect binary/PDF responses before parsing as HTML ─────
+            content_type = resp.headers.get("content-type", "")
+            if "application/pdf" in content_type or (
+                resp.content[:5] == b"%PDF-" and "html" not in content_type
+            ):
+                # URL serves a PDF — extract text with read_pdf instead of
+                # returning binary garbage through the HTML parser.
+                try:
+                    pdf_text = read_pdf(url, max_chars=max_chars)
+                    if pdf_text and len(pdf_text.strip()) > 20:
+                        return {
+                            "ok": True, "content": f"[PDF detected — extracted text]\n\n{pdf_text}",
+                            "url": str(resp.url), "blocked": False, "reason": "",
+                            "status_code": resp.status_code, "retries": attempt,
+                            "source": "read_pdf",
+                        }
+                except Exception as pdf_err:
+                    logger.debug(f"PDF extraction failed for {url}: {pdf_err}")
+                # If PDF extraction failed, return structured error
+                return {
+                    "ok": False, "content": "", "url": str(resp.url),
+                    "blocked": False, "reason": "URL serves a PDF file that could not be parsed",
+                    "status_code": resp.status_code, "retries": attempt,
+                    "hint": "Try read_pdf(url=...) directly, or search for an HTML version.",
+                }
+
             # Check for soft blocks (200 but Cloudflare challenge page, etc.)
             blocked, reason = _is_blocked(resp.text, resp.status_code)
             if blocked:

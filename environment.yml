@@ -13,6 +13,7 @@ dependencies:
   - pip:
       - vllm>=0.15
       - openai>=2.0
+      - google-genai>=1.0.0
       - duckduckgo-search>=7.0
       - torch>=2.9
       - transformers

@@ -16,6 +16,35 @@ from .tool_store import TOOLS, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
 
 
+def _recover_final_answer_from_raw(raw_args: str) -> str | None:
+    """Try to extract the answer text from a malformed JSON arguments string.
+    
+    The model often produces *almost* valid JSON for final_answer — e.g. a
+    trailing quote is missing, or there's an unescaped newline.  We try
+    several regex strategies to pull out the answer value.
+    
+    Returns the recovered answer string, or None if nothing useful found.
+    """
+    # Strategy 1: grab everything after "answer": "  up to the last quote-like boundary
+    m = re.search(r'"answer"\s*:\s*"(.*)', raw_args, re.DOTALL)
+    if m:
+        candidate = m.group(1)
+        # Strip trailing incomplete JSON: "}  or just "
+        candidate = re.sub(r'"\s*\}?\s*$', '', candidate)
+        # Unescape common JSON escapes
+        for esc, repl in [('\\n', '\n'), ('\\t', '\t'), ('\\"', '"'), ('\\\\', '\\')]:
+            candidate = candidate.replace(esc, repl)
+        if len(candidate.strip()) >= 20:
+            return candidate.strip()
+    
+    # Strategy 2: the whole raw_args might just be the answer text (no JSON wrapper)
+    stripped = raw_args.strip().strip('"').strip()
+    if len(stripped) >= 50 and '{' not in stripped[:5]:
+        return stripped
+    
+    return None
+
+
 def _extract_final_answer(assistant_msg: dict) -> str:
     """Extract the answer from a final_answer tool call in an assistant message.
     
@@ -214,10 +243,22 @@ def dispatch(
     # into the synthesis prompt if the model runs out of turns.
     findings: list[str] = []
     
+    # ── Consecutive search tracker (orchestrator only) ────────────────
+    # Detect when the orchestrator falls into a search loop instead of
+    # delegating to sub-agents.
+    _consecutive_search_count = 0
+    _MAX_CONSECUTIVE_SEARCHES = 2  # after this many, force delegation
+    
     # ── Memory store ──────────────────────────────────────────────────
     # Full-fidelity storage of tool outputs. Compressed at synthesis time
     # and passed to the synthesis sub-agent for programmatic querying.
     memory = MemoryStore()
+    
+    # ── Degeneration flag ─────────────────────────────────────────────
+    # Set when the model can't produce tool calls (3x consecutive failures).
+    # When True, the post-loop synthesis skips Stage 1 (same corrupted
+    # context) and jumps straight to a fresh synthesis sub-agent.
+    _degenerated = False
     
     def _finalize(final_content: str) -> Dict[str, Any]:
         """Build the return dict and finalize the trace."""
@@ -456,14 +497,25 @@ def dispatch(
             final_content = assistant_message.get("content", "") or ""
             
             if consecutive_no_tool_count >= 3:
-                # Model keeps refusing to use tools — accept whatever it gave us
-                if verbose:
-                    print(f"⚠️  Model produced text without tool calls {consecutive_no_tool_count}x in a row — accepting as final answer")
-                    if final_content.strip():
-                        print(f"\n📝 Final Response:\n{final_content[:300]}")
-                turn_record.duration_s = round(time.time() - turn_start, 3)
-                episode.turns.append(turn_record)
-                return _finalize(final_content)
+                # Model has degenerated — it can't produce tool calls anymore.
+                # If it wrote something substantive, accept it. Otherwise,
+                # break to the synthesis pipeline which will try to recover
+                # a coherent answer from the accumulated MemoryStore.
+                if len(final_content.strip()) > 200:
+                    # Substantive text — accept as final answer
+                    if verbose:
+                        print(f"⚠️  Model produced text without tool calls {consecutive_no_tool_count}x in a row — accepting substantive response as final answer")
+                    turn_record.duration_s = round(time.time() - turn_start, 3)
+                    episode.turns.append(turn_record)
+                    return _finalize(final_content)
+                else:
+                    # Empty/garbage — break to synthesis pipeline
+                    if verbose:
+                        print(f"⚠️  Model degenerated ({consecutive_no_tool_count}x no tool calls, no substantive content) — breaking to synthesis pipeline")
+                    _degenerated = True
+                    turn_record.duration_s = round(time.time() - turn_start, 3)
+                    episode.turns.append(turn_record)
+                    break
             else:
                 # Nudge model to call a tool — include its own content so it can
                 # wrap it in final_answer without losing it.
@@ -509,12 +561,26 @@ def dispatch(
             if "<|" in tool_name:
                 tool_name = tool_name.split("<|")[0]
             raw_args = tool_call["function"].get("arguments", "")
+            _args_were_malformed = False
             try:
                 tool_args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
-                tool_args = {}
-                if verbose:
-                    print(f"   ⚠️  Malformed tool arguments for {tool_name}, using empty args")
+                _args_were_malformed = True
+                # For final_answer, try regex extraction before giving up
+                if tool_name == "final_answer" and raw_args:
+                    _recovered = _recover_final_answer_from_raw(raw_args)
+                    if _recovered:
+                        tool_args = {"answer": _recovered}
+                        if verbose:
+                            print(f"   🔧 Recovered final_answer from malformed JSON ({len(_recovered)} chars)")
+                    else:
+                        tool_args = {}
+                        if verbose:
+                            print(f"   ⚠️  Malformed tool arguments for {tool_name}, could not recover")
+                else:
+                    tool_args = {}
+                    if verbose:
+                        print(f"   ⚠️  Malformed tool arguments for {tool_name}, using empty args")
             
             if verbose:
                 print(f"   [{i}] {tool_name}")
@@ -522,6 +588,33 @@ def dispatch(
             # ── Check for final_answer ────────────────────────────────
             if tool_name == "final_answer":
                 final_content = tool_args.get("answer", "")
+                
+                # If answer is empty/trivial AND args were malformed AND we have
+                # turns left, reject and ask the model to retry instead of
+                # silently accepting an empty answer.
+                if len(final_content.strip()) < 20 and _args_were_malformed:
+                    _has_turns_left = turn_length is None or turn < turn_length
+                    if _has_turns_left:
+                        _reject_msg = (
+                            "ERROR: Your final_answer call had malformed JSON arguments and "
+                            "the answer could not be recovered. Please call final_answer again "
+                            "with your complete answer as a simple string. Make sure to properly "
+                            "escape any quotes or special characters in the answer text."
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": _reject_msg,
+                        })
+                        tc_record = ToolCallRecord(
+                            tool_name=tool_name, tool_args=tool_args,
+                            tool_call_id=tool_call["id"], output=_reject_msg,
+                            duration_s=0, child_trace=None,
+                        )
+                        turn_record.tool_calls.append(tc_record)
+                        if verbose:
+                            print(f"   🔄 Rejected malformed final_answer — asking model to retry")
+                        continue  # skip to next tool call / next turn
                 
                 # Backfill: if the model called final_answer with an empty/trivial
                 # answer, it likely already wrote its real answer as plain text in
@@ -552,6 +645,22 @@ def dispatch(
                             if verbose:
                                 print(f"   ↩️  Backfilled empty final_answer from prior response ({len(candidate)} chars)")
                             break
+                    
+                    # Last resort: if backfill failed and we have research data,
+                    # break to the synthesis pipeline instead of dumping raw findings.
+                    # The fresh synthesis sub-agent can query MemoryStore properly.
+                    if len(final_content.strip()) < 20 and (findings or memory):
+                        if verbose:
+                            print(f"   🔄 Empty final_answer with {len(findings)} findings — breaking to synthesis pipeline")
+                        tc_record = ToolCallRecord(
+                            tool_name=tool_name, tool_args=tool_args,
+                            tool_call_id=tool_call["id"],
+                            output="[answer lost — routing to synthesis]",
+                            duration_s=0, child_trace=None,
+                        )
+                        turn_record.tool_calls.append(tc_record)
+                        _degenerated = True
+                        break  # → post-loop synthesis pipeline
                 
                 tc_record = ToolCallRecord(
                     tool_name=tool_name,
@@ -604,6 +713,24 @@ def dispatch(
             else:
                 consecutive_error_count = 0
                 last_error_signature = None
+            
+            # ── Consecutive search enforcement (orchestrator only) ────
+            if _depth == 0 and tool_name in ("search_web", "fetch_url", "read_pdf"):
+                _consecutive_search_count += 1
+                if _consecutive_search_count >= _MAX_CONSECUTIVE_SEARCHES:
+                    output += (
+                        "\n\n⚠️ ORCHESTRATOR RULE: You have called search/fetch "
+                        f"{_consecutive_search_count} times in a row. "
+                        "You are a COORDINATOR — stop researching directly. "
+                        "If you still need information, spawn_agent(task='...') "
+                        "with a clear research task. Do NOT call search_web or "
+                        "fetch_url again until a sub-agent returns."
+                    )
+                    if verbose:
+                        print(f"       ⚠️  Consecutive search #{_consecutive_search_count} — nudging to delegate")
+            else:
+                if tool_name == "spawn_agent":
+                    _consecutive_search_count = 0  # reset after delegation
             
             # Record tool call in trace
             tc_record = ToolCallRecord(
@@ -660,17 +787,29 @@ def dispatch(
         turn_record.duration_s = round(time.time() - turn_start, 3)
         episode.turns.append(turn_record)
         
+        # If empty final_answer triggered synthesis break, propagate to while loop
+        if _degenerated:
+            break
+        
         # If final_answer was called in this batch, finalize now
         if final_answer_result is not None:
             if verbose:
                 print(f"\n📝 Final Response:\n{final_answer_result}")
             return _finalize(final_answer_result)
     
-    # ── Turn limit reached — force one last final_answer call ─────────
-    # We should rarely get here because the last turn already forces
-    # final_answer via tool_choice. But as a safety net:
-    if verbose:
-        print(f"\n⚠️  Turn limit reached — forcing final_answer synthesis")
+    # ── Post-loop synthesis ────────────────────────────────────────────
+    # Two paths lead here:
+    #   1. Normal: turn limit reached (context is long but not corrupted)
+    #   2. Degeneration: model failed to produce tool calls 3x in a row
+    # For (1), we try Stage 1 (forced final_answer in current context)
+    # then Stage 2 (fresh synthesis sub-agent). For (2), we skip Stage 1
+    # since the corrupted context is what caused the failure.
+    if _degenerated:
+        if verbose:
+            print(f"\n⚠️  Model degenerated — skipping Stage 1, going straight to fresh synthesis sub-agent")
+    else:
+        if verbose:
+            print(f"\n⚠️  Turn limit reached — forcing final_answer synthesis")
     
     # Build a findings summary to inject into the synthesis prompt
     findings_block = ""
@@ -694,25 +833,30 @@ def dispatch(
               f"({stats['savings_pct']}% savings)")
     
     q_echo_synth = user_input[:500] + ("…" if len(user_input) > 500 else "")
-    messages.append({
-        "role": "user",
-        "content": (
-            "You have run out of turns. Call final_answer NOW with your best "
-            "response based on everything gathered so far.\n\n"
-            f"ORIGINAL QUESTION:\n{q_echo_synth}\n"
-            f"{findings_block}\n"
-            "Synthesize these findings into a clear, well-cited answer to the "
-            "question above."
-        ),
-    })
     
-    # Use proper max_tokens estimation (not the raw context_window)
-    approx_input_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 4
-    synth_max_tokens = max(context_window - approx_input_tokens - TOKEN_SAFETY_MARGIN, 256)
-    synth_max_tokens = min(synth_max_tokens, max_tokens)
+    # ── Stage 1: Forced final_answer in current context ────────────────
+    # Skip this entirely if the model degenerated — the corrupted context
+    # is what caused the failure, so retrying in it is pointless.
+    if not _degenerated:
+        messages.append({
+            "role": "user",
+            "content": (
+                "You have run out of turns. Call final_answer NOW with your best "
+                "response based on everything gathered so far.\n\n"
+                f"ORIGINAL QUESTION:\n{q_echo_synth}\n"
+                f"{findings_block}\n"
+                "Synthesize these findings into a clear, well-cited answer to the "
+                "question above."
+            ),
+        })
+        
+        # Use proper max_tokens estimation (not the raw context_window)
+        approx_input_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 4
+        synth_max_tokens = max(context_window - approx_input_tokens - TOKEN_SAFETY_MARGIN, 256)
+        synth_max_tokens = min(synth_max_tokens, max_tokens)
     
-    # Try synthesis up to 2 times
-    for synth_attempt in range(2):
+    # Try synthesis up to 2 times (skipped when degenerated)
+    for synth_attempt in range(0 if _degenerated else 2):
         try:
             synth_response = _call_api(synth_max_tokens, tools_override=[FINAL_ANSWER_TOOL])
             if synth_response.status_code == 200:
