@@ -15,4 +15,7 @@ data
 demo
 evals
 private_example.py
+recovery_trace_scripts.sh
+deep_research_bench
+sample_essay*
 *.sif

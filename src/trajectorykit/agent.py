@@ -255,9 +255,10 @@ def dispatch(
     
     # ── Consecutive search tracker (orchestrator only) ────────────────
     # Detect when the orchestrator falls into a search loop instead of
-    # delegating to sub-agents.
+    # delegating to sub-agents.  After _MAX hits, suppress tool output
+    # and return only the delegation directive (hard block).
     _consecutive_search_count = 0
-    _MAX_CONSECUTIVE_SEARCHES = 2  # after this many, force delegation
+    _MAX_CONSECUTIVE_SEARCHES = 3  # after this many, hard-block output
     
     # ── Memory store ──────────────────────────────────────────────────
     # Full-fidelity storage of tool outputs. Compressed at synthesis time
@@ -739,22 +740,37 @@ def dispatch(
                 last_error_signature = None
             
             # ── Consecutive search enforcement (orchestrator only) ────
-            if _depth == 0 and tool_name in ("search_web", "fetch_url", "read_pdf"):
+            # After 3 consecutive search/fetch calls at root level, hard-block:
+            # suppress the tool output entirely and return only a directive
+            # to delegate. Resets on ANY non-search tool (spawn, execute, etc).
+            if _depth == 0 and tool_name in ("search_web", "fetch_url", "read_pdf", "extract_tables", "fetch_cached", "wikipedia_lookup"):
                 _consecutive_search_count += 1
-                if _consecutive_search_count >= _MAX_CONSECUTIVE_SEARCHES:
-                    output += (
-                        "\n\n⚠️ ORCHESTRATOR RULE: You have called search/fetch "
-                        f"{_consecutive_search_count} times in a row. "
-                        "You are a COORDINATOR — stop researching directly. "
-                        "If you still need information, spawn_agent(task='...') "
-                        "with a clear research task. Do NOT call search_web or "
-                        "fetch_url again until a sub-agent returns."
+                if _consecutive_search_count > _MAX_CONSECUTIVE_SEARCHES:
+                    # Hard block: discard output, return directive only
+                    output = (
+                        f"⛔ BLOCKED: You have called search/fetch {_consecutive_search_count} times "
+                        "in a row without delegating. Your output has been SUPPRESSED.\n\n"
+                        "You are the ORCHESTRATOR — your job is to COORDINATE, not research.\n"
+                        "REQUIRED NEXT ACTION: Call spawn_agent(task='...') with a clear, "
+                        "self-contained research task. Your search counter will reset after "
+                        "you delegate.\n\n"
+                        "If you already have enough information, call final_answer now."
                     )
                     if verbose:
-                        print(f"       ⚠️  Consecutive search #{_consecutive_search_count} — nudging to delegate")
+                        print(f"       ⛔  Consecutive search #{_consecutive_search_count} — OUTPUT BLOCKED, forcing delegation")
+                elif _consecutive_search_count == _MAX_CONSECUTIVE_SEARCHES:
+                    # Last allowed search — warn that next will be blocked
+                    output += (
+                        "\n\n⚠️ ORCHESTRATOR WARNING: This is your 3rd consecutive search/fetch. "
+                        "The NEXT search/fetch call will be BLOCKED and its output suppressed. "
+                        "Delegate remaining research to spawn_agent(task='...') or "
+                        "call final_answer if you have enough information."
+                    )
+                    if verbose:
+                        print(f"       ⚠️  Consecutive search #{_consecutive_search_count} — warning, next will be blocked")
             else:
-                if tool_name == "spawn_agent":
-                    _consecutive_search_count = 0  # reset after delegation
+                # Any non-search tool resets the counter
+                _consecutive_search_count = 0
             
             # Record tool call in trace
             tc_record = ToolCallRecord(

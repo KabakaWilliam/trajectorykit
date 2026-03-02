@@ -26,6 +26,42 @@ logger = logging.getLogger(__name__)
 
 ToolReturn = Tuple[str, Optional[EpisodeTrace]]
 
+
+def cleanup_sandbox() -> bool:
+    """Send a lightweight cleanup request to the sandbox to free /tmp.
+
+    Removes stale temp directories created by previous execute_code calls.
+    Safe to call between questions — no code is running at that point.
+    Returns True if cleanup succeeded, False on any error.
+    """
+    from .config import SANDBOX_FUSION_URL
+    try:
+        resp = requests.post(
+            SANDBOX_FUSION_URL,
+            json={
+                "code": (
+                    "import shutil, glob, os\n"
+                    "removed = 0\n"
+                    "for p in glob.glob('/tmp/tmp*'):\n"
+                    "    try:\n"
+                    "        shutil.rmtree(p)\n"
+                    "        removed += 1\n"
+                    "    except OSError:\n"
+                    "        pass\n"
+                    "print(f'Cleaned {removed} temp dirs')\n"
+                ),
+                "language": "python",
+                "run_timeout": 5,
+                "compile_timeout": 5,
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        logger.debug(f"Sandbox cleanup failed: {e}")
+        return False
+
 DEFAULT_NUM_SEARCHES = 5
 
 # ── Search backend selection ─────────────────────────────────────────────
@@ -535,11 +571,26 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
     # ── All direct attempts failed — try Jina Reader ──────────────────
     jina_text = _jina_reader_fallback(url, max_chars)
     if jina_text:
-        return {
-            "ok": True, "content": jina_text, "url": url,
-            "blocked": False, "reason": "", "status_code": last_status,
-            "retries": retries_done, "source": "jina_reader",
-        }
+        # Sanity-check: if Jina returned a "Page Not Found" style page,
+        # don't treat it as success.
+        _jina_lower = jina_text[:1500].lower()
+        if "page not found" not in _jina_lower and "404" not in _jina_lower:
+            return {
+                "ok": True, "content": jina_text, "url": url,
+                "blocked": False, "reason": "", "status_code": last_status,
+                "retries": retries_done, "source": "jina_reader",
+            }
+        # Jina returned a 404 page — fall through to Wayback
+        logger.debug(f"Jina Reader returned a 404 page for {url}, trying Wayback")
+
+    # ── Wayback Machine auto-fallback ─────────────────────────────────
+    try:
+        wb_result = fetch_cached(url=url, max_chars=max_chars)
+        if wb_result.get("ok") and wb_result.get("content", "").strip():
+            wb_result["source"] = "wayback_auto_fallback"
+            return wb_result
+    except Exception as wb_err:
+        logger.debug(f"Wayback auto-fallback failed for {url}: {wb_err}")
 
     # ── Total failure ─────────────────────────────────────────────────
     return {
@@ -547,9 +598,8 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
         "blocked": True, "reason": last_error, "status_code": last_status,
         "retries": retries_done,
         "hint": (
-            "This site blocked automated access. Do NOT retry this URL. "
-            "Search for the same information from a different source, "
-            "or try site:web.archive.org in your search query."
+            "This site blocked automated access and no Wayback Machine snapshot was found. "
+            "Do NOT retry this URL. Search for the same information from a different source."
         ),
     }
 
@@ -1246,30 +1296,42 @@ def search_available_tools_wrapper(**kwargs):
 def fetch_url_wrapper(**kwargs):
     """Wrapper for fetch_url tool. Returns (output, None).
     
-    Auto-redirects Wikipedia URLs to wikipedia_lookup for reliable access
-    (Wikipedia blocks raw HTTP requests without proper API credentials).
+    Smart routing before hitting fetch_url:
+    1. Wikipedia URLs → wikipedia_lookup (MediaWiki API, not blocked)
+    2. .pdf URLs → read_pdf first (proper PDF extraction)
+    Then normal fetch_url with Jina + Wayback fallbacks.
     """
     try:
         url = kwargs.get("url")
         if not url:
             return "ERROR: 'url' parameter is required", None
 
-        # ── A: Auto-redirect Wikipedia URLs → wikipedia_lookup ────────
+        # ── Auto-redirect Wikipedia URLs → wikipedia_lookup ───────────
         import re as _re
         wiki_match = _re.match(
             r'https?://(?:\w+\.)?wikipedia\.org/wiki/(.+)',
             url, _re.IGNORECASE,
         )
         if wiki_match:
-            # Extract title from URL path, decode percent-encoding
             from urllib.parse import unquote
             raw_title = unquote(wiki_match.group(1)).replace('_', ' ')
-            # Strip any section anchor
             if '#' in raw_title:
                 raw_title = raw_title.split('#')[0]
             logger.info(f"[fetch_url] Wikipedia URL detected — redirecting to wikipedia_lookup(title='{raw_title}')")
             result_str, _ = wikipedia_lookup_wrapper(title=raw_title, max_chars=kwargs.get("max_chars", 8000))
             return f"[Auto-redirected to wikipedia_lookup for reliable Wikipedia access]\n\n{result_str}", None
+
+        # ── Early PDF detection by URL extension ──────────────────────
+        from urllib.parse import urlparse
+        url_path = urlparse(url).path.lower()
+        if url_path.endswith(".pdf"):
+            try:
+                logger.info(f"[fetch_url] PDF URL detected — trying read_pdf first: {url}")
+                pdf_text = read_pdf(url=url, max_chars=kwargs.get("max_chars", 8000))
+                if pdf_text and len(pdf_text.strip()) > 30:
+                    return f"[PDF detected by URL — extracted with read_pdf]\n\n{pdf_text}", None
+            except Exception as pdf_err:
+                logger.debug(f"[fetch_url] read_pdf failed for {url}: {pdf_err} — falling through to normal fetch")
 
         max_chars = kwargs.get("max_chars", 8000)
         extract = kwargs.get("extract", "text")
@@ -1585,10 +1647,14 @@ TOOLS = [
         "name": "fetch_url",
         "description": (
             "Fetch a web page with automatic retry, browser-grade headers, and "
-            "persistent cookies. Falls back to Jina Reader for JS-heavy pages.\n\n"
+            "persistent cookies. Falls back to Jina Reader for JS-heavy pages, "
+            "then Wayback Machine if all else fails.\n\n"
             "Returns page text on success. On failure (site blocks, 403, etc.) returns "
             "a structured error with blocked=true and a hint to search elsewhere.\n"
             "DO NOT retry a URL that returns blocked=true — pivot to a different source.\n\n"
+            "TABLE EXTRACTION: Set extract='table' to get HTML tables as pipe-delimited rows. "
+            "This is a good fallback if extract_tables fails or returns no tables, since "
+            "fetch_url has a full retry chain (Jina + Wayback) that extract_tables lacks.\n\n"
             "TIP: Use css_selector to extract only the relevant part of a large page "
             "(e.g. css_selector='table.data-table' or css_selector='div#content')."
         ),
@@ -1634,7 +1700,10 @@ TOOLS = [
             "proper column names and cell values you can directly process in code.\n\n"
             "Use this when the answer requires reading specific values from tables "
             "(statistics, rankings, comparisons). Feed the JSON result into "
-            "execute_code for filtering, sorting, or computation."
+            "execute_code for filtering, sorting, or computation.\n\n"
+            "FALLBACK: If this tool returns no tables or the site blocks access, "
+            "try fetch_url(url=..., extract='table') instead — it has a stronger "
+            "retry chain (Jina Reader + Wayback Machine) that can reach more sites."
         ),
         "parameters": {
             "type": "object",

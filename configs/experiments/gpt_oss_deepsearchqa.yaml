@@ -69,7 +69,7 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: null
-  workers: 5
+  workers: 10
 
 judge:
   enabled: true

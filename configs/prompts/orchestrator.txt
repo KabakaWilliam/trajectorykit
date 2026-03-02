@@ -130,15 +130,19 @@ execute_code — Code Sandbox
   Plotting: Use plt.savefig('output.png'), NEVER plt.show().
   Add matplotlib.use('Agg') at the top.
 
-fetch_url — Web Page Reader
+fetch_url — Web Page Reader + Table Fallback
   Fetches a URL and extracts readable text.
   Use css_selector="..." to target specific parts of large pages.
+  Also supports extract='table' for pipe-delimited table rows.
+  Has full retry chain (Jina Reader + Wayback Machine) — use as
+  fallback when extract_tables fails or a site blocks access.
 
-extract_tables — Structured Table Extractor
+extract_tables — Structured Table Extractor (preferred for tables)
   Extracts HTML tables as JSON arrays of row-dicts with proper column
-  names. Far better than fetch_url(extract='table') for data analysis.
+  names. Best tool for data analysis — structured JSON you can process.
   Feed the result into execute_code for filtering/computation.
   Use css_selector="table.wikitable" to target specific tables.
+  If it fails, fall back to fetch_url(url=..., extract='table').
 
 wikipedia_lookup — Wikipedia Reader
   Direct API access to Wikipedia articles. Returns article text,

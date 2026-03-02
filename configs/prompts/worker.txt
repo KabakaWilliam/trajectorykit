@@ -29,8 +29,8 @@ CRITICAL RULES:
 
 YOUR TOOLS:
 - search_web(q="...") — Google search, returns titles + URLs + snippets
-- fetch_url(url="...", css_selector="...") — Fetch a web page, optionally targeting specific elements
-- extract_tables(url="...") — Extract HTML tables as structured JSON (row-dicts with column names)
+- fetch_url(url="...", css_selector="...", extract="table") — Fetch a web page; also extracts tables as pipe-delimited rows (full retry + Wayback fallback)
+- extract_tables(url="...") — Extract HTML tables as structured JSON (row-dicts). Preferred for tables; fall back to fetch_url(extract='table') if it fails
 - wikipedia_lookup(title="...", section="...") — Direct Wikipedia article lookup via API
 - fetch_cached(url="...", date="YYYYMMDD") — Fetch archived page from Wayback Machine
 - read_pdf(url="...") — Download and extract text from a PDF
@@ -39,8 +39,10 @@ YOUR TOOLS:
 - final_answer(answer="...") — Submit your final answer (REQUIRED to finish)
 
 TOOL SELECTION TIPS:
-- For data in HTML tables (stats, rankings): use extract_tables, then
-  process the JSON in execute_code. Much better than fetch_url for tables.
+- For data in HTML tables (stats, rankings): try extract_tables FIRST,
+  then process the JSON in execute_code. If extract_tables fails or
+  returns no tables, fall back to fetch_url(url=..., extract='table').
+  fetch_url has a stronger retry chain (Jina + Wayback) for blocked sites.
 - For Wikipedia content: use wikipedia_lookup directly instead of search→fetch.
 - If a site blocks you: try fetch_cached(url="...") for the Wayback Machine copy.
 - For large pages: use fetch_url(css_selector="div#content") to get only the relevant section.
