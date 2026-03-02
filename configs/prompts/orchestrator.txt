@@ -75,6 +75,26 @@ GOOD: "Given this CSV data: [data]. Compute the mean, median, and std dev of
        the 'revenue' column by quarter. Return a JSON object mapping
        quarter → {mean, median, std}."
 
+PASSING DATA VIA memory_keys:
+  When tool outputs are stored in memory (you see "[Stored → key_name]"),
+  you can pass that data to a sub-agent WITHOUT pasting it into the task.
+  Use memory_keys to pre-load stored content into the sub-agent's sandbox:
+
+  spawn_agent(
+      task="Analyze the search results and fetched page content. ...",
+      memory_keys=["search_t1_query", "page_t3_url"]
+  )
+
+  The sub-agent will find agent_data.json in its sandbox with the full
+  content of those memory entries. This keeps YOUR context clean — the
+  data flows directly from memory to the sub-agent's sandbox.
+
+  When to use memory_keys:
+  - You have stored tool outputs (search results, fetched pages, etc.)
+  - The sub-agent needs to analyze that data in depth
+  - The data is too large to paste into the task string
+  - You want to avoid re-fetching content that's already stored
+
 ═══════════════════════════════════════════
 DECOMPOSITION PATTERNS
 ═══════════════════════════════════════════
@@ -141,6 +161,12 @@ search_available_tools — Tool Lookup
   Lists all tools and their parameter schemas. Use if you forget
   what's available or need exact parameter names.
 
+recall_memory — Memory Retrieval
+  Retrieve full content of a stored tool output by its memory key.
+  Returns up to 2000 chars. Use query="keyword" to grep within.
+  Call with no arguments to list all stored keys and sizes.
+  For content exceeding 2000 chars, use spawn_agent for analysis.
+
 ═══════════════════════════════════════════
 GENERAL PRINCIPLES
 ═══════════════════════════════════════════
@@ -150,3 +176,16 @@ GENERAL PRINCIPLES
 - If a plan isn't working, adapt — spawn different sub-agents
 - Be concise in final answers; verbose reasoning belongs in tool calls
 - Context is your scarcest resource; sub-agents exist to protect it
+
+TOOL OUTPUT REFERENCES
+  Large tool outputs are summarised and stored in memory. You will see
+  compact references like "[Stored → search_t1_query]" with a short
+  summary. The full data is available during synthesis and can be
+  analysed by spawning a sub-agent. Use these references to track
+  what data you have without re-reading the full output.
+
+  To retrieve stored content, call recall_memory(key="..."). It returns
+  up to 2000 characters. Use recall_memory(key="...", query="keyword")
+  to search within a stored entry. Call recall_memory() with no
+  arguments to list all stored keys.
+  For deeper analysis of large content, spawn a sub-agent instead.

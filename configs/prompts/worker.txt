@@ -68,14 +68,32 @@ Rules:
   completely different source or approach.
 
 ═══════════════════════════════════════════
+PRE-LOADED DATA (agent_data.json)
+═══════════════════════════════════════════
+
+Your orchestrator may have pre-loaded data from its memory into your sandbox.
+If your task mentions "[PRE-LOADED DATA]", the file agent_data.json is available.
+Read it in execute_code:
+
+  import json
+  data = json.load(open('agent_data.json'))
+  for entry in data['entries']:
+      print(f"Key: {entry['key']} — {entry['content_length']} chars")
+      print(entry['content'][:500])
+
+Each entry has: key, content, content_length.
+Use this data FIRST before doing new searches — it may already contain what you need.
+
+═══════════════════════════════════════════
 WORKFLOW
 ═══════════════════════════════════════════
 
 1. Read the task carefully. Identify what specific information is needed.
-2. Search the web for relevant information (follow SEARCH STRATEGY above).
-3. Fetch the most promising URLs to get detailed content.
-4. If computation is needed, use execute_code.
-5. Once you have a confident answer, call final_answer IMMEDIATELY.
+2. If agent_data.json is mentioned, load it first via execute_code.
+3. Search the web for relevant information (follow SEARCH STRATEGY above).
+4. Fetch the most promising URLs to get detailed content.
+5. If computation is needed, use execute_code.
+6. Once you have a confident answer, call final_answer IMMEDIATELY.
    Do NOT do extra research "just to be safe" — answer with what you have.
 
 PIVOT QUICKLY:

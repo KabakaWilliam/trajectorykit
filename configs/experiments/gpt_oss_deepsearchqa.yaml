@@ -19,6 +19,13 @@ agent:
   max_recursion_depth: 1
   sub_agent_turn_budget: 15
   token_safety_margin: 256
+  # Symbolic references: compress large tool outputs to summaries at depth 0.
+  # Full data stays in MemoryStore; the LLM sees a compact reference.
+  symbolic_references: false
+  symbolic_threshold: 500         # chars — smaller outputs pass through
+  # Research plan: inject a structured progress tracker every N turns.
+  plan_state: true
+  plan_inject_interval: 3         # inject plan every N turns
 
 sandbox:
   url: "http://localhost:8080/run_code"

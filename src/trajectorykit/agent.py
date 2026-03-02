@@ -11,7 +11,10 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT, TOKEN_SAFETY_MARGIN, get_model_profile
+from .config import SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL
 from .memory import MemoryStore
+from .plan import ResearchPlan
+from .symbolic import make_symbolic
 from .tool_store import TOOLS, dispatch_tool_call
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
 
@@ -130,6 +133,7 @@ def dispatch(
     example_id: Optional[str] = None,
     _depth: int = 0,
     _sandbox_files: Optional[Dict[str, str]] = None,
+    _is_synthesizer: bool = False,
 ) -> Dict[str, Any]:
     """
     Run an agentic loop with iterative tool calling and response refinement.
@@ -147,6 +151,9 @@ def dispatch(
         _sandbox_files: Files to auto-inject into every execute_code sandbox call.
                         Dict of {filename: base64_content}. Used by synthesis sub-agent
                         to access research data without polluting the LLM context.
+        _is_synthesizer: If True, use the synthesizer prompt and restricted tool set.
+                         Decoupled from _sandbox_files so regular workers can also
+                         receive sandbox files (e.g. via memory_keys on spawn_agent).
     
     Returns:
         Dictionary with:
@@ -189,9 +196,9 @@ def dispatch(
     
     # ── Depth-aware prompt & tool selection ──────────────────────────────
     # Root agent (depth 0): orchestrator prompt, full tool list
-    # Sub-agents (depth >= 1): worker prompt, spawn_agent hidden
-    # Synthesis sub-agent (_sandbox_files set): synthesizer prompt, code + final_answer only
-    if _sandbox_files:
+    # Sub-agents (depth >= 1): worker prompt, spawn_agent + recall_memory hidden
+    # Synthesis sub-agent (_is_synthesizer): synthesizer prompt, code + final_answer only
+    if _is_synthesizer:
         system_prompt = SYNTHESIZER_PROMPT
         available_tools = [t for t in TOOLS if t["function"]["name"] in ("execute_code", "final_answer", "search_available_tools")]
     elif _depth == 0:
@@ -199,7 +206,7 @@ def dispatch(
         available_tools = TOOLS
     else:
         system_prompt = WORKER_PROMPT
-        available_tools = [t for t in TOOLS if t["function"]["name"] != "spawn_agent"]
+        available_tools = [t for t in TOOLS if t["function"]["name"] not in ("spawn_agent", "recall_memory")]
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -257,6 +264,14 @@ def dispatch(
     # and passed to the synthesis sub-agent for programmatic querying.
     memory = MemoryStore()
     
+    # ── Research plan (root orchestrator only) ─────────────────────
+    # Mechanical progress tracker injected into conversation every N turns.
+    plan: ResearchPlan | None = None
+    if PLAN_STATE and _depth == 0:
+        q_plan = user_input[:300] + ("…" if len(user_input) > 300 else "")
+        plan = ResearchPlan(question=q_plan)
+        plan.INJECT_EVERY_N_TURNS = PLAN_INJECT_INTERVAL
+    
     # ── Degeneration flag ─────────────────────────────────────────────
     # Set when the model can't produce tool calls (3x consecutive failures).
     # When True, the post-loop synthesis skips Stage 1 (same corrupted
@@ -305,10 +320,16 @@ def dispatch(
         if max_completion:
             effective_max_tokens = min(effective_max_tokens, max_completion)
 
-        # ── Periodic question reminder (every 8 turns) ────────────────────
-        # During long horizons the model can lose sight of the original question.
+        # ── Periodic plan state / question reminder (every N turns) ─────
+        # If plan_state is enabled (root only), inject structured progress.
+        # Otherwise fall back to the simple question reminder every 8 turns.
         _REMINDER_INTERVAL = 8
-        if turn > 1 and turn % _REMINDER_INTERVAL == 0:
+        if plan is not None and plan.should_inject(turn):
+            plan_msg = plan.render(turn, turn_length)
+            messages.append({"role": "system", "content": plan_msg})
+            if verbose:
+                print(f"📋  Injected research plan (turn {turn})")
+        elif plan is None and turn > 1 and turn % _REMINDER_INTERVAL == 0:
             q_snippet = user_input[:300] + ("…" if len(user_input) > 300 else "")
             messages.append({"role": "system", "content": (
                 f"🔎 REMINDER — You are answering this question:\n"
@@ -685,7 +706,7 @@ def dispatch(
             tc_start = time.time()
             child_trace = None
             try:
-                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files)
+                output, child_trace = dispatch_tool_call(tool_name, tool_args, _depth=_depth, model=model, reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _memory_store=memory)
                 if verbose and len(output) < 200:
                     print(f"       → {output}")
                 elif verbose:
@@ -749,7 +770,8 @@ def dispatch(
             # ── Track findings for synthesis fallback ─────────────────
             # Keep a compact log of non-error tool outputs so we can
             # inject them into the synthesis prompt if the model runs out.
-            if not output.startswith("ERROR:") and tool_name not in ("search_available_tools",):
+            _is_error = output.startswith("ERROR:")
+            if not _is_error and tool_name not in ("search_available_tools",):
                 snippet = output[:1500].strip()
                 if snippet:
                     findings.append(f"[{tool_name}] {snippet}")
@@ -766,11 +788,23 @@ def dispatch(
                     desc = str(tool_args.get("url", ""))[:60]
                 elif tool_name == "spawn_agent":
                     desc = str(tool_args.get("task", ""))[:60]
-                memory.add(
+                mem_key = memory.add(
                     tool_name=tool_name,
                     turn=turn,
                     content=output,
                     description=desc,
+                )
+            else:
+                mem_key = None
+            
+            # ── Research plan tracking (root only) ────────────────────
+            if plan is not None and tool_name not in ("search_available_tools",):
+                plan.record_tool_call(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    output=output,
+                    memory_key=mem_key,
+                    is_error=_is_error,
                 )
             
             # Add tool result to messages (strip base64 blobs to avoid
@@ -780,6 +814,24 @@ def dispatch(
                 r"\1[file content saved to trace]\2",
                 output, flags=re.DOTALL
             )
+            
+            # ── Symbolic references (root orchestrator only) ──────────
+            # Replace large outputs with compact summary + memory key.
+            if (
+                SYMBOLIC_REFERENCES
+                and _depth == 0
+                and mem_key is not None
+                and len(msg_output) > SYMBOLIC_THRESHOLD
+            ):
+                msg_output = make_symbolic(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    output=msg_output,
+                    memory_key=mem_key,
+                )
+                if verbose:
+                    print(f"       📎 Symbolic ref: {len(output):,} → {len(msg_output):,} chars [{mem_key}]")
+            
             tool_message = {
                 "role": "tool",
                 "tool_call_id": tool_call["id"],
@@ -956,6 +1008,7 @@ def dispatch(
                 example_id=example_id,
                 _depth=_depth + 1,
                 _sandbox_files=sandbox_files,
+                _is_synthesizer=True,
             )
             
             final_content = synth_result.get("final_response", "")

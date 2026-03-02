@@ -907,7 +907,8 @@ def spawn_agent(
     return output, child_trace
 
 def execute_code(
-    completion: str,
+    code: Optional[str] = None,
+    completion: Optional[str] = None,   # legacy alias for 'code'
     stdin: Optional[str] = '',
     compile_timeout: int = 10,
     run_timeout: int = 15,
@@ -919,21 +920,26 @@ def execute_code(
     
     from .config import SANDBOX_FUSION_URL
 
-    code = completion
-    if "```python" in completion:
-        code = completion.split("```python")[-1].split("```")[0]
-    elif "```" in completion:
+    # Accept both 'code' and legacy 'completion' param names
+    raw = code or completion
+    if not raw:
+        return None, "ERROR: 'code' parameter is required"
+
+    extracted = raw
+    if "```python" in raw:
+        extracted = raw.split("```python")[-1].split("```")[0]
+    elif "```" in raw:
         # Handle cases like ```\ncode\n```
-        parts = completion.split("```")
+        parts = raw.split("```")
         if len(parts) >= 2:
-            code = parts[1]
+            extracted = parts[1]
             # Remove potential language specifier like 'python\n'
-            if "\n" in code:
-                first_line, rest = code.split("\n", 1)
+            if "\n" in extracted:
+                first_line, rest = extracted.split("\n", 1)
                 if first_line.strip().isalpha():  # Simple check for language name
-                    code = rest
-    else:
-        return 0.0, [{"error": "Invalid completion (missing code block)"}]
+                    extracted = rest
+    # If no code block markers, use raw input as-is (don't error)
+    code = extracted
     
     request_id = str(uuid.uuid4())  # <-- Generate request_id internally
     log_prefix = f"[Request ID: {request_id}] "  # <-- Create log prefix
@@ -1131,13 +1137,50 @@ def search_web_wrapper(**kwargs):
     except Exception as e:
         return f"ERROR: {str(e)}", None
 
-def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, **kwargs):
+def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _memory_store=None, **kwargs):
     """Wrapper for spawn_agent tool. Injects _depth, _model, _reasoning_effort from the parent dispatch loop.
-    Returns (output_str, child_trace) where child_trace is an EpisodeTrace."""
+    Returns (output_str, child_trace) where child_trace is an EpisodeTrace.
+    
+    If the model provides memory_keys, the corresponding MemoryStore entries
+    are serialized to agent_data.json and pre-loaded into the sub-agent's sandbox.
+    """
     try:
         task = kwargs.get("task")
         if not task:
             return "ERROR: 'task' parameter is required", None
+
+        # Build sandbox files for this sub-agent
+        # Start with any inherited sandbox files (e.g. from synthesis pipeline)
+        child_sandbox_files = dict(_sandbox_files) if _sandbox_files else {}
+
+        # If memory_keys provided, serialize those entries to agent_data.json
+        memory_keys = kwargs.pop("memory_keys", None)
+        if memory_keys and _memory_store:
+            import base64 as _b64
+            entries = []
+            missing = []
+            for k in memory_keys:
+                content = _memory_store.get(k)
+                if content is not None:
+                    entries.append({"key": k, "content": content, "content_length": len(content)})
+                else:
+                    missing.append(k)
+            if entries:
+                data_json = json.dumps({"entries": entries, "entry_count": len(entries)}, ensure_ascii=False)
+                child_sandbox_files["agent_data.json"] = _b64.b64encode(data_json.encode("utf-8")).decode("ascii")
+                # Prepend a note to the task so the worker knows about the file
+                file_summary = ", ".join(f"{e['key']} ({e['content_length']:,} chars)" for e in entries)
+                task = (
+                    f"[PRE-LOADED DATA] The file agent_data.json is available in your sandbox. "
+                    f"Read it with: import json; data = json.load(open('agent_data.json'))\n"
+                    f"It contains {len(entries)} entries: {file_summary}\n"
+                    f"Each entry has 'key', 'content', and 'content_length' fields.\n\n"
+                    f"{task}"
+                )
+            if missing:
+                task += f"\n\n(Note: requested memory keys not found: {', '.join(missing)})"
+        elif memory_keys and not _memory_store:
+            task += "\n\n(Note: memory_keys were requested but memory store is not available at this depth.)"
 
         from .config import SUB_AGENT_TURN_BUDGET
         output, child_trace = spawn_agent(
@@ -1149,7 +1192,7 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
             model=_model,
             reasoning_effort=_reasoning_effort,
             _depth=_depth,
-            _sandbox_files=_sandbox_files,
+            _sandbox_files=child_sandbox_files if child_sandbox_files else None,
         )
         return output, child_trace
     except Exception as e:
@@ -1201,11 +1244,32 @@ def search_available_tools_wrapper(**kwargs):
         return f"ERROR: {str(e)}", None
     
 def fetch_url_wrapper(**kwargs):
-    """Wrapper for fetch_url tool. Returns (output, None)."""
+    """Wrapper for fetch_url tool. Returns (output, None).
+    
+    Auto-redirects Wikipedia URLs to wikipedia_lookup for reliable access
+    (Wikipedia blocks raw HTTP requests without proper API credentials).
+    """
     try:
         url = kwargs.get("url")
         if not url:
             return "ERROR: 'url' parameter is required", None
+
+        # ── A: Auto-redirect Wikipedia URLs → wikipedia_lookup ────────
+        import re as _re
+        wiki_match = _re.match(
+            r'https?://(?:\w+\.)?wikipedia\.org/wiki/(.+)',
+            url, _re.IGNORECASE,
+        )
+        if wiki_match:
+            # Extract title from URL path, decode percent-encoding
+            from urllib.parse import unquote
+            raw_title = unquote(wiki_match.group(1)).replace('_', ' ')
+            # Strip any section anchor
+            if '#' in raw_title:
+                raw_title = raw_title.split('#')[0]
+            logger.info(f"[fetch_url] Wikipedia URL detected — redirecting to wikipedia_lookup(title='{raw_title}')")
+            result_str, _ = wikipedia_lookup_wrapper(title=raw_title, max_chars=kwargs.get("max_chars", 8000))
+            return f"[Auto-redirected to wikipedia_lookup for reliable Wikipedia access]\n\n{result_str}", None
 
         max_chars = kwargs.get("max_chars", 8000)
         extract = kwargs.get("extract", "text")
@@ -1220,6 +1284,13 @@ def fetch_url_wrapper(**kwargs):
                 output = f"[Rendered via Jina Reader]\n\n{output}"
             return output, None
         else:
+            # ── B: Add Wikipedia hint on 403 from Wikipedia domains ───
+            if result.get("status_code") == 403 and "wikipedia" in url.lower():
+                result["hint"] = (
+                    "Wikipedia blocked this request (403 Forbidden). "
+                    "Use wikipedia_lookup(title='Article Title') instead — "
+                    "it uses the MediaWiki API which is not blocked."
+                )
             return json.dumps(result, indent=2), None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
@@ -1311,7 +1382,64 @@ def fetch_cached_wrapper(**kwargs):
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
 
-def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None):
+def recall_memory_wrapper(_memory_store=None, **kwargs):
+    """Retrieve a stored tool output from MemoryStore by key. Returns (output, None).
+    
+    - No key: list all stored keys with sizes
+    - Key only: return first 2000 chars of stored content
+    - Key + query: return matching lines (case-insensitive grep), capped at 2000 chars
+    """
+    MAX_RETURN_CHARS = 2000
+
+    try:
+        if _memory_store is None:
+            return "ERROR: Memory store is not available (recall_memory is only usable at the root orchestrator level).", None
+
+        key = kwargs.get("key")
+        query = kwargs.get("query", "")
+
+        # No key → list all stored entries
+        if not key:
+            if len(_memory_store) == 0:
+                return "Memory is empty — no tool outputs have been stored yet.", None
+            return _memory_store.summary(), None
+
+        # Retrieve by key
+        content = _memory_store.get(key)
+        if content is None:
+            available = ", ".join(_memory_store.keys()[:15])
+            return f"ERROR: No entry with key '{key}'. Available keys: {available}", None
+
+        # Query filter: grep matching lines
+        if query:
+            q_lower = query.lower()
+            matching = [line for line in content.split("\n") if q_lower in line.lower()]
+            if not matching:
+                return f"No lines matching '{query}' in {key} ({len(content):,} chars total).", None
+            filtered = "\n".join(matching)
+            if len(filtered) > MAX_RETURN_CHARS:
+                filtered = filtered[:MAX_RETURN_CHARS] + f"\n... (truncated, {len(matching)} matching lines total)"
+            return f"[{key}] Lines matching '{query}' ({len(matching)} hits):\n{filtered}", None
+
+        # Return content capped at limit
+        if len(content) <= MAX_RETURN_CHARS:
+            return f"[{key}] ({len(content):,} chars):\n{content}", None
+        else:
+            truncated = content[:MAX_RETURN_CHARS]
+            # Trim to last newline to avoid mid-line cut
+            last_nl = truncated.rfind("\n")
+            if last_nl > MAX_RETURN_CHARS // 2:
+                truncated = truncated[:last_nl]
+            return (
+                f"[{key}] (showing first {len(truncated):,} of {len(content):,} chars — "
+                f"use query= to search within, or spawn_agent for full analysis):\n{truncated}"
+            ), None
+
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
+def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _memory_store=None):
     """Route tool calls to appropriate wrapper function.
     
     All wrappers return (output_str, child_trace_or_None).
@@ -1324,6 +1452,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         reasoning_effort: Reasoning effort level to propagate to sub-agents
         _sandbox_files: Files to auto-inject into every execute_code sandbox call.
                         Dict of {filename: base64_content}. Merged with model-provided files.
+        _memory_store: MemoryStore instance for recall_memory tool (root only).
     
     Returns:
         Tuple of (output_string, child_trace) where child_trace is an
@@ -1339,7 +1468,7 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
     elif tool_name == "spawn_agent":
-        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, **tool_args)
+        return spawn_agent_wrapper(_depth=_depth, _model=model, _reasoning_effort=reasoning_effort, _sandbox_files=_sandbox_files, _memory_store=_memory_store, **tool_args)
     elif tool_name == "final_answer":
         return final_answer_wrapper(**tool_args)
     elif tool_name == "search_available_tools":
@@ -1354,6 +1483,8 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return wikipedia_lookup_wrapper(**tool_args)
     elif tool_name == "fetch_cached":
         return fetch_cached_wrapper(**tool_args)
+    elif tool_name == "recall_memory":
+        return recall_memory_wrapper(_memory_store=_memory_store, **tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
 
@@ -1382,12 +1513,12 @@ TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "completion": {
+                "code": {
                     "type": "string",
                     "description": (
-                        "Code to execute. MUST be wrapped in markdown code blocks "
-                        "(```python ... ``` or ``` ... ```). "
-                        "The code will be automatically extracted from the code block."
+                        "Code to execute. Wrap in markdown code blocks "
+                        "(```python ... ``` or ``` ... ```) or provide raw code. "
+                        "Code blocks are automatically extracted."
                     )
                 },
                 "stdin": {
@@ -1444,7 +1575,7 @@ TOOLS = [
                     "default": 512
                 }
             },
-            "required": ["completion"]
+            "required": ["code"]
         }
     }
 },
@@ -1673,6 +1804,11 @@ TOOLS = [
                 "- BAD: 'Research card A' (too vague)\n"
                 "- GOOD: 'Find the ATK, DEF, Level, Type, and Attribute of the Yu-Gi-Oh card Blue-Eyes White Dragon. "
                 "Search the web for accurate stats. Return the results as a JSON object with keys: name, atk, def, level, type, attribute.'\n\n"
+                "PASSING DATA VIA memory_keys:\n"
+                "When tool outputs are stored in memory (you see [Stored → key_name]), you can pass that data "
+                "to a sub-agent WITHOUT pasting it. Use memory_keys=['key1', 'key2'] and the data will be "
+                "pre-loaded as agent_data.json in the sub-agent's sandbox. The sub-agent reads it via execute_code.\n"
+                "This keeps YOUR context clean — the data goes straight to the sub-agent's sandbox.\n\n"
                 "PATTERN FOR MULTI-ITEM TASKS:\n"
                 "1. spawn_agent(task='[detailed task for item 1, specify return format]')\n"
                 "2. spawn_agent(task='[detailed task for item 2, specify return format]')\n"
@@ -1690,6 +1826,18 @@ TOOLS = [
                         "description": (
                             "Optional background context or data the sub-agent needs. "
                             "Include any relevant information from the current conversation."
+                        )
+                    },
+                    "memory_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Memory keys to pre-load into the sub-agent's sandbox as agent_data.json. "
+                            "The sub-agent can read this file via execute_code: "
+                            "import json; data = json.load(open('agent_data.json')). "
+                            "Use when you need the sub-agent to analyze large stored tool outputs "
+                            "without pasting them into the task string. "
+                            "Example: memory_keys=['search_t1_query', 'page_t3_url']"
                         )
                     },
                     "turn_length": {
@@ -1730,6 +1878,44 @@ TOOLS = [
                     }
                 },
                 "required": ["answer"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": (
+                "Retrieve a previously stored tool output from memory by its key. "
+                "When tool outputs are large, they are stored in memory and you see a "
+                "compact summary with a key like [Stored → search_t1_query]. Use this "
+                "tool to retrieve the full content when the summary is insufficient.\n\n"
+                "Returns up to 2000 characters of the stored content. For longer content, "
+                "use the optional `query` parameter to search within the stored text, or "
+                "spawn a sub-agent for detailed analysis.\n\n"
+                "Call with no arguments to list all available memory keys and their sizes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": (
+                            "The memory key to retrieve (e.g. 'search_t1_france_gdp'). "
+                            "Omit to list all stored keys."
+                        )
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Optional text to search for within the stored content. "
+                            "When provided, returns only the lines containing the query "
+                            "(case-insensitive), up to the character limit. "
+                            "Useful for finding specific facts in large documents."
+                        )
+                    }
+                },
+                "required": []
             }
         }
     },

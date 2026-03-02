@@ -34,6 +34,10 @@ _FALLBACK_CONFIG = {
         "max_recursion_depth": 1,
         "sub_agent_turn_budget": 15,
         "token_safety_margin": 256,
+        "symbolic_references": True,
+        "symbolic_threshold": 500,
+        "plan_state": True,
+        "plan_inject_interval": 3,
     },
     "sandbox": {
         "url": "http://localhost:8080/run_code",
@@ -161,6 +165,7 @@ def _update_module_constants():
     global MODEL_PROFILES, _DEFAULT_PROFILE
     global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
+    global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL
 
     c = _config
 
@@ -198,6 +203,13 @@ def _update_module_constants():
     SYSTEM_PROMPT = _load_prompt(orchestrator_path)
     WORKER_PROMPT = _load_prompt(worker_path)
     SYNTHESIZER_PROMPT = _load_prompt(synthesizer_path)
+
+    # Agent feature flags
+    agent_cfg = c.get("agent", {})
+    SYMBOLIC_REFERENCES = agent_cfg.get("symbolic_references", True)
+    SYMBOLIC_THRESHOLD = agent_cfg.get("symbolic_threshold", 500)
+    PLAN_STATE = agent_cfg.get("plan_state", True)
+    PLAN_INJECT_INTERVAL = agent_cfg.get("plan_inject_interval", 3)
 
     # Dataset & eval (new — used by eval.py)
     DATASET_CONFIG = c.get("dataset", {})
