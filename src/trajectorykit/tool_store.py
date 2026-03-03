@@ -2049,3 +2049,175 @@ TOOLS = [
         }
     }
 ]
+
+
+# ── Root-only tools ──────────────────────────────────────────────────────
+# These are the ONLY tools the root orchestrator sees.  They are virtual
+# tools — intercepted in agent.py before reaching dispatch_tool_call.
+# Sub-agents continue to use `TOOLS` as before.
+
+ROOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "conduct_research",
+            "description": (
+                "Delegate a research task to a specialized sub-agent. "
+                "The sub-agent gets its own fresh context, tools (search, fetch, "
+                "code execution, etc.), and turn budget. It performs the research "
+                "and returns ONLY its final result — keeping your context clean.\n\n"
+                "WRITE SELF-CONTAINED TASKS:\n"
+                "The sub-agent has NO context from your conversation. The task "
+                "string is ALL it gets. Include:\n"
+                "  - Exactly what to find or compute\n"
+                "  - Any background context it needs\n"
+                "  - What format to return results in\n\n"
+                "PASSING DATA VIA memory_keys:\n"
+                "When tool outputs are stored in memory (you see [Stored → key]), "
+                "pass them to the sub-agent via memory_keys=['key1','key2']. "
+                "The data is pre-loaded as agent_data.json in the sub-agent's sandbox.\n\n"
+                "PATTERN FOR MULTI-ITEM TASKS:\n"
+                "  conduct_research(task='[detailed task for item 1]')\n"
+                "  conduct_research(task='[detailed task for item 2]')\n"
+                "  → Review results → refine_draft with findings"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Clear, self-contained description of the research task."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "Optional background context or data the sub-agent needs."
+                        )
+                    },
+                    "memory_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Memory keys to pre-load into the sub-agent's sandbox "
+                            "as agent_data.json. Example: ['search_t1_query', 'page_t3_url']"
+                        )
+                    },
+                    "turn_length": {
+                        "type": "integer",
+                        "description": f"Maximum turns for the sub-agent (default: {SUB_AGENT_TURN_BUDGET})",
+                        "default": SUB_AGENT_TURN_BUDGET
+                    },
+                },
+                "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "refine_draft",
+            "description": (
+                "Write or update your draft report. Each call REPLACES the entire "
+                "draft with the new content you provide.\n\n"
+                "Your draft is a living document — the central artifact of your "
+                "research session. Write it as a complete, self-contained answer "
+                "to the original question every time.\n\n"
+                "WHEN TO CALL:\n"
+                "  1. After the first wave of research returns — write Draft v1\n"
+                "  2. After each round of gap-filling research — update with new findings\n"
+                "  3. When you're satisfied — call research_complete to publish it\n\n"
+                "IMPORTANT: You cannot call research_complete until you have a draft. "
+                "Your draft IS your answer — research_complete simply publishes it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Your complete draft answer. Write it as if it were the "
+                            "final answer — well-structured, cited, and directly "
+                            "addressing the question. Each call REPLACES the previous draft."
+                        )
+                    }
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "research_complete",
+            "description": (
+                "Signal that your research is done and publish your draft as the "
+                "final answer. This tool takes NO content — it reads your latest "
+                "draft and delivers it.\n\n"
+                "PREREQUISITES:\n"
+                "  - You must have called refine_draft at least once\n"
+                "  - Your draft should be a complete, well-cited answer\n\n"
+                "Before calling this, review your draft one last time:\n"
+                "  - Does it answer every part of the question?\n"
+                "  - Are claims supported by research findings?\n"
+                "  - Is it well-structured with citations?"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "think",
+            "description": (
+                "Record your reasoning, planning, or reflection. Use this tool "
+                "when you need to think through a problem, plan your next research "
+                "steps, or reflect on findings before acting.\n\n"
+                "This is a thinking-out-loud tool — your thought is recorded and "
+                "returned to you. It costs nothing and helps you stay organized.\n\n"
+                "USE FOR:\n"
+                "  - Planning which research tasks to delegate next\n"
+                "  - Analyzing what gaps remain in your draft\n"
+                "  - Deciding whether your draft is ready to publish\n"
+                "  - Reflecting on conflicting findings"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Your reasoning, plan, or reflection."
+                    }
+                },
+                "required": ["thought"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_available_tools",
+            "description": (
+                "Look up the tools you have available and their parameter schemas. "
+                "Call with no arguments to get a compact summary of all tools. "
+                "Call with a tool_name to get the full JSON schema for that specific tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": (
+                            "Name of a specific tool to get its full schema. "
+                            "Omit to list all available tools with short descriptions."
+                        )
+                    }
+                },
+                "required": []
+            }
+        }
+    }
+]

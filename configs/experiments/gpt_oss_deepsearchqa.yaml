@@ -74,6 +74,6 @@ eval:
 
 judge:
   enabled: true
-  model: "gemini-2.5-flash" #gemini-2.5-flash #gpt-4.1-mini
+  model: "gpt-4.1-mini" #gemini-2.5-flash #gpt-4.1-mini
   threads: 5
   # rpm: 5   # uncomment to throttle (free tier = 5 RPM). Omit or null for unlimited (paid tier).
