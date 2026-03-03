@@ -38,6 +38,7 @@ _FALLBACK_CONFIG = {
         "symbolic_threshold": 500,
         "plan_state": True,
         "plan_inject_interval": 3,
+        "draft_report": True,
     },
     "sandbox": {
         "url": "http://localhost:8080/run_code",
@@ -165,7 +166,7 @@ def _update_module_constants():
     global MODEL_PROFILES, _DEFAULT_PROFILE
     global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
-    global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL
+    global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT
 
     c = _config
 
@@ -210,6 +211,7 @@ def _update_module_constants():
     SYMBOLIC_THRESHOLD = agent_cfg.get("symbolic_threshold", 500)
     PLAN_STATE = agent_cfg.get("plan_state", True)
     PLAN_INJECT_INTERVAL = agent_cfg.get("plan_inject_interval", 3)
+    DRAFT_REPORT = agent_cfg.get("draft_report", True)
 
     # Dataset & eval (new — used by eval.py)
     DATASET_CONFIG = c.get("dataset", {})

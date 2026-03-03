@@ -10,8 +10,9 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT, TOKEN_SAFETY_MARGIN, get_model_profile
-from .config import SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL
+import os
+from .config import MODEL_NAME, VLLM_API_URL, SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT, TOKEN_SAFETY_MARGIN, TRACES_DIR, get_model_profile
+from .config import SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT
 from .memory import MemoryStore
 from .plan import ResearchPlan
 from .symbolic import make_symbolic
@@ -203,10 +204,14 @@ def dispatch(
         available_tools = [t for t in TOOLS if t["function"]["name"] in ("execute_code", "final_answer", "search_available_tools")]
     elif _depth == 0:
         system_prompt = SYSTEM_PROMPT
-        available_tools = TOOLS
+        # Root orchestrator: full tool set, but strip update_draft if disabled
+        if DRAFT_REPORT:
+            available_tools = TOOLS
+        else:
+            available_tools = [t for t in TOOLS if t["function"]["name"] != "update_draft"]
     else:
         system_prompt = WORKER_PROMPT
-        available_tools = [t for t in TOOLS if t["function"]["name"] not in ("spawn_agent", "recall_memory")]
+        available_tools = [t for t in TOOLS if t["function"]["name"] not in ("spawn_agent", "recall_memory", "update_draft")]
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -279,6 +284,12 @@ def dispatch(
     # context) and jumps straight to a fresh synthesis sub-agent.
     _degenerated = False
     
+    # ── Draft report (root orchestrator only) ─────────────────────────
+    # Stores progressive draft snapshots via the update_draft virtual tool.
+    # Latest draft serves as fallback when final_answer is empty or the
+    # model runs out of turns.
+    draft_versions: list[tuple[int, str]] = []  # [(turn, content), ...]
+    
     def _finalize(final_content: str) -> Dict[str, Any]:
         """Build the return dict and finalize the trace."""
         episode.final_response = final_content
@@ -330,6 +341,20 @@ def dispatch(
             messages.append({"role": "system", "content": plan_msg})
             if verbose:
                 print(f"📋  Injected research plan (turn {turn})")
+            # Inject latest draft alongside plan so the model sees its own
+            # evolving answer and can identify gaps to fill.
+            if draft_versions and turn > draft_versions[-1][0]:
+                _draft_turn, _draft_text = draft_versions[-1]
+                _draft_preview = _draft_text[:2000] + ("…" if len(_draft_text) > 2000 else "")
+                messages.append({"role": "system", "content": (
+                    f"📝 YOUR CURRENT DRAFT (v{len(draft_versions)}, saved turn {_draft_turn}):\n"
+                    f"{_draft_preview}\n\n"
+                    "Review this draft against the research plan above. "
+                    "If gaps remain, research them. If the draft is solid, "
+                    "call final_answer with your polished version."
+                )})
+                if verbose:
+                    print(f"📝  Injected draft v{len(draft_versions)} reminder ({len(_draft_text):,} chars)")
         elif plan is None and turn > 1 and turn % _REMINDER_INTERVAL == 0:
             q_snippet = user_input[:300] + ("…" if len(user_input) > 300 else "")
             messages.append({"role": "system", "content": (
@@ -341,39 +366,71 @@ def dispatch(
             if verbose:
                 print(f"🔎  Injected periodic question reminder (turn {turn})")
 
+        # ── Research-phase gate (root only) ──────────────────────────────
+        # Prevent the root orchestrator from calling final_answer before
+        # it has done meaningful research. Two conditions, either lifts the gate:
+        #   1. Minimum turns elapsed (gives time for sub-agents to return)
+        #   2. Draft exists (model deliberately saved a synthesized answer)
+        # The last-turn budget override (remaining==0) always takes precedence.
+        _MIN_RESEARCH_TURNS = 2
+        tools_for_turn = None  # None = use full TOOLS list
+        if _depth == 0 and (
+            turn <= _MIN_RESEARCH_TURNS
+            or (DRAFT_REPORT and not draft_versions)
+        ):
+            tools_for_turn = [t for t in available_tools if t["function"]["name"] != "final_answer"]
+            if verbose and turn == 1:
+                print(f"🔒 final_answer gated — research phase (need draft or {_MIN_RESEARCH_TURNS}+ turns)")
+
         # ── Budget-aware tool restriction ─────────────────────────────────
         # Progressive warnings at multiple checkpoints, then force final_answer.
         q_echo = user_input[:500] + ("…" if len(user_input) > 500 else "")
-        tools_for_turn = None  # None = use full TOOLS list
         if turn_length is not None:
             remaining = turn_length - turn
+            _has_draft = bool(draft_versions)
             if remaining == 4:
-                # Early warning
+                # Early warning — nudge to draft if they haven't yet
+                _draft_hint = (
+                    "If you haven't saved a draft yet, call update_draft NOW with "
+                    "your best answer so far — it's your safety net."
+                ) if not _has_draft else (
+                    "You have a draft saved. Update it with any new findings, "
+                    "then call final_answer with your polished version."
+                )
                 messages.append({"role": "system", "content": (
                     "📋 BUDGET CHECK: You have 5 turns remaining (including this one). "
                     "Start consolidating your findings toward answering this question:\n"
                     f"{q_echo}\n\n"
-                    "If you have enough information, consider calling final_answer soon."
+                    f"{_draft_hint}"
                 )})
                 if verbose:
-                    print(f"📋  Injected budget check (5 turns left)")
+                    print(f"📋  Injected budget check (5 turns left, draft={'yes' if _has_draft else 'no'})")
             elif remaining == 2:
                 # Urgent warning
+                _draft_hint = (
+                    "CRITICAL: You have NO draft saved. Call update_draft immediately "
+                    "with your best answer, then call final_answer."
+                ) if not _has_draft else (
+                    "Call final_answer NOW with your polished answer."
+                )
                 messages.append({"role": "system", "content": (
                     "⚠️ BUDGET WARNING: You have 3 turns remaining (including this one). "
                     "Synthesize what you have to answer this question:\n"
                     f"{q_echo}\n\n"
-                    "Call final_answer NOW. Do not start new research."
+                    f"{_draft_hint} Do not start new research."
                 )})
                 if verbose:
                     print(f"⚠️  Injected budget warning (3 turns left)")
             elif remaining == 1:
                 # Last chance
+                _draft_hint = (
+                    " You have NO draft — call update_draft AND final_answer this turn."
+                ) if not _has_draft else ""
                 messages.append({"role": "system", "content": (
                     "🚨 LAST CHANCE: You have 2 turns remaining (including this one). "
                     "On your next turn you will be FORCED to call final_answer. "
-                    "Finish any last tool call NOW, then call final_answer for:\n"
-                    f"{q_echo}"
+                    f"Finish any last tool call NOW, then call final_answer for:\n"
+                    f"{q_echo}{_draft_hint}"
                 )})
                 if verbose:
                     print(f"🚨  Injected last chance warning (2 turns left)")
@@ -642,50 +699,59 @@ def dispatch(
                         continue  # skip to next tool call / next turn
                 
                 # Backfill: if the model called final_answer with an empty/trivial
-                # answer, it likely already wrote its real answer as plain text in
-                # a previous turn. Scan backwards for the most recent substantive
-                # assistant content.
+                # answer, try (in priority order):
+                #   1. Latest draft snapshot (most reliable — model wrote it intentionally)
+                #   2. Scan backwards for substantive assistant content
+                #   3. Break to synthesis pipeline
                 if len(final_content.strip()) < 20:
-                    _NON_ANSWER_PREFIXES = (
-                        "i should", "i'll", "i need", "i will", "let me",
-                        "okay", "ok,", "ok ", "sure", "now i",
-                        "let's", "alright",
-                    )
-                    _STRUCTURE_SIGNALS = ("|", "#", "- ", "1.", "1)", "{", "**")
-                    
-                    for msg in reversed(messages):
-                        if msg.get("role") != "assistant":
-                            continue
-                        candidate = (msg.get("content") or "").strip()
-                        if len(candidate) < 100:
-                            continue
-                        # Skip meta-commentary
-                        lower = candidate[:40].lower()
-                        if any(lower.startswith(p) for p in _NON_ANSWER_PREFIXES):
-                            continue
-                        # Prefer structured content (tables, headers, lists, JSON)
-                        has_structure = any(s in candidate[:500] for s in _STRUCTURE_SIGNALS)
-                        if has_structure or len(candidate) > 200:
-                            final_content = candidate
-                            if verbose:
-                                print(f"   ↩️  Backfilled empty final_answer from prior response ({len(candidate)} chars)")
-                            break
-                    
-                    # Last resort: if backfill failed and we have research data,
-                    # break to the synthesis pipeline instead of dumping raw findings.
-                    # The fresh synthesis sub-agent can query MemoryStore properly.
-                    if len(final_content.strip()) < 20 and (findings or memory):
+                    # Priority 1: use latest draft if available
+                    if draft_versions:
+                        _, draft_text = draft_versions[-1]
+                        final_content = draft_text
                         if verbose:
-                            print(f"   🔄 Empty final_answer with {len(findings)} findings — breaking to synthesis pipeline")
-                        tc_record = ToolCallRecord(
-                            tool_name=tool_name, tool_args=tool_args,
-                            tool_call_id=tool_call["id"],
-                            output="[answer lost — routing to synthesis]",
-                            duration_s=0, child_trace=None,
+                            print(f"   📝 Backfilled empty final_answer from draft v{len(draft_versions)} ({len(draft_text):,} chars)")
+                    else:
+                        # Priority 2: scan backwards for substantive assistant content
+                        _NON_ANSWER_PREFIXES = (
+                            "i should", "i'll", "i need", "i will", "let me",
+                            "okay", "ok,", "ok ", "sure", "now i",
+                            "let's", "alright",
                         )
-                        turn_record.tool_calls.append(tc_record)
-                        _degenerated = True
-                        break  # → post-loop synthesis pipeline
+                        _STRUCTURE_SIGNALS = ("|", "#", "- ", "1.", "1)", "{", "**")
+                        
+                        for msg in reversed(messages):
+                            if msg.get("role") != "assistant":
+                                continue
+                            candidate = (msg.get("content") or "").strip()
+                            if len(candidate) < 100:
+                                continue
+                            # Skip meta-commentary
+                            lower = candidate[:40].lower()
+                            if any(lower.startswith(p) for p in _NON_ANSWER_PREFIXES):
+                                continue
+                            # Prefer structured content (tables, headers, lists, JSON)
+                            has_structure = any(s in candidate[:500] for s in _STRUCTURE_SIGNALS)
+                            if has_structure or len(candidate) > 200:
+                                final_content = candidate
+                                if verbose:
+                                    print(f"   ↩️  Backfilled empty final_answer from prior response ({len(candidate)} chars)")
+                                break
+                        
+                        # Priority 3: if backfill failed and we have research data,
+                        # break to the synthesis pipeline instead of dumping raw findings.
+                        # The fresh synthesis sub-agent can query MemoryStore properly.
+                        if len(final_content.strip()) < 20 and (findings or memory):
+                            if verbose:
+                                print(f"   🔄 Empty final_answer with {len(findings)} findings — breaking to synthesis pipeline")
+                            tc_record = ToolCallRecord(
+                                tool_name=tool_name, tool_args=tool_args,
+                                tool_call_id=tool_call["id"],
+                                output="[answer lost — routing to synthesis]",
+                                duration_s=0, child_trace=None,
+                            )
+                            turn_record.tool_calls.append(tc_record)
+                            _degenerated = True
+                            break  # → post-loop synthesis pipeline
                 
                 tc_record = ToolCallRecord(
                     tool_name=tool_name,
@@ -701,6 +767,64 @@ def dispatch(
                     print(f"   ✅ final_answer received")
                 # Don't break — record remaining tool calls in this batch
                 # but we'll finalize after the loop
+                continue
+            
+            # ── Check for update_draft (virtual tool — root only) ─────
+            if tool_name == "update_draft" and _depth == 0:
+                draft_content = tool_args.get("content", "")
+                if len(draft_content.strip()) < 50:
+                    draft_output = (
+                        "Draft too short — write a complete, self-contained answer draft. "
+                        "Include findings, citations, and structure."
+                    )
+                else:
+                    draft_versions.append((turn, draft_content))
+                    ver = len(draft_versions)
+                    
+                    # File-back: persist to disk alongside trace files
+                    try:
+                        os.makedirs(TRACES_DIR, exist_ok=True)
+                        draft_path = os.path.join(
+                            TRACES_DIR, f"draft_{episode.trace_id}.md"
+                        )
+                        with open(draft_path, "w", encoding="utf-8") as f:
+                            f.write(f"<!-- Draft v{ver} | turn {turn} -->\n")
+                            f.write(draft_content)
+                    except Exception as e:
+                        if verbose:
+                            print(f"       ⚠️  Draft file-back failed: {e}")
+                    
+                    # MemoryStore: upsert with well-known key so sub-agents
+                    # can access it via memory_keys=["draft_latest"]
+                    memory.upsert(
+                        key="draft_latest",
+                        tool_name="update_draft",
+                        turn=turn,
+                        content=draft_content,
+                        description="latest draft answer",
+                    )
+                    
+                    draft_output = (
+                        f"Draft v{ver} saved ({len(draft_content):,} chars). "
+                        f"This is your safety net — if you run out of turns, this draft "
+                        f"will be used as your answer. Keep researching or call final_answer.\n\n"
+                        f"TIP: To give a sub-agent access to this draft, pass "
+                        f'memory_keys=["draft_latest"] in spawn_agent.'
+                    )
+                    if verbose:
+                        print(f"       📝 Draft v{ver} saved ({len(draft_content):,} chars) → {draft_path}")
+                
+                tc_record = ToolCallRecord(
+                    tool_name=tool_name, tool_args=tool_args,
+                    tool_call_id=tool_call["id"], output=draft_output,
+                    duration_s=0, child_trace=None,
+                )
+                turn_record.tool_calls.append(tc_record)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": draft_output,
+                })
                 continue
             
             # Execute tool (pass _depth so spawn_agent knows its recursion level)
@@ -875,6 +999,103 @@ def dispatch(
     # For (1), we try Stage 1 (forced final_answer in current context)
     # then Stage 2 (fresh synthesis sub-agent). For (2), we skip Stage 1
     # since the corrupted context is what caused the failure.
+    
+    # ── Draft verification: if we have a draft, verify it with a fresh agent ──
+    # The model saved a draft during research. Rather than returning it blindly
+    # (it may be stale if research continued after the last draft), spawn a
+    # lightweight verification agent that cross-checks the draft against all
+    # collected research data and returns a corrected/polished version.
+    if draft_versions and memory:
+        _draft_turn, latest_draft = draft_versions[-1]
+        if len(latest_draft.strip()) >= 50:
+            if verbose:
+                print(f"\n📝 Draft v{len(draft_versions)} found (turn {_draft_turn}, {len(latest_draft):,} chars) — spawning verification agent")
+            
+            try:
+                # Build sandbox files: research_data.json (full MemoryStore)
+                memory_json = memory.to_json()
+                memory_b64 = base64.b64encode(memory_json.encode("utf-8")).decode("ascii")
+                verify_sandbox = {"research_data.json": memory_b64}
+                
+                from .config import SUB_AGENT_TURN_BUDGET
+                verify_budget = min(SUB_AGENT_TURN_BUDGET, 8)
+                
+                verify_task = (
+                    f"You are a verification and polish agent. Below is a DRAFT answer "
+                    f"to a research question, followed by the question itself.\n\n"
+                    f"DRAFT ANSWER (written at turn {_draft_turn}, may be stale):\n"
+                    f"{latest_draft}\n\n"
+                    f"ORIGINAL QUESTION:\n{user_input}\n\n"
+                    f"YOUR JOB:\n"
+                    f"1. Load research_data.json (pre-loaded in your sandbox) — it contains "
+                    f"all research collected during the investigation.\n"
+                    f"2. Cross-check every claim in the draft against the research data.\n"
+                    f"3. Fix any stale, incorrect, or unsupported claims.\n"
+                    f"4. Add any important findings from the research data that the draft missed.\n"
+                    f"5. Polish the structure, citations, and prose.\n"
+                    f"6. Call final_answer with the corrected, complete answer.\n\n"
+                    f"If the draft is already accurate and complete, return it with minor polish. "
+                    f"Do NOT invent information — only use what exists in research_data.json."
+                )
+                
+                verify_result = dispatch(
+                    user_input=verify_task,
+                    turn_length=verify_budget,
+                    verbose=verbose,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    example_id=example_id,
+                    _depth=_depth + 1,
+                    _sandbox_files=verify_sandbox,
+                    _is_synthesizer=True,
+                )
+                
+                verified_content = verify_result.get("final_response", "")
+                
+                # Record in trace
+                if verify_result.get("trace"):
+                    v_trace = verify_result["trace"]
+                    v_record = TurnRecord(
+                        turn_number=turn + 1,
+                        assistant_content=verified_content,
+                        raw_assistant_message={"draft_verification_agent": True},
+                        prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                    )
+                    v_tc = ToolCallRecord(
+                        tool_name="spawn_agent",
+                        tool_args={"task": "draft verification"},
+                        tool_call_id="draft_verify",
+                        output=verified_content[:500] if verified_content else "",
+                        duration_s=v_trace.duration_s or 0,
+                        child_trace=v_trace,
+                    )
+                    v_record.tool_calls.append(v_tc)
+                    v_record.duration_s = v_trace.duration_s or 0
+                    episode.turns.append(v_record)
+                
+                if verified_content and verified_content.strip() and not verified_content.startswith("[Auto-extracted"):
+                    if verbose:
+                        print(f"✅ Draft verification agent succeeded ({len(verified_content):,} chars)")
+                    return _finalize(verified_content)
+                else:
+                    if verbose:
+                        print(f"⚠️  Verification agent returned empty — falling back to raw draft")
+                    return _finalize(latest_draft)
+            except Exception as e:
+                if verbose:
+                    print(f"❌ Draft verification agent failed: {e} — using raw draft")
+                return _finalize(latest_draft)
+    
+    # If we have a draft but no memory (shouldn't happen), use it directly
+    if draft_versions:
+        _, latest_draft = draft_versions[-1]
+        if len(latest_draft.strip()) >= 50:
+            if verbose:
+                print(f"\n📝 Using raw draft v{len(draft_versions)} as final answer ({len(latest_draft):,} chars)")
+            return _finalize(latest_draft)
+    
     if _degenerated:
         if verbose:
             print(f"\n⚠️  Model degenerated — skipping Stage 1, going straight to fresh synthesis sub-agent")
@@ -905,6 +1126,17 @@ def dispatch(
     
     q_echo_synth = user_input[:500] + ("…" if len(user_input) > 500 else "")
     
+    # ── Gap check before synthesis (plan_state only) ───────────────────
+    # Inject a gap assessment so the model knows what data is strong/weak
+    # and can address gaps explicitly in the synthesized answer.
+    gap_note = ""
+    if plan is not None:
+        gap_msg = plan.render_gap_check()
+        if gap_msg:
+            gap_note = f"\n\n{gap_msg}\n"
+            if verbose:
+                print(f"📊  Gap check injected before synthesis")
+
     # ── Stage 1: Forced final_answer in current context ────────────────
     # Skip this entirely if the model degenerated — the corrupted context
     # is what caused the failure, so retrying in it is pointless.
@@ -916,8 +1148,10 @@ def dispatch(
                 "response based on everything gathered so far.\n\n"
                 f"ORIGINAL QUESTION:\n{q_echo_synth}\n"
                 f"{findings_block}\n"
+                f"{gap_note}"
                 "Synthesize these findings into a clear, well-cited answer to the "
-                "question above."
+                "question above. Address any noted gaps honestly — state what is "
+                "well-supported and what remains uncertain."
             ),
         })
         

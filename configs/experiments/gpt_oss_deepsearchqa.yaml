@@ -26,6 +26,7 @@ agent:
   # Research plan: inject a structured progress tracker every N turns.
   plan_state: true
   plan_inject_interval: 3         # inject plan every N turns
+  draft_report: true              # update_draft tool at root for answer safety net
 
 sandbox:
   url: "http://localhost:8080/run_code"

@@ -40,15 +40,19 @@ def cleanup_sandbox() -> bool:
             SANDBOX_FUSION_URL,
             json={
                 "code": (
-                    "import shutil, glob, os\n"
+                    "import shutil, os\n"
                     "removed = 0\n"
-                    "for p in glob.glob('/tmp/tmp*'):\n"
+                    "for p in os.listdir('/tmp'):\n"
+                    "    fp = os.path.join('/tmp', p)\n"
                     "    try:\n"
-                    "        shutil.rmtree(p)\n"
+                    "        if os.path.isdir(fp):\n"
+                    "            shutil.rmtree(fp)\n"
+                    "        else:\n"
+                    "            os.remove(fp)\n"
                     "        removed += 1\n"
                     "    except OSError:\n"
                     "        pass\n"
-                    "print(f'Cleaned {removed} temp dirs')\n"
+                    "print(f'Cleaned {removed} items from /tmp')\n"
                 ),
                 "language": "python",
                 "run_timeout": 5,
@@ -1926,6 +1930,37 @@ TOOLS = [
                     }
                 },
                 "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_draft",
+            "description": (
+                "Save a full snapshot of your current draft answer. Call this tool after each "
+                "major research wave to capture your evolving understanding of the answer.\n\n"
+                "WHEN TO CALL:\n"
+                "  1. After the first wave of sub-agents returns — write an initial draft\n"
+                "  2. After gap-filling research — update with new findings\n"
+                "  3. Before calling final_answer — save your polished version\n\n"
+                "The draft is your safety net: if you run out of turns before calling "
+                "final_answer, the system will use your latest draft. Write each draft as "
+                "a COMPLETE, self-contained answer (not a diff or notes)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Your complete draft answer. Write it as if it were the final answer — "
+                            "well-structured, cited, and directly addressing the question. "
+                            "Each call REPLACES the previous draft."
+                        )
+                    }
+                },
+                "required": ["content"]
             }
         }
     },

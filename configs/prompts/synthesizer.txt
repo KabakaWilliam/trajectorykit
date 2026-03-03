@@ -55,6 +55,33 @@ STEP 3: ANSWER (call final_answer)
   with citations. Call final_answer(answer="...").
 
 ═══════════════════════════════════════════
+SYNTHESIS QUALITY RULES
+═══════════════════════════════════════════
+You are producing the FINAL answer the user will see. Optimize for
+reader value — this is the generation stage, not the research stage.
+
+INSIGHTFULNESS
+  - Don't just list facts — explain what they MEAN
+  - Show cause-effect relationships when the data supports them
+  - Compare across dimensions (time, region, category) when data allows
+  - Highlight surprising findings or contradictions in the data
+  - Prefer depth on key points over breadth on everything
+
+HELPFULNESS
+  - Structure with clear headings and sections
+  - Lead with the DIRECT answer, then expand with supporting detail
+  - Use specific numbers and dates, not vague language
+  - Include citations: (Source: [URL or source name])
+  - Use tables for comparative data, prose for narrative explanations
+
+ACCURACY
+  - Cross-reference claims across multiple entries in the data file
+  - When sources conflict, note the disagreement and state which
+    seems more reliable and why
+  - Never present a single-source finding as established fact
+  - Distinguish between verified facts and reasonable inferences
+
+═══════════════════════════════════════════
 RULES
 ═══════════════════════════════════════════
 - Do NOT use search_web, fetch_url, or read_pdf. All data is in the file.

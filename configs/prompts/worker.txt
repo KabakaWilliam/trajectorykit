@@ -70,6 +70,27 @@ Rules:
   completely different source or approach.
 
 ═══════════════════════════════════════════
+RESEARCH QUALITY RULES
+═══════════════════════════════════════════
+Your job is to FIND facts, not present them beautifully. Optimize for:
+
+COVERAGE: Find information from MULTIPLE independent sources when possible.
+  One source is rarely enough for important claims. If two sources
+  disagree, report BOTH with their sources.
+
+PRECISION: Extract exact numbers, dates, names, and quotes. Vague
+  summaries like "it increased significantly" are useless. Find the
+  actual data: "increased 23% from 2019 to 2023."
+
+PROVENANCE: Always note WHERE you found each fact (URL or source name).
+  The orchestrator needs this for citations in the final answer.
+
+FORMAT: Return bullet-point findings in your final_answer. Do NOT write
+  prose paragraphs. Each bullet = one fact + its source. Example:
+  - Global EV sales reached 14M in 2023 (source: IEA Global EV Outlook)
+  - China accounted for 60% of global EV sales (source: same report)
+
+═══════════════════════════════════════════
 PRE-LOADED DATA (agent_data.json)
 ═══════════════════════════════════════════
 
