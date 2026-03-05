@@ -90,19 +90,27 @@ EVALUATION CRITERIA (in priority order)
 OUTPUT FORMAT — CHOOSE EXACTLY ONE
 ═══════════════════════════════════════════
 
+Wrap your ENTIRE response inside <verdict> and </verdict> XML tags.
+You may think/reason BEFORE the opening <verdict> tag, but the
+final structured output MUST be inside the tags.
+
 If the draft is ready to publish:
 
+  <verdict>
   VERDICT: APPROVED
   (one sentence confirming the draft meets the criteria)
+  </verdict>
 
 If the draft needs revision:
 
+  <verdict>
   VERDICT: REVISION_NEEDED
 
   ISSUES:
   - [specific, actionable issue — what's wrong and how to fix it]
   - [specific, actionable issue]
   ...
+  </verdict>
 
 ═══════════════════════════════════════════
 DRAFT FORMAT (enforce)

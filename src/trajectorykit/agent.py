@@ -16,6 +16,12 @@ from __future__ import annotations
 from typing import Optional, Dict, Any
 
 from .agent_state import create_state
+from .chain import analyze_chain
+from .config import (
+    CHAIN_ANALYSIS_ENABLED,
+    CHAIN_ANALYSIS_PROMPT,
+    VLLM_API_URL,
+)
 from .runner import run_agent_loop
 
 import logging
@@ -76,5 +82,28 @@ def dispatch(
         _sandbox_files=_sandbox_files,
         _is_synthesizer=_is_synthesizer,
     )
+
+    # ── Pre-dispatch chain analysis (root only) ──────────────────────
+    if _depth == 0 and CHAIN_ANALYSIS_ENABLED and CHAIN_ANALYSIS_PROMPT:
+        chain_plan = analyze_chain(
+            question=user_input,
+            prompt_template=CHAIN_ANALYSIS_PROMPT,
+            model=state.model,
+            vllm_url=VLLM_API_URL,
+            temperature=state.temperature,
+            max_tokens=state.max_tokens,
+        )
+        state.chain_plan = chain_plan
+        # Seed the research plan with chain steps
+        if chain_plan.has_chain and state.plan is not None:
+            state.plan.seed_from_chain(chain_plan)
+        if verbose:
+            if chain_plan.has_chain:
+                print(f"⛓  Chain detected: {len(chain_plan.chain_steps)} steps, "
+                      f"{len(chain_plan.parallel_tasks)} parallel tasks")
+            else:
+                print(f"⚡  No causal chain detected "
+                      f"({len(chain_plan.parallel_tasks)} parallel tasks)")
+
     return run_agent_loop(state)
 

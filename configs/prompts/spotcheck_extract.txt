@@ -3,16 +3,67 @@ important checkable factual claims in a draft answer.
 
 CURRENT_DATE: {current_date}
 
-You will receive a QUESTION and a DRAFT ANSWER. Extract ALL specific
-factual claims from the draft that would be damaging if wrong.
-Aim for thoroughness — typically 5-10 claims for a detailed answer,
-fewer for short answers.
+You will receive a QUESTION and a DRAFT ANSWER. Extract the claims
+that would be most damaging if wrong. Aim for thoroughness —
+typically 5-10 claims for a detailed answer, fewer for short answers.
+
+═══════════════════════════════════════════
+CAUSAL CHAIN DETECTION
+═══════════════════════════════════════════
+
+Before extracting claims, determine whether the question requires
+a REASONING CHAIN — a sequence of lookups where each step depends
+on the result of the previous one.
+
+Test: Does answering this question require discovering intermediate
+facts that are not given in the question itself?
+
+Example: "What is the population of the city where the director of
+Jaws was born?"
+  Chain: director of Jaws → Spielberg → birthplace → Cincinnati → population
+
+If a PRE-COMPUTED CHAIN ANALYSIS is provided in the input, use its
+chain structure as the basis for your dependency ordering. Do NOT
+re-derive the chain from scratch — the pre-computed analysis was
+performed before research began and represents the intended
+resolution order. You should:
+  - Adopt its step ordering and dependency links
+  - Map each chain step to the corresponding claim in the draft
+  - Add the correct "depends_on" fields based on the pre-computed
+    chain, not your own re-analysis
+  - Still extract any additional non-chain claims the draft makes
+
+If NO pre-computed chain is provided, determine the chain structure
+yourself: if the draft answers a chain question, EVERY intermediate
+link must become a separate claim, ordered by dependency. Mark each
+claim with "depends_on" pointing to the claim number it relies on.
+
+If the question is NOT a chain (simple factual, multi-part, etc.),
+omit the "depends_on" field entirely.
+
+═══════════════════════════════════════════
+CLAIM #1 — THE CORE ANSWER (MANDATORY)
+═══════════════════════════════════════════
+
+Your FIRST claim MUST always be the draft's direct answer to the
+question — the core conclusion, not a supporting detail.
+
+Frame it as: "The draft concludes that [answer] in response to
+[what the question asks]."
+
+The search_query for this claim should be designed to find
+independent evidence that confirms or refutes the answer itself.
+
+If the draft cites a specific source URL for its answer, include
+that URL in the "source_url" field so we can fetch it directly
+and verify the answer appears there.
 
 ═══════════════════════════════════════════
 WHAT MAKES A GOOD CLAIM TO CHECK
 ═══════════════════════════════════════════
 
 PRIORITIZE:
+  - The core answer to the question (always claim #1)
   - Specific numbers, dates, statistics, or quantities
   - Named events, people, or organizations with factual assertions
   - "First", "largest", "only", or other superlative claims
@@ -22,30 +73,44 @@ SKIP:
   - Opinions or subjective assessments
   - Well-known common knowledge (e.g. "Paris is in France")
   - Claims already attributed to a named, reputable source with URL
+    (UNLESS it is the core answer — always check that)
   - Vague statements that can't be verified via search
 
 ═══════════════════════════════════════════
 OUTPUT FORMAT
 ═══════════════════════════════════════════
 
-Return EXACTLY this JSON format — no markdown fences, no extra text:
+Wrap your ENTIRE JSON response inside <claims> and </claims> XML tags.
+You may think/reason BEFORE the opening <claims> tag, but the JSON
+MUST be inside the tags. No markdown fences inside the tags.
 
+<claims>
 {"claims": [
   {
-    "claim": "The draft states that X is Y",
-    "search_query": "concise search query to verify this"
+    "claim": "The draft concludes that [core answer to the question]",
+    "search_query": "concise search query to verify this",
+    "source_url": "https://example.com/page-cited-in-draft (optional)"
   },
   {
-    "claim": "The draft states that A happened in B",
-    "search_query": "concise search query to verify this"
+    "claim": "The draft states that X is Y",
+    "search_query": "concise search query to verify this",
+    "depends_on": 1
   }
 ]}
+</claims>
 
 RULES:
-  - Return all checkable claims, ordered by importance (typically 5-10).
+  - Claim #1 is ALWAYS the core answer. Remaining claims ordered by
+    importance (typically 5-10 total).
+  - For chain questions: order chain links by dependency (earliest
+    link first), then non-chain claims by importance. Include
+    "depends_on" for each link that relies on a previous link.
   - Each search_query should be a natural web search query — concise
     and specific enough to get relevant results.
+  - Include "source_url" ONLY when the draft explicitly cites a URL
+    for that claim. This lets us fetch the source directly to verify
+    the claim appears in it. Omit if no URL is cited.
   - If the draft is a refusal ("I couldn't find...") or contains no
-    checkable factual claims, return: {"claims": []}
+    checkable factual claims, return: <claims>{"claims": []}</claims>
   - Do NOT fabricate claims that aren't in the draft.
   - Keep it tight — these searches cost time.

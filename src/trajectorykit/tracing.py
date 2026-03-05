@@ -77,6 +77,9 @@ class EpisodeTrace:
     total_completion_tokens: int = 0
     total_tokens: int = 0
 
+    # Chain analysis (pre-dispatch decomposition, root only)
+    chain_plan: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the full trace tree to a dict (JSON-safe)."""
         def _serialize(obj):
@@ -572,6 +575,91 @@ body {
   .main { padding: 24px 20px; }
   .trace-stats { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ── Chain analysis panel ── */
+.chain-panel {
+  background: var(--white); border: 1px solid var(--border);
+  border-radius: 4px; margin-bottom: 20px; overflow: hidden;
+}
+.chain-panel-header {
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  cursor: pointer; user-select: none;
+}
+.chain-panel-header:hover { background: var(--off); }
+.chain-panel-title {
+  font-family: var(--mono); font-size: 12px; color: var(--text-mid);
+  display: flex; align-items: center; gap: 8px;
+}
+.chain-panel-body { padding: 20px; }
+.chain-panel-body.collapsed { display: none; }
+
+/* Chain steps */
+.chain-steps { list-style: none; padding: 0; margin: 0; }
+.chain-step {
+  position: relative; padding: 12px 16px 12px 44px; margin-bottom: 8px;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--off);
+  transition: all 0.15s;
+}
+.chain-step:last-child { margin-bottom: 0; }
+.chain-step::before {
+  content: ""; position: absolute; left: 16px; top: 50%;
+  transform: translateY(-50%);
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid var(--border); background: var(--white);
+}
+.chain-step.resolved { border-color: var(--success); background: #f0faf0; }
+.chain-step.resolved::before { border-color: var(--success); background: var(--success); }
+.chain-step.unlocked { border-color: var(--accent); background: var(--accent-bg); }
+.chain-step.unlocked::before { border-color: var(--accent); background: var(--accent-bg); }
+.chain-step.locked { opacity: 0.65; }
+.chain-step.locked::before { border-color: var(--text-light); background: var(--off); }
+
+.chain-step-num {
+  font-family: var(--mono); font-size: 10px; color: var(--text-light);
+  letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 4px;
+}
+.chain-step-lookup { font-size: 13px; color: var(--text); line-height: 1.5; }
+.chain-step-dep {
+  font-family: var(--mono); font-size: 10px; color: var(--text-light);
+  margin-top: 4px;
+}
+.chain-step-result {
+  margin-top: 6px; padding: 6px 10px; border-radius: 3px;
+  background: var(--white); border: 1px solid var(--success);
+  font-family: var(--mono); font-size: 11px; color: var(--success);
+}
+/* Connector line between steps */
+.chain-step-connector {
+  position: absolute; left: 24px; top: -8px;
+  width: 2px; height: 8px; background: var(--border);
+}
+.chain-step:first-child .chain-step-connector { display: none; }
+
+/* Parallel tasks */
+.chain-parallel { margin-top: 16px; }
+.chain-parallel-title {
+  font-family: var(--mono); font-size: 10px; color: var(--text-light);
+  letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px;
+}
+.chain-parallel-item {
+  padding: 8px 12px; background: var(--off); border: 1px solid var(--border);
+  border-radius: 3px; margin-bottom: 4px; font-size: 12px; color: var(--text-mid);
+}
+.chain-parallel-item:last-child { margin-bottom: 0; }
+
+/* No-chain badge */
+.chain-no-chain {
+  font-family: var(--mono); font-size: 11px; color: var(--text-mid);
+  padding: 8px 0;
+}
+.chain-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 3px;
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.05em; text-transform: uppercase;
+}
+.chain-badge.has-chain { background: #e8f0fe; color: var(--accent); }
+.chain-badge.no-chain { background: #f0f0ee; color: var(--text-mid); }
 """
 
 _JS = """\
@@ -581,6 +669,13 @@ function toggle(header) {
 
 function toggleTool(header) {
   header.closest('.tool-block').classList.toggle('open');
+}
+
+function toggleChainPanel(header) {
+  var body = header.nextElementSibling;
+  body.classList.toggle('collapsed');
+  var chevron = header.querySelector('.chevron');
+  if (chevron) chevron.style.transform = body.classList.contains('collapsed') ? '' : 'rotate(180deg)';
 }
 
 function scrollToTurn(id) {
@@ -1034,6 +1129,118 @@ def _build_timeline(flat_cards: list) -> str:
     return "\n".join(parts)
 
 
+def _render_chain_panel(chain_plan: Optional[dict]) -> str:
+    """Render the chain analysis panel HTML. Returns empty string if no chain data."""
+    if chain_plan is None:
+        return ""
+
+    has_chain = chain_plan.get("has_chain", False)
+    chain_steps = chain_plan.get("chain_steps", [])
+    parallel_tasks = chain_plan.get("parallel_tasks", [])
+
+    if not has_chain and not parallel_tasks:
+        return ""
+
+    badge_cls = "has-chain" if has_chain else "no-chain"
+    badge_text = f"⛓ {len(chain_steps)} steps" if has_chain else "⚡ parallel"
+    step_count_text = f"{len(chain_steps)} chain step{'s' if len(chain_steps) != 1 else ''}"
+    parallel_count_text = f"{len(parallel_tasks)} parallel task{'s' if len(parallel_tasks) != 1 else ''}"
+
+    parts = ['<div class="chain-panel">']
+
+    # Header
+    parts.append(
+        f'<div class="chain-panel-header" onclick="toggleChainPanel(this)">'
+        f'<div class="chain-panel-title">'
+        f'<span class="chain-badge {badge_cls}">{badge_text}</span>'
+        f' Chain Analysis'
+        f'</div>'
+        f'<div style="font-family:var(--mono);font-size:10px;color:var(--text-light);">'
+        f'{step_count_text}, {parallel_count_text}'
+        f'{_CHEVRON_SVG}'
+        f'</div>'
+        f'</div>'
+    )
+
+    # Body
+    parts.append('<div class="chain-panel-body">')
+
+    if has_chain and chain_steps:
+        # Build a lookup for resolved values
+        resolved_map = {}
+        for s in chain_steps:
+            if s.get("resolved_value"):
+                resolved_map[s["placeholder"]] = s["resolved_value"]
+
+        parts.append('<ul class="chain-steps">')
+        for s in chain_steps:
+            step_num = s.get("step", "?")
+            lookup = s.get("lookup", "")
+            depends_on = s.get("depends_on")
+            placeholder = s.get("placeholder", "")
+            resolved = s.get("resolved_value")
+
+            # Substitute resolved placeholders into lookup text
+            display_lookup = lookup
+            for ph, val in resolved_map.items():
+                display_lookup = display_lookup.replace(ph, f'<strong>{_esc(val)}</strong>')
+            # Escape remaining text (but preserve our <strong> tags)
+            # We need to be careful: escape first, then re-insert strong tags
+            escaped_lookup = _esc(lookup)
+            for ph, val in resolved_map.items():
+                escaped_lookup = escaped_lookup.replace(
+                    _esc(ph), f'<strong style="color:var(--success)">{_esc(val)}</strong>'
+                )
+
+            # Determine state
+            if resolved:
+                state_cls = "resolved"
+            elif depends_on is not None:
+                dep_step = next((x for x in chain_steps if x.get("step") == depends_on), None)
+                if dep_step and dep_step.get("resolved_value"):
+                    state_cls = "unlocked"
+                else:
+                    state_cls = "locked"
+            else:
+                state_cls = "unlocked"
+
+            parts.append(f'<li class="chain-step {state_cls}">')
+            parts.append('<div class="chain-step-connector"></div>')
+            parts.append(f'<div class="chain-step-num">Step {step_num}</div>')
+            parts.append(f'<div class="chain-step-lookup">{escaped_lookup}</div>')
+
+            if depends_on is not None:
+                parts.append(
+                    f'<div class="chain-step-dep">depends on step {depends_on}</div>'
+                )
+
+            if resolved:
+                parts.append(
+                    f'<div class="chain-step-result">✅ {_esc(str(resolved))}</div>'
+                )
+
+            parts.append('</li>')
+        parts.append('</ul>')
+
+    if parallel_tasks:
+        parts.append('<div class="chain-parallel">')
+        parts.append('<div class="chain-parallel-title">⚡ Parallel Tasks</div>')
+        for task in parallel_tasks:
+            parts.append(f'<div class="chain-parallel-item">{_esc(str(task))}</div>')
+        parts.append('</div>')
+
+    if not has_chain and not chain_steps:
+        parts.append(
+            '<div class="chain-no-chain">'
+            'No causal chain detected — all tasks can be researched in parallel.'
+            '</div>'
+        )
+
+    parts.append('</div>')  # .chain-panel-body
+    parts.append('</div>')  # .chain-panel
+    return "\n".join(parts)
+
+
 def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
     """Generate a self-contained HTML page from a trace dict (or loaded JSON).
 
@@ -1085,6 +1292,9 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
     # Build turn cards
     cards_html = "\n".join(_render_turn_card(card) for card in flat_cards)
 
+    # Build chain analysis panel
+    chain_html = _render_chain_panel(d.get("chain_plan"))
+
     # Build final response images
     images_html = "".join(
         f'<div class="tc-img" style="margin:8px 0;">'
@@ -1127,6 +1337,9 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
       <div class="prompt-label">User Prompt</div>
       <div class="prompt-text">{user_input}</div>
     </div>
+
+    <!-- Chain analysis -->
+    {chain_html}
 
     <!-- Stats header -->
     <div class="trace-header">

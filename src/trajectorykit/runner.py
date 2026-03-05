@@ -203,6 +203,9 @@ def _finalize(state: AgentState, final_content: str) -> Dict[str, Any]:
     state.episode.ended_at = datetime.now().isoformat()
     state.episode.duration_s = round(time.time() - state.episode_start, 3)
     state.episode.compute_recursive_stats()
+    # Attach chain plan snapshot to the trace
+    if state.chain_plan is not None:
+        state.episode.chain_plan = state.chain_plan.to_dict()
     return {
         "final_response": final_content,
         "turns": state.turn,
@@ -224,10 +227,23 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
     """
     tools_for_turn: Optional[List[dict]] = None
 
+    # ── Chain plan injection (root, early turns) ──────────────────────
+    if (state.depth == 0 and state.chain_plan is not None
+            and state.chain_plan.has_chain and state.turn <= 2):
+        chain_msg = state.chain_plan.render()
+        if chain_msg:
+            state.messages.append({"role": "system", "content": chain_msg})
+            if state.verbose:
+                print(f"⛓  Injected chain plan (turn {state.turn})")
+
     # ── Periodic plan state / question reminder ────────────────────────
     _REMINDER_INTERVAL = 8
     if state.plan is not None and state.plan.should_inject(state.turn):
         plan_msg = state.plan.render(state.turn, state.turn_length)
+        # Append chain status if active
+        if (state.chain_plan is not None and state.chain_plan.has_chain
+                and not state.chain_plan.all_resolved()):
+            plan_msg += "\n\n" + state.chain_plan.render()
         state.messages.append({"role": "system", "content": plan_msg})
         if state.verbose:
             print(f"\U0001f4cb  Injected research plan (turn {state.turn})")

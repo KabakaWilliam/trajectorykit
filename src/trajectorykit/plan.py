@@ -15,7 +15,10 @@ The plan gives the orchestrator a "map" of:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .chain import ChainPlan
 
 
 @dataclass
@@ -28,6 +31,7 @@ class PlanTask:
     result_summary: Optional[str] = None   # ≤200 chars
     memory_key: Optional[str] = None
     data_quality: str = "none"       # none | weak | strong
+    chain_step: Optional[int] = None  # linked chain step number, or None
 
     # ── Status icons ──────────────────────────────────────────────────
     _ICONS = {
@@ -46,7 +50,8 @@ class PlanTask:
     def render(self, index: int) -> str:
         icon = self._ICONS.get(self.status, "?")
         q_icon = self._QUALITY_ICONS.get(self.data_quality, "")
-        line = f"  {icon}{q_icon} [{index}] {self.description}"
+        chain_tag = f" [chain step {self.chain_step}]" if self.chain_step is not None else ""
+        line = f"  {icon}{q_icon} [{index}] {self.description}{chain_tag}"
         if self.result_summary:
             line += f" → {self.result_summary}"
         if self.memory_key:
@@ -188,6 +193,31 @@ class ResearchPlan:
         lines.append("")
         lines.extend(self._gap_assessment_lines())
         return "\n".join(lines)
+
+    def seed_from_chain(self, chain_plan: "ChainPlan") -> None:
+        """Pre-populate subtasks from the chain analysis results.
+
+        Chain steps become pending tasks in order, followed by parallel tasks.
+        This gives the orchestrator a pre-built research plan to follow.
+        """
+        for step in chain_plan.chain_steps:
+            self.subtasks.append(PlanTask(
+                description=step.lookup,
+                status="pending",
+                chain_step=step.step,
+            ))
+        for task_desc in chain_plan.parallel_tasks:
+            self.subtasks.append(PlanTask(
+                description=task_desc,
+                status="pending",
+            ))
+
+    def find_chain_task(self, chain_step_num: int) -> Optional[PlanTask]:
+        """Find the PlanTask linked to a specific chain step number."""
+        for t in self.subtasks:
+            if t.chain_step == chain_step_num:
+                return t
+        return None
 
     def _gap_assessment_lines(self) -> list[str]:
         """Shared gap analysis logic used by render() and render_gap_check()."""

@@ -31,6 +31,7 @@ from .config import (
 )
 from .memory import MemoryStore
 from .plan import ResearchPlan
+from .chain import ChainPlan
 from .tool_store import TOOLS, ROOT_TOOLS
 from .tracing import EpisodeTrace, TurnRecord, ToolCallRecord
 
@@ -90,6 +91,7 @@ class AgentState:
     # ── Memory & Plan ─────────────────────────────────────────────────
     memory: MemoryStore = field(default_factory=MemoryStore)
     plan: Optional[ResearchPlan] = None
+    chain_plan: Optional[ChainPlan] = None
 
     # ── Draft management (root only) ──────────────────────────────────
     draft_path: Optional[str] = None

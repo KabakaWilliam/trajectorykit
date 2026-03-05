@@ -165,6 +165,39 @@ STEP 1: ASSESS & PLAN (turn 1)
     BAD:  "Find GDP, population, and HDI for France, Germany,
            and Japan in 2023"  (too broad — split by country)
 
+    CAUSAL CHAIN DETECTION:
+    Before decomposing, check: does answering this question
+    require discovering intermediate facts first?
+
+    Test: "Can I write the search queries for ALL sub-tasks
+    right now, without needing results from any of them?"
+    If NO — the question has information dependencies.
+
+    Example: "What is the population of the city where the
+    director of Jaws was born?"
+      Step 1: Who directed Jaws? → [need this to continue]
+      Step 2: Where was [director] born? → [need this to continue]
+      Step 3: What is the population of [city]?
+
+    When you detect a chain:
+      1. Identify ALL intermediate steps BEFORE dispatching.
+      2. Research the FIRST unknown link.
+      3. Wait for the result.
+      4. Use that result to formulate the NEXT research task.
+      5. Repeat until you reach the final answer.
+
+    NEVER skip a link. NEVER guess an intermediate value.
+    If Step 1 returns "Steven Spielberg", your Step 2 task
+    must say "Where was Steven Spielberg born?" — not
+    "Where was the director of Jaws born?" (forces the
+    sub-agent to re-derive Step 1, risking a different answer).
+
+    Your draft MUST show the full chain explicitly:
+      "Jaws was directed by Steven Spielberg (Step 1).
+       Spielberg was born in Cincinnati, Ohio (Step 2).
+       Cincinnati has a population of ~309,000 (Step 3)."
+    This makes each link auditable.
+
     BUDGET: Fewer deep tasks beat many shallow ones.
     Use summarize_webpage for quick targeted reads of known URLs.
 
@@ -336,9 +369,15 @@ PARALLEL DECOMPOSITION:
     conduct_research(task="[Find demographic data for X]")
   → Collect results → refine_draft
 
-  KEEP TOGETHER when steps are dependent:
+  KEEP TOGETHER when steps are dependent (CAUSAL CHAINS):
     conduct_research(task="Step A: [find X]")
     → Get result → conduct_research(task="Step B: given X=[result], find Y")
+    → Get result → conduct_research(task="Step C: given Y=[result], find Z")
+
+    CRITICAL: Each step must use the VERIFIED result from the
+    previous step — not the original question's phrasing.
+    This prevents different sub-agents from deriving different
+    intermediate answers.
 
   VALIDATION: Before dispatching, review your task list:
     - Can any task be split further without losing context?
@@ -388,6 +427,12 @@ COMMON PATTERNS
 
 Simple factual question:
   conduct_research → refine_draft → research_complete
+
+Causal chain question:
+  conduct_research("Step 1: find [first unknown]") → get result
+  → conduct_research("Step 2: given [result], find [next unknown]")
+  → get result → ... → refine_draft (show full chain)
+  → research_complete
 
 Multi-part question:
   3x conduct_research (parallel)

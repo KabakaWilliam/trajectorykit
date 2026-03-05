@@ -22,7 +22,10 @@ import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .chain import ChainPlan, ChainStep
 
 from .agent_state import AgentState
 from .config import (
@@ -253,11 +256,14 @@ def _focused_page_summary(
     model: str,
     vllm_url: str,
     max_fetch_chars: int = 200_000,
-    max_summary_tokens: int = 4096,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
 ) -> str:
     """Fetch a URL and produce an LLM-generated summary.
 
     Shared by summarize_webpage and the spot-check evidence pipeline.
+    The LLM is asked to wrap its output in <summary> tags so callers can
+    robustly extract the core content even if the model adds preamble.
     """
     result = fetch_url(url, max_chars=max_fetch_chars)
     if not result.get("ok"):
@@ -284,7 +290,16 @@ def _focused_page_summary(
                 "  - Maintain the logical structure of arguments\n"
                 "  - Note any data tables or lists of items\n"
                 "  - Flag if the page seems incomplete or paywalled\n"
-                "  - Be concise but never drop quantitative data"
+                "  - Be concise but never drop quantitative data\n"
+                "  - Be brief — aim for the most information-dense summary\n"
+                "    possible, not a lengthy rewrite of the page\n\n"
+                "OUTPUT FORMAT:\n"
+                "  Wrap your entire summary inside <summary> and </summary> XML tags.\n"
+                "  Example:\n"
+                "  <summary>\n"
+                "  Key finding: X was Y in 2023 (Source: Z).\n"
+                "  Table data: A=10, B=20, C=30.\n"
+                "  </summary>"
                 f"{focus_instruction}"
             ),
         },
@@ -292,27 +307,30 @@ def _focused_page_summary(
             "role": "user",
             "content": (
                 f"Summarize the following webpage content from: {url}\n\n"
+                f"Produce a structured summary inside <summary></summary> tags."
                 f"--- PAGE CONTENT ---\n{page_content}\n--- END ---\n\n"
-                "Produce a structured summary with the key information."
             ),
         },
     ]
     try:
+        _summary_payload: dict = {
+            "model": model,
+            "messages": msgs,
+        }
+        if temperature is not None:
+            _summary_payload["temperature"] = temperature
+        if max_tokens is not None:
+            _summary_payload["max_tokens"] = max_tokens
         resp = requests.post(
             f"{vllm_url}/chat/completions",
-            json={
-                "model": model,
-                "messages": msgs,
-                "temperature": 0.3,
-                "max_tokens": max_summary_tokens,
-            },
+            json=_summary_payload,
         )
         if resp.status_code == 200:
             choices = resp.json().get("choices", [])
             if choices:
                 text = choices[0].get("message", {}).get("content", "")
                 if text and text.strip():
-                    return text.strip()
+                    return _extract_summary_tags(text.strip())
                 return f"LLM returned empty summary. Raw page excerpt:\n{page_content[:3000]}"
             return f"LLM returned no choices. Raw page excerpt:\n{page_content[:3000]}"
         return (
@@ -321,6 +339,53 @@ def _focused_page_summary(
         )
     except Exception as e:
         return f"Summarization error: {e}. Raw page excerpt:\n{page_content[:3000]}"
+
+
+def _extract_xml_tag(text: str, tag: str = "summary") -> str:
+    """Extract content from <tag>...</tag> XML wrapper.
+
+    Handles edge cases: missing tags, partial/truncated tags, nested
+    content.  Falls back to full text if no tags found.
+
+    Parameters
+    ----------
+    text : str
+        Raw LLM output that may contain XML-wrapped content.
+    tag : str
+        The XML tag name to extract (e.g. "summary", "verdict", "claims",
+        "compressed").
+    """
+    # Try to find content between <tag> and </tag>
+    match = re.search(
+        rf'<{tag}>\s*(.*?)\s*</{tag}>',
+        text, re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        extracted = match.group(1).strip()
+        if extracted:
+            return extracted
+
+    # Fallback: opening tag exists but closing tag is missing (truncated output)
+    match_open = re.search(
+        rf'<{tag}>\s*(.*)',
+        text, re.DOTALL | re.IGNORECASE,
+    )
+    if match_open:
+        extracted = match_open.group(1).strip()
+        # Strip a trailing partial closing tag
+        extracted = re.sub(
+            rf'</{tag[:4]}(?:{re.escape(tag[4:])}?)?\s*$', '',
+            extracted, flags=re.IGNORECASE,
+        ).strip()
+        if extracted:
+            return extracted
+
+    # No tags at all — return full text as-is
+    return text.strip()
+
+
+# Backwards-compatible alias used by _focused_page_summary
+_extract_summary_tags = lambda text: _extract_xml_tag(text, "summary")
 
 
 def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str, str]:
@@ -373,11 +438,12 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         resp = requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
         if resp.status_code == 200:
             result = resp.json()
-            text = (
+            raw_text = (
                 result.get("choices", [{}])[0]
                 .get("message", {})
                 .get("content", "")
             ).strip()
+            text = _extract_xml_tag(raw_text, "verdict")
             clean = text.replace("*", "").upper()
             if "VERDICT: REVISION_NEEDED" in clean or "VERDICT:REVISION_NEEDED" in clean:
                 state.verification_rejections += 1
@@ -426,30 +492,39 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
             print(f"       \U0001f50e Spot-check: extracting checkable claims...")
 
         # Step 1: Extract claims from draft
+        # Inject chain plan as a hint so the extract LLM confirms the
+        # pre-computed chain structure rather than re-discovering it.
+        _chain_hint = ""
+        if state.chain_plan and state.chain_plan.has_chain:
+            _chain_hint = f"\n\nPRE-COMPUTED CHAIN ANALYSIS:\n{state.chain_plan.render()}\n"
         sc_extract_msgs = [
             {"role": "system", "content": SPOTCHECK_EXTRACT_PROMPT},
             {"role": "user", "content": (
-                f"QUESTION:\n{state.user_input}\n\n"
+                f"QUESTION:\n{state.user_input}"
+                f"{_chain_hint}\n\n"
                 f"DRAFT ANSWER:\n{draft_content}"
             )},
         ]
+        sc_extract_payload: dict = {
+            "model": state.model,
+            "messages": sc_extract_msgs,
+            "temperature": state.temperature,
+            "max_tokens": state.max_tokens,
+        }
         sc_extract_resp = requests.post(
             f"{VLLM_API_URL}/chat/completions",
-            json={
-                "model": state.model,
-                "messages": sc_extract_msgs,
-                "temperature": 0.3,
-                "max_tokens": 1024,
-            },
+            json=sc_extract_payload,
         )
         sc_claims = []
         if sc_extract_resp.status_code == 200:
-            sc_extract_text = (
+            sc_extract_raw = (
                 sc_extract_resp.json().get("choices", [{}])[0]
                 .get("message", {}).get("content", "")
             ).strip()
-            meta["extract_response"] = sc_extract_text
-            sc_json_text = re.sub(r'^```(?:json)?\s*', '', sc_extract_text, flags=re.MULTILINE)
+            meta["extract_response"] = sc_extract_raw
+            sc_json_text = _extract_xml_tag(sc_extract_raw, "claims")
+            # Strip residual markdown fences if model added them inside the tags
+            sc_json_text = re.sub(r'^```(?:json)?\s*', '', sc_json_text, flags=re.MULTILINE)
             sc_json_text = re.sub(r'```\s*$', '', sc_json_text, flags=re.MULTILINE).strip()
             try:
                 sc_parsed = json.loads(sc_json_text)
@@ -486,42 +561,138 @@ def _spot_check_claims(
     def _verify_one_claim(claim_obj):
         _q = claim_obj.get("search_query", "")
         _c = claim_obj.get("claim", "")
-        if not _q:
+        _source_url = claim_obj.get("source_url", "")
+        _depends_on = claim_obj.get("depends_on")  # chain dependency (int or None)
+        if not _q and not _source_url:
             return None
         try:
-            _sr, _ = dispatch_tool_call("search_web", {"q": _q, "num_results": 5}, _depth=0)
+            _sr = ""
             _ps = ""
-            _um = re.search(r'URL:\s*(https?://\S+)', _sr)
-            if _um:
-                _top_url = _um.group(1)
+            _supplementary: list[dict] = []  # additional raw page excerpts
+
+            # ── Strategy 1: If the extract provided a source URL, fetch ──
+            # it directly — the best evidence is the page the draft cited.
+            if _source_url:
                 try:
                     _ps = _focused_page_summary(
-                        url=_top_url,
+                        url=_source_url,
                         focus=f"Verify this claim: {_c}",
                         model=state.model,
                         vllm_url=VLLM_API_URL,
-                        max_summary_tokens=1024,
+                        temperature=state.temperature,
+                        max_tokens=state.max_tokens,
                     )
                     if _ps.startswith(("Failed to fetch", "Page fetched but", "Summarization error")):
+                        if state.verbose:
+                            print(f"       ⚠️  Spot-check: cited source {_source_url[:60]} failed, falling back to search")
                         _ps = ""
                     elif state.verbose:
-                        print(f"       \U0001f4c4 Spot-check: summarized {_top_url[:60]} ({len(_ps)} chars)")
+                        print(f"       📄 Spot-check: verified cited source {_source_url[:60]} ({len(_ps)} chars)")
                 except Exception:
-                    pass
+                    _ps = ""
+
+            # ── Strategy 2: Search for independent corroboration ─────────
+            if _q:
+                _sr, _ = dispatch_tool_call("search_web", {"q": _q, "num_results": 5}, _depth=0)
+
+                # Extract ALL URLs from search results for multi-source verification.
+                _all_urls = re.findall(r'URL:\s*(https?://\S+)', _sr)
+
+                # Rank URLs: PDFs first (primary sources), then authoritative
+                # domains (.gov, .edu, .org, Wikipedia), then everything else.
+                # This counters the bias toward finding all info in search
+                # snippets — PDFs, government data, and academic papers often
+                # hold the definitive answer that snippets merely summarise.
+                _cited_domain = ""
+                if _source_url:
+                    _dm = re.search(r'https?://([^/]+)', _source_url)
+                    _cited_domain = _dm.group(1) if _dm else ""
+
+                _pdf_urls: list[str] = []
+                _primary_urls: list[str] = []
+                _other_urls: list[str] = []
+                for _u in _all_urls:
+                    if _u == _source_url:
+                        continue  # already fetched as cited source
+                    if _cited_domain:
+                        _um_domain = re.search(r'https?://([^/]+)', _u)
+                        if _um_domain and _um_domain.group(1) == _cited_domain:
+                            continue  # skip same-domain as cited source
+                    if _u.lower().rstrip('/').endswith('.pdf') or '/pdf/' in _u.lower():
+                        _pdf_urls.append(_u)
+                    elif any(d in _u for d in ('.gov/', '.edu/', '.org/', '.int/', 'wikipedia.org')):
+                        _primary_urls.append(_u)
+                    else:
+                        _other_urls.append(_u)
+                _ranked_urls = _pdf_urls + _primary_urls + _other_urls
+
+                # ── Primary page summary: LLM-summarised, from best URL ──
+                if not _ps and _ranked_urls:
+                    _top_url = _ranked_urls[0]
+                    try:
+                        _ps = _focused_page_summary(
+                            url=_top_url,
+                            focus=f"Verify this claim: {_c}",
+                            model=state.model,
+                            vllm_url=VLLM_API_URL,
+                            temperature=state.temperature,
+                            max_tokens=state.max_tokens,
+                        )
+                        if _ps.startswith(("Failed to fetch", "Page fetched but", "Summarization error")):
+                            _ps = ""
+                        elif state.verbose:
+                            print(f"       📄 Spot-check: summarized {_top_url[:60]} ({len(_ps)} chars)")
+                    except Exception:
+                        pass
+                    _ranked_urls = _ranked_urls[1:]
+
+                # ── Supplementary evidence: raw fetch (no LLM), cheap ────
+                # Fetch 1-2 additional sources for cross-verification.
+                # Chain claims get the full budget (2); regular claims get 1.
+                _supp_budget = 2 if _depends_on is not None else 1
+                for _supp_url in _ranked_urls[:_supp_budget]:
+                    try:
+                        _result = fetch_url(_supp_url, max_chars=50_000)
+                        if _result.get("ok"):
+                            _is_pdf = (
+                                _supp_url.lower().rstrip('/').endswith('.pdf')
+                                or '[PDF detected' in _result.get("content", "")
+                                or _result.get("source") == "read_pdf"
+                            )
+                            _supp_text = _result["content"][:3000 if _is_pdf else 2000]
+                            if len(_supp_text.strip()) > 100:
+                                _supplementary.append({
+                                    "url": _supp_url,
+                                    "content": _supp_text,
+                                    "is_pdf": _is_pdf,
+                                })
+                                if state.verbose:
+                                    _tag = "📑" if _is_pdf else "📄"
+                                    print(f"       {_tag} Spot-check: supplementary {_supp_url[:50]} "
+                                          f"({len(_supp_text)} chars{', PDF' if _is_pdf else ''})")
+                    except Exception:
+                        pass
+
             return {
                 "claim": _c,
                 "search_query": _q,
-                "search_results": _sr[:3000],
+                "source_url": _source_url,
+                "depends_on": _depends_on,
+                "search_results": _sr[:3000] if _sr else "",
                 "page_content": _ps,
+                "supplementary_pages": _supplementary,
             }
         except Exception as e:
             if state.verbose:
-                print(f"       \u26a0\ufe0f  Spot-check search error: {e}")
+                print(f"       ⚠️  Spot-check search error: {e}")
             return {
                 "claim": _c,
                 "search_query": _q,
+                "source_url": _source_url,
+                "depends_on": _depends_on,
                 "search_results": f"(search failed: {e})",
                 "page_content": "",
+                "supplementary_pages": [],
             }
 
     max_workers = min(len(sc_claims), 4)
@@ -535,12 +706,16 @@ def _spot_check_claims(
 
     meta["claims_checked"] = len(sc_evidence)
 
-    # Short-circuit: if >50% degraded evidence, auto-PASS
+    # Short-circuit: if >50% degraded evidence, auto-PASS.
+    # A claim is degraded only if search failed AND it has no page content
+    # AND no supplementary pages (PDFs, gov docs, etc.).
     if sc_evidence:
         degraded = sum(
             1 for ev in sc_evidence
-            if ev["search_results"].startswith("(search failed")
-            or (not ev["page_content"] and len(ev["search_results"]) < 200)
+            if (
+                ev["search_results"].startswith("(search failed")
+                or (not ev["page_content"] and len(ev["search_results"]) < 200)
+            ) and not ev.get("supplementary_pages")
         )
         if degraded > len(sc_evidence) / 2:
             meta["spot_check_verdict"] = "PASSED"
@@ -554,17 +729,43 @@ def _spot_check_claims(
         return True, "", "", meta
 
     # Step 3: Compare claims against evidence
+    # Preserve original claim ordering for chain coherence analysis.
+    # Claims were verified in parallel so sc_evidence may be unordered;
+    # re-sort by the original claim list position.
+    _claim_texts = [c.get("claim", "") for c in sc_claims]
+    sc_evidence.sort(key=lambda ev: (
+        _claim_texts.index(ev["claim"]) if ev["claim"] in _claim_texts else 999
+    ))
+
+    has_chain = any(ev.get("depends_on") is not None for ev in sc_evidence)
     evidence_parts = []
     for i, ev in enumerate(sc_evidence, 1):
-        part = (
-            f"CLAIM {i}: {ev['claim']}\n"
-            f"SEARCH QUERY: {ev['search_query']}\n"
-            f"SEARCH RESULTS:\n{ev['search_results']}"
-        )
+        part = f"CLAIM {i}: {ev['claim']}\n"
+        if ev.get("depends_on") is not None:
+            part += f"DEPENDS ON: Claim {ev['depends_on']}\n"
+        if ev.get("source_url"):
+            part += f"CITED SOURCE URL: {ev['source_url']}\n"
+        if ev.get("search_query"):
+            part += f"SEARCH QUERY: {ev['search_query']}\n"
+        if ev.get("search_results"):
+            part += f"SEARCH RESULTS:\n{ev['search_results']}"
         if ev.get("page_content"):
-            part += f"\n\nSUMMARY OF TOP RESULT:\n{ev['page_content']}"
+            source_label = "CITED SOURCE CONTENT" if ev.get("source_url") else "SUMMARY OF TOP RESULT"
+            part += f"\n\n{source_label}:\n{ev['page_content']}"
+        # ── Supplementary pages (raw fetches — PDFs, gov sites, etc.) ─
+        for sp in (ev.get("supplementary_pages") or []):
+            sp_label = "PDF DOCUMENT" if sp.get("is_pdf") else "ADDITIONAL SOURCE"
+            part += f"\n\n{sp_label} ({sp['url'][:80]}):\n{sp['content']}"
         evidence_parts.append(part)
     evidence_text = "\n\n".join(evidence_parts)
+
+    chain_note = ""
+    if has_chain:
+        chain_note = (
+            "\n\nNOTE: Some claims have DEPENDS ON annotations indicating "
+            "a reasoning chain. Verify chain coherence: does the verified "
+            "result of each step match the entity used in the next step?"
+        )
 
     compare_msgs = [
         {"role": "system", "content": SPOTCHECK_COMPARE_PROMPT},
@@ -572,6 +773,7 @@ def _spot_check_claims(
             f"QUESTION:\n{state.user_input}\n\n"
             f"DRAFT ANSWER (excerpt of checked claims):\n\n"
             f"{evidence_text}"
+            f"{chain_note}"
         )},
     ]
     compare_resp = requests.post(
@@ -579,16 +781,17 @@ def _spot_check_claims(
         json={
             "model": state.model,
             "messages": compare_msgs,
-            "temperature": 0.3,
-            "max_tokens": 2048,
+            "temperature": state.temperature,
+            "max_tokens": state.max_tokens,
         },
     )
     if compare_resp.status_code == 200:
-        compare_text = (
+        compare_raw = (
             compare_resp.json().get("choices", [{}])[0]
             .get("message", {}).get("content", "")
         ).strip()
-        meta["compare_response"] = compare_text
+        meta["compare_response"] = compare_raw
+        compare_text = _extract_xml_tag(compare_raw, "verdict")
         clean = compare_text.replace("*", "").upper()
         if "VERDICT: SPOT_CHECK_FAILED" in clean or "VERDICT:SPOT_CHECK_FAILED" in clean:
             state.spot_check_rejections += 1
@@ -638,7 +841,13 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
     if state.verbose:
         print(f"       \U0001f50e Spot-check: draft looks like a refusal \u2014 launching refusal challenge...")
 
+    # For chain questions, search for Step 1's lookup text instead of the
+    # full composite question — the full question is often unanswerable
+    # as-is, but Step 1 should be independently verifiable.
     rc_query = state.user_input[:200]
+    if state.chain_plan and state.chain_plan.has_chain and state.chain_plan.chain_steps:
+        _step1 = state.chain_plan.chain_steps[0]
+        rc_query = _step1.lookup[:200]
     try:
         rc_search_result, _ = dispatch_tool_call("search_web", {"q": rc_query, "num_results": 5}, _depth=0)
         rc_page_summary = ""
@@ -651,7 +860,8 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
                     focus=f"Find information relevant to: {state.user_input[:300]}",
                     model=state.model,
                     vllm_url=VLLM_API_URL,
-                    max_summary_tokens=1024,
+                    temperature=state.temperature,
+                    max_tokens=state.max_tokens,
                 )
                 if rc_page_summary.startswith(("Failed to fetch", "Page fetched but", "Summarization error")):
                     rc_page_summary = ""
@@ -675,16 +885,17 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
             json={
                 "model": state.model,
                 "messages": rc_msgs,
-                "temperature": 0.3,
-                "max_tokens": 1024,
+                "temperature": state.temperature,
+                "max_tokens": state.max_tokens,
             },
         )
         if rc_resp.status_code == 200:
-            rc_text = (
+            rc_raw = (
                 rc_resp.json().get("choices", [{}])[0]
                 .get("message", {}).get("content", "")
             ).strip()
-            meta["refusal_challenge_response"] = rc_text
+            meta["refusal_challenge_response"] = rc_raw
+            rc_text = _extract_xml_tag(rc_raw, "verdict")
             rc_clean = rc_text.replace("*", "").upper()
             if "VERDICT: REFUSAL_CHALLENGED" in rc_clean or "VERDICT:REFUSAL_CHALLENGED" in rc_clean:
                 state.spot_check_rejections += 1
@@ -865,6 +1076,89 @@ def handle_research_complete(
 # CONDUCT_RESEARCH  (root only — delegates to sub-agent)
 # ═══════════════════════════════════════════════════════════════════════
 
+def _match_chain_step(
+    chain_plan: "ChainPlan",
+    task_text: str,
+    output: str,
+) -> Optional["ChainStep"]:
+    """Match a conduct_research task to an unresolved chain step.
+
+    Uses Jaccard word-overlap between the task and each unresolved
+    chain step's lookup text. Also checks if the task explicitly
+    references the step placeholder.
+
+    Returns the best-matching unresolved ChainStep, or None.
+    """
+    from .chain import ChainPlan, ChainStep  # lazy to avoid circular
+
+    stopwords = frozenset({
+        "the", "and", "for", "that", "this", "with", "from", "are", "was",
+        "has", "have", "been", "will", "but", "not", "all", "can", "about",
+        "how", "what", "which", "their", "there", "each", "who", "more",
+        "find", "search", "look", "research", "investigate",
+    })
+
+    task_words = set(re.findall(r"\w{3,}", task_text.lower())) - stopwords
+    if not task_words:
+        return None
+
+    best_score = 0.0
+    best_step = None
+
+    for step in chain_plan.chain_steps:
+        if step.is_resolved:
+            continue
+        # Check explicit placeholder reference first
+        if step.placeholder and step.placeholder in task_text:
+            # Task explicitly references this step's placeholder — poor match
+            # (it's trying to USE this step, not resolve it)
+            continue
+        lookup = step.lookup_resolved(chain_plan)
+        step_words = set(re.findall(r"\w{3,}", lookup.lower())) - stopwords
+        if not step_words:
+            continue
+        jaccard = len(task_words & step_words) / len(task_words | step_words)
+        if jaccard > best_score:
+            best_score = jaccard
+            best_step = step
+
+    if best_score >= 0.35 and best_step is not None:
+        return best_step
+    return None
+
+
+def _extract_chain_answer(output: str) -> str:
+    """Extract a concise factual answer from sub-agent output.
+
+    Used to fill chain step resolved_value. Tries to pull out the
+    key factual answer rather than the full verbose output.
+    """
+    text = output.strip()
+
+    # If it's JSON-wrapped (spawn_agent response), unwrap
+    if text.startswith("{"):
+        import json as _json
+        try:
+            parsed = _json.loads(text)
+            resp = parsed.get("response", "")
+            if resp:
+                text = resp.strip()
+        except (ValueError, KeyError):
+            pass
+
+    # Take first meaningful line (skip empty lines and markers)
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("#", "---", "```", "[", "Source")):
+            # Cap at reasonable length for a placeholder value
+            if len(stripped) > 200:
+                stripped = stripped[:200].rsplit(" ", 1)[0] + "..."
+            return stripped
+
+    # Fallback: first 200 chars
+    return text[:200].strip()
+
+
 def _find_similar_prior_research(state: AgentState, new_task: str) -> Optional[str]:
     """Check memory for prior conduct_research results with overlapping tasks.
 
@@ -924,8 +1218,46 @@ def handle_conduct_research(
     if state.depth != 0:
         return _CONTINUE
 
-    # ── Task-level deduplication: inject prior findings if similar ─────
     new_task = str(tool_args.get("task", ""))
+
+    # ── Chain enforcement gate ────────────────────────────────────────
+    # If a causal chain is active, block tasks that reference unresolved
+    # placeholders (the model is trying to skip ahead).
+    if state.chain_plan is not None and state.chain_plan.has_chain:
+        missing = state.chain_plan.unresolved_dependencies_for(new_task)
+        if missing:
+            missing_desc = "; ".join(
+                f"step {s.step} ({s.lookup})" for s in missing
+            )
+            block_msg = (
+                f"⛓ BLOCKED: This task references unresolved chain dependencies: "
+                f"{missing_desc}. You must resolve earlier chain steps first. "
+                f"Next step to resolve: "
+            )
+            next_step = state.chain_plan.next_unlocked_step()
+            if next_step:
+                resolved_lookup = next_step.lookup_resolved(state.chain_plan)
+                block_msg += (
+                    f"Step {next_step.step} — {resolved_lookup}"
+                )
+            else:
+                block_msg += "(all preceding steps appear resolved — check your task text)"
+            state.messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": block_msg,
+            })
+            tc_record = ToolCallRecord(
+                tool_name="conduct_research", tool_args=tool_args,
+                tool_call_id=tool_call["id"], output=block_msg,
+                duration_s=0.0, child_trace=None,
+            )
+            turn_record.tool_calls.append(tc_record)
+            if state.verbose:
+                print(f"       ⛓ Chain gate: blocked out-of-order dispatch")
+            return _CONTINUE
+
+    # ── Task-level deduplication: inject prior findings if similar ─────
     prior_note = _find_similar_prior_research(state, new_task)
     if prior_note:
         existing_ctx = tool_args.get("context", "") or ""
@@ -982,6 +1314,25 @@ def handle_conduct_research(
                 output=output, memory_key=None, is_error=True,
             )
 
+    # ── Chain step resolution ─────────────────────────────────────────
+    # If a chain is active and the task looks like it matches a chain step,
+    # resolve it with a concise summary of the output.
+    if (state.chain_plan is not None and state.chain_plan.has_chain
+            and not output.startswith("ERROR:")):
+        matched_step = _match_chain_step(state.chain_plan, new_task, output)
+        if matched_step is not None:
+            # Extract a concise answer from the output (first meaningful line)
+            answer_value = _extract_chain_answer(output)
+            state.chain_plan.resolve_step(matched_step.step, answer_value)
+            # Also update the linked PlanTask if it exists
+            if state.plan is not None:
+                plan_task = state.plan.find_chain_task(matched_step.step)
+                if plan_task is not None:
+                    plan_task.status = "done"
+                    plan_task.result_summary = answer_value[:200]
+            if state.verbose:
+                print(f"       ⛓ Resolved chain step {matched_step.step} → {answer_value[:80]}")
+
     # Build the message for context
     msg_output = re.sub(
         r"(--- .+? \(base64\) ---\n).+?(\n---|$)",
@@ -1029,7 +1380,8 @@ def handle_summarize_webpage(
             sw_output = _focused_page_summary(
                 url=sw_url, focus=sw_focus, model=state.model,
                 vllm_url=VLLM_API_URL,
-                max_summary_tokens=min(4096, state.max_tokens or 4096),
+                temperature=state.temperature,
+                max_tokens=state.max_tokens,
             )
             if sw_output.startswith("Failed to fetch") or sw_output.startswith("Page fetched but"):
                 sw_output += (
@@ -1159,7 +1511,10 @@ def handle_compress_findings(
                         "  - NEVER drop quantitative data (numbers, percentages, dates)\n"
                         "  - Preserve source attributions\n"
                         "  - Be concise but complete \u2014 compress prose, keep facts\n"
-                        "  - If a finding is well-supported by multiple sources, note that"
+                        "  - If a finding is well-supported by multiple sources, note that\n\n"
+                        "OUTPUT WRAPPING:\n"
+                        "  Wrap your ENTIRE structured summary inside <compressed> and </compressed> XML tags.\n"
+                        "  You may think/reason before the opening tag, but the summary MUST be inside the tags."
                         f"{focus_instruction}"
                     ),
                 },
@@ -1175,15 +1530,16 @@ def handle_compress_findings(
             cf_payload = {
                 "model": state.model,
                 "messages": compress_messages,
-                "temperature": 0.3,
-                "max_tokens": min(8192, state.max_tokens),
+                "temperature": state.temperature,
+                "max_tokens": state.max_tokens,
             }
             cf_resp = requests.post(f"{VLLM_API_URL}/chat/completions", json=cf_payload)
             if cf_resp.status_code == 200:
                 cf_result = cf_resp.json()
                 cf_choices = cf_result.get("choices", [])
                 if cf_choices:
-                    cf_output = cf_choices[0].get("message", {}).get("content", "")
+                    cf_raw = cf_choices[0].get("message", {}).get("content", "")
+                    cf_output = _extract_xml_tag(cf_raw, "compressed") if cf_raw else ""
                     if not cf_output or not cf_output.strip():
                         cf_output = (
                             f"LLM returned empty compression. "

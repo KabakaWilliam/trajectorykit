@@ -12,15 +12,22 @@ refusal is honest, given independent search evidence gathered below.
 OUTPUT FORMAT — CHOOSE EXACTLY ONE
 ═══════════════════════════════════════════
 
+Wrap your ENTIRE response inside <verdict> and </verdict> XML tags.
+You may think/reason BEFORE the opening <verdict> tag, but the
+final structured output MUST be inside the tags.
+
 If the independent evidence confirms that the information is genuinely
 hard to find or unavailable:
 
+  <verdict>
   VERDICT: REFUSAL_JUSTIFIED
   (one sentence explaining why the refusal seems honest)
+  </verdict>
 
 If the independent evidence shows that the answer IS findable — the
 agent was lazy or gave up too early:
 
+  <verdict>
   VERDICT: REFUSAL_CHALLENGED
 
   EVIDENCE FOUND:
@@ -29,6 +36,7 @@ agent was lazy or gave up too early:
 
   SUGGESTION:
   - What the agent should search for or look at to find the answer
+  </verdict>
 
 ═══════════════════════════════════════════
 RULES
@@ -52,3 +60,11 @@ RULES
 - Be strict. Agents should try hard before giving up. If there's a
   reasonable trail of evidence in the search results, the refusal
   was premature.
+
+- CHAIN QUESTIONS: If the question requires a multi-step reasoning
+  chain (e.g. "find X, then use X to look up Y"), the evidence
+  below may address only the FIRST step of the chain. That is
+  still sufficient for REFUSAL_CHALLENGED — if Step 1 is
+  answerable, the agent should have researched it and continued
+  down the chain rather than refusing. A partial trail of evidence
+  means the agent gave up too early.
