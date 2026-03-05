@@ -378,68 +378,465 @@ _BROWSER_HEADERS = {
     "DNT": "1",
 }
 
-# Persistent cookie jar — survives across requests within one agent run
+# ── Thread-safe cookie jar ────────────────────────────────────────────
+# Cookie strategy: NO shared jar.  Each httpx.get() manages its own
+# redirect-chain cookies internally.  A global jar leaked cookies across
+# domains and caused "Multiple cookies exist with name=__cf_bm" errors
+# when several Cloudflare-fronted sites each set that cookie.
 import httpx as _httpx
-_cookie_jar = _httpx.Cookies()
+import threading as _threading
 
-def _get_cookie_jar():
-    return _cookie_jar
+# ── Per-domain fetch rate limiter ─────────────────────────────────────
+# Prevents rapid-fire requests to the same domain, which is the #1 cause
+# of Cloudflare/WAF blocks. Each domain gets its own last-request timestamp.
+_FETCH_MIN_INTERVAL = 1.5  # seconds between requests to the same domain
+_domain_fetch_times: dict[str, float] = {}
+_domain_fetch_lock = _threading.Lock()
+
+def _domain_rate_wait(domain: str) -> None:
+    """Block until at least _FETCH_MIN_INTERVAL has passed since the last
+    request to this domain. Thread-safe."""
+    if not domain:
+        return
+    with _domain_fetch_lock:
+        now = time.time()
+        last = _domain_fetch_times.get(domain, 0.0)
+        wait = last + _FETCH_MIN_INTERVAL - now
+        if wait > 0:
+            _domain_fetch_times[domain] = last + _FETCH_MIN_INTERVAL
+        else:
+            _domain_fetch_times[domain] = now
+    # Sleep OUTSIDE the lock so other domains aren't blocked
+    if wait > 0:
+        time.sleep(wait)
+
+# ── Known-hostile domains (always skip direct, go Jina first) ─────────
+# These domains are known to aggressively block automated access.
+# Going direct wastes time and poisons the session blocklist.
+_JINA_FIRST_DOMAINS: frozenset[str] = frozenset({
+    # Data / analytics platforms
+    "www.statista.com", "statista.com",
+    "www.similarweb.com", "similarweb.com",
+    "www.semrush.com", "semrush.com",
+    # News paywalls
+    "www.wsj.com", "wsj.com",
+    "www.ft.com", "ft.com",
+    "www.nytimes.com", "nytimes.com",
+    "www.washingtonpost.com", "washingtonpost.com",
+    "www.bloomberg.com", "bloomberg.com",
+    "www.economist.com", "economist.com",
+    "www.theatlantic.com", "theatlantic.com",
+    # Heavy CF protection
+    "www.glassdoor.com", "glassdoor.com",
+    "www.linkedin.com", "linkedin.com",
+    "www.indeed.com", "indeed.com",
+    "www.zillow.com", "zillow.com",
+    "www.realtor.com", "realtor.com",
+    # Academic paywalls
+    "www.sciencedirect.com", "sciencedirect.com",
+    "www.jstor.org", "jstor.org",
+    "www.springer.com", "springer.com",
+    "link.springer.com",
+})
 
 # Patterns that indicate a site blocked us
 _BLOCK_PATTERNS = [
     "access denied", "403 forbidden", "just a moment",
     "checking your browser", "enable javascript", "captcha",
-    "cloudflare", "blocked", "unusual traffic", "bot detection",
+    "blocked", "unusual traffic", "bot detection",
     "please verify", "security check", "are you a robot",
 ]
 
-def _is_blocked(text: str, status_code: int) -> tuple[bool, str]:
-    """Check if a response looks like a bot-block page."""
+# Cloudflare-specific patterns (subset — these mean retries are pointless)
+_CLOUDFLARE_PATTERNS = [
+    "cloudflare", "cf-browser-verification", "cf-challenge",
+    "cf-chl-bypass", "_cf_chl", "ray id",
+]
+
+# Session-level domain blocklist with TTL: Cloudflare blocks are often
+# transient (CDN-edge variance, rotating challenges).  Entries expire after
+# _BLOCKED_DOMAIN_TTL seconds so a momentary block doesn't permanently
+# degrade a domain for the rest of the eval run.
+_BLOCKED_DOMAIN_TTL = 300  # seconds (5 min)
+_blocked_domains: dict[str, float] = {}   # domain → timestamp of block
+_blocked_domains_lock = _threading.Lock()
+
+# ── URL response cache: avoids re-fetching the same page across workers ──
+# Stores raw HTML keyed by URL. Parsing (extract, css_selector, max_chars)
+# still happens per-call so different callers all benefit from one fetch.
+_URL_CACHE_TTL = 600  # seconds (10 min)
+_url_cache: dict[str, tuple[str, str, int, float]] = {}  # url → (html, final_url, status, ts)
+_url_cache_lock = _threading.Lock()
+
+# ── Parsed-text page cache: full cleaned text, keyed by URL ──────────
+# Populated by _parse_html_content *before* truncation so that read_page
+# can serve arbitrary offsets without re-parsing.  Same TTL as URL cache.
+_page_text_cache: dict[str, tuple[str, float]] = {}  # url → (full_text, timestamp)
+_page_text_cache_lock = _threading.Lock()
+
+from urllib.parse import urlparse as _urlparse
+
+
+def _is_domain_blocked(domain: str) -> bool:
+    """Check if domain is in the blocklist and its TTL hasn't expired."""
+    with _blocked_domains_lock:
+        ts = _blocked_domains.get(domain)
+        if ts is None:
+            return False
+        if time.time() - ts > _BLOCKED_DOMAIN_TTL:
+            del _blocked_domains[domain]
+            logger.debug(f"Domain {domain} blocklist entry expired (TTL={_BLOCKED_DOMAIN_TTL}s)")
+            return False
+        return True
+
+
+def _block_domain(domain: str) -> None:
+    """Add a domain to the blocklist with current timestamp.
+
+    Infrastructure domains (Wayback, Jina) are never blocklisted because
+    doing so would disable our own fallback tiers.
+    """
+    _NEVER_BLOCK = frozenset({"web.archive.org", "r.jina.ai", "s.jina.ai"})
+    if domain in _NEVER_BLOCK:
+        logger.debug(f"Refusing to blocklist infrastructure domain {domain}")
+        return
+    with _blocked_domains_lock:
+        _blocked_domains[domain] = time.time()
+
+
+def reset_fetch_state() -> None:
+    """Clear all session-level fetch state between questions.
+
+    Call this between eval questions so that transient blocks,
+    rate-limit timestamps, and other per-session state don't leak
+    across independent questions.
+    """
+    with _blocked_domains_lock:
+        cleared = len(_blocked_domains)
+        _blocked_domains.clear()
+    with _domain_fetch_lock:
+        _domain_fetch_times.clear()
+    with _url_cache_lock:
+        cached = len(_url_cache)
+        _url_cache.clear()
+    with _page_text_cache_lock:
+        pages = len(_page_text_cache)
+        _page_text_cache.clear()
+    if cleared or cached or pages:
+        logger.debug(f"reset_fetch_state: cleared {cleared} blocked domains, {cached} cached URLs, {pages} parsed pages")
+
+
+def _extract_domain(url: str) -> str:
+    """Extract domain from URL for blocklist lookups."""
+    try:
+        return _urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _get_cached_full_length(url: str) -> int:
+    """Return full-text length from _page_text_cache, or 0 if not cached."""
+    with _page_text_cache_lock:
+        cached = _page_text_cache.get(url)
+    return len(cached[0]) if cached else 0
+
+
+def _is_blocked(text: str, status_code: int) -> tuple[bool, str, bool]:
+    """Check if a response looks like a bot-block page.
+
+    Returns:
+        (is_blocked, reason, is_cloudflare) — the third element indicates
+        whether this is specifically a Cloudflare/WAF challenge, meaning
+        retries are pointless and the domain should be blocklisted.
+    """
     if status_code in (403, 429, 503):
-        return True, f"HTTP {status_code}"
+        # Check body for CF signatures even on error status codes
+        lower = text[:3000].lower()
+        for cf_pat in _CLOUDFLARE_PATTERNS:
+            if cf_pat in lower:
+                return True, f"Cloudflare ({cf_pat})", True
+        return True, f"HTTP {status_code}", False
+
     lower = text[:3000].lower()
-    for pat in _BLOCK_PATTERNS:
-        if pat in lower:
-            return True, f"block pattern: {pat}"
-    return False, ""
+
+    # Check Cloudflare first (more specific) — always checked
+    for cf_pat in _CLOUDFLARE_PATTERNS:
+        if cf_pat in lower:
+            return True, f"Cloudflare ({cf_pat})", True
+
+    # Generic block patterns — only on SHORT pages.
+    # Real block/challenge pages are tiny (<5 KB).  A long page that
+    # incidentally contains "blocked" or "access denied" in its body
+    # is almost certainly legitimate content.  This prevents false
+    # positives from articles about ad-blockers, road blocks, etc.
+    if len(text) < 5000:
+        for pat in _BLOCK_PATTERNS:
+            if pat in lower:
+                return True, f"block pattern: {pat}", False
+
+    return False, "", False
 
 
-def _jina_reader_fallback(url: str, max_chars: int = 8000) -> str | None:
-    """Last-resort fallback: use Jina Reader to render JS-heavy pages.
-    
-    Returns cleaned text or None on failure.
+def _jina_reader_fallback(url: str, max_chars: int = 12000,
+                         accept: str = "text/plain",
+                         target_selector: str = "",
+                         wait_for_selector: str = "",
+                         min_content_len: int = 200) -> str | None:
+    """Fallback: use Jina Reader (headless Chrome) to render JS-heavy pages.
+
+    Two-tier strategy:
+      1. GET  r.jina.ai/{url} — fast, benefits from Jina's CDN cache.
+      2. POST r.jina.ai/       — slower, forces full network-idle wait.
+         Only used when GET returns too little content (likely JS-rendered).
+
+    Args:
+        url: The original URL to fetch via Jina.
+        max_chars: Truncate returned text to this many characters.
+        accept: MIME type for the Accept header.
+            - "text/plain" (default): returns clean Markdown text.
+            - "text/html": returns rendered HTML — needed when the
+              caller will parse <table> elements from the output.
+        target_selector: CSS selector for Jina's x-target-selector header.
+            When set, Jina returns only content within the matched element.
+        wait_for_selector: CSS selector for Jina's x-wait-for-selector header.
+            When set, Jina waits for this element to render before returning.
+        min_content_len: If GET returns fewer chars than this, escalate to POST.
+
+    Returns cleaned text/HTML or None on failure.
     """
     import httpx
-    jina_url = f"https://r.jina.ai/{url}"
+    _wfs = wait_for_selector or "article, main, #content, .content, table"
+    headers = {
+        "Accept": accept,
+        "User-Agent": _BROWSER_HEADERS["User-Agent"],
+        "x-timeout": "30",
+        "x-wait-for-selector": _wfs,
+    }
+    if target_selector:
+        headers["x-target-selector"] = target_selector
+
+    # ── Tier 1: GET (fast, cacheable) ─────────────────────────────────
+    get_text = None
     try:
+        jina_url = f"https://r.jina.ai/{url}"
         resp = httpx.get(
             jina_url,
-            headers={"Accept": "text/plain", "User-Agent": _BROWSER_HEADERS["User-Agent"]},
-            timeout=25,
+            headers=headers,
+            timeout=30,
             follow_redirects=True,
         )
         if resp.status_code == 200 and len(resp.text.strip()) > 50:
-            return resp.text.strip()[:max_chars]
+            get_text = resp.text.strip()
     except Exception as e:
-        logger.debug(f"Jina Reader fallback failed for {url}: {e}")
+        logger.debug(f"Jina GET failed for {url}: {e}")
+
+    if get_text and len(get_text) >= min_content_len:
+        # Cache full text for read_page before truncating
+        with _page_text_cache_lock:
+            _page_text_cache[url] = (get_text, time.time())
+        return get_text[:max_chars]
+
+    # ── Tier 2: POST (forces network-idle wait, handles SPAs / hash routes) ─
+    logger.debug(
+        f"Jina GET {'returned only ' + str(len(get_text)) + ' chars' if get_text else 'failed'} "
+        f"for {url} — escalating to POST"
+    )
+    try:
+        resp = httpx.post(
+            "https://r.jina.ai/",
+            headers=headers,
+            data={"url": url},
+            timeout=35,
+            follow_redirects=True,
+        )
+        if resp.status_code == 200 and len(resp.text.strip()) > 50:
+            post_text = resp.text.strip()
+            # Use POST result only if it's actually better than GET
+            if get_text and len(post_text) <= len(get_text):
+                best = get_text
+            else:
+                best = post_text
+            with _page_text_cache_lock:
+                _page_text_cache[url] = (best, time.time())
+            return best[:max_chars]
+    except Exception as e:
+        logger.debug(f"Jina POST failed for {url}: {e}")
+
+    # Return whatever GET got, even if short — better than nothing
+    if get_text:
+        with _page_text_cache_lock:
+            _page_text_cache[url] = (get_text, time.time())
+        return get_text[:max_chars]
     return None
 
 
-def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
-              css_selector: str = "", max_retries: int = 2, timeout: int = 20) -> dict:
-    """Fetch a web page with browser-grade headers, retries, and Jina fallback.
+def _parse_html_content(resp_text: str, resp_url, resp_status_code: int,
+                        extract: str, css_selector: str, max_chars: int,
+                        attempt: int) -> dict:
+    """Parse an HTML response into structured content. Shared by direct + Jina paths."""
+    from bs4 import BeautifulSoup
+    import warnings
 
-    3-tier strategy:
-      1. Direct fetch with browser headers + persistent cookies
-      2. Retry with exponential backoff (if blocked / transient error)
-      3. Jina Reader fallback (JS rendering, last resort)
+    content_type_hdr = ""  # already validated by caller
+    raw = resp_text
+
+    # Detect XML vs HTML
+    if raw.lstrip()[:20].startswith("<?xml"):
+        parser = "xml"
+    else:
+        parser = "html.parser"
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+        soup = BeautifulSoup(raw, parser)
+
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+
+    # Apply CSS selector if provided
+    if css_selector:
+        selected = soup.select(css_selector)
+        if selected:
+            from bs4 import BeautifulSoup as BS
+            combined = "\n".join(str(el) for el in selected)
+            soup = BS(combined, "html.parser")
+
+    if extract == "table":
+        # Use shared table parser — same logic as extract_tables
+        parsed = _parse_tables_from_soup(soup, max_chars=max_chars, css_selector="")
+        if parsed["tables"]:
+            lines = []
+            for tbl_data in parsed["tables"]:
+                meta = tbl_data["meta"]
+                # Table header line
+                label_parts = []
+                if meta.get("nearest_heading"):
+                    label_parts.append(meta["nearest_heading"])
+                if meta.get("caption"):
+                    label_parts.append(meta["caption"])
+                if label_parts:
+                    lines.append(f"=== {' — '.join(label_parts)} ===")
+                elif len(parsed["tables"]) > 1:
+                    lines.append(f"=== Table {meta['table_index']} ===")
+
+                if tbl_data["rows"]:
+                    # Column headers
+                    if meta["headers"]:
+                        lines.append(" | ".join(meta["headers"]))
+                        lines.append("-" * min(len(" | ".join(meta["headers"])), 80))
+                    # Data rows
+                    for row in tbl_data["rows"]:
+                        lines.append(" | ".join(str(v) for v in row.values()))
+                else:
+                    # Truncated table — show preview only
+                    lines.append(f"[TABLE TRUNCATED — {meta['total_rows']} rows. "
+                                 f"Headers: {', '.join(meta['headers']) if meta['headers'] else 'none'}]")
+                    if meta.get("preview_rows"):
+                        lines.append("Preview:")
+                        for pr in meta["preview_rows"]:
+                            lines.append("  " + " | ".join(str(v) for v in pr.values()))
+                lines.append("")  # blank line between tables
+
+            # Truncation footer
+            if parsed["truncated"]:
+                lines.append(
+                    f"[TRUNCATED: showed {parsed['tables_returned']} of "
+                    f"{parsed['tables_found']} tables. "
+                    f"Use extract_tables(css_selector='...') to target a specific table.]"
+                )
+            content = "\n".join(lines)
+        else:
+            content = soup.get_text(separator="\n", strip=True)
+    else:
+        # ── trafilatura extraction (preferred for article pages) ─────
+        # trafilatura is trained on thousands of websites and does a much
+        # better job than hand-rolled heuristics at isolating the main
+        # article body.  We fall through to BeautifulSoup if it's not
+        # installed or returns too little content (e.g. non-article pages).
+        content = None
+        if not css_selector:
+            try:
+                import trafilatura
+                _traf = trafilatura.extract(
+                    resp_text,
+                    include_links=True,
+                    include_tables=True,
+                    favor_recall=True,
+                )
+                if _traf and len(_traf) > 200:
+                    content = _traf
+            except Exception:
+                pass  # trafilatura not installed or crashed — fall through
+
+        # ── BeautifulSoup fallback (css_selector, or trafilatura too short)
+        if content is None:
+            _content_soup = None
+            if not css_selector:
+                for _sel in ("article", "main", "[role='main']", ".post-content", ".entry-content", "#content", "#mw-content-text"):
+                    _found = soup.select(_sel)
+                    if _found:
+                        _candidate_text = "\n".join(el.get_text(separator="\n", strip=True) for el in _found)
+                        _full_text_len = len(soup.get_text())
+                        if len(_candidate_text) > max(200, _full_text_len * 0.3):
+                            _content_soup = _candidate_text
+                            break
+
+            if _content_soup:
+                content = _content_soup
+            else:
+                content = soup.get_text(separator="\n", strip=True)
+
+        # Collapse excessive whitespace
+        import re as _re_clean
+        content = _re_clean.sub(r'\n{3,}', '\n\n', content)
+        _lines = content.split('\n')
+        _cleaned = []
+        _short_streak = 0
+        for _line in _lines:
+            _stripped = _line.strip()
+            if len(_stripped) < 4 and _stripped:
+                _short_streak += 1
+                if _short_streak <= 2:
+                    _cleaned.append(_stripped)
+            else:
+                _short_streak = 0
+                _cleaned.append(_stripped)
+        content = '\n'.join(_cleaned)
+
+    # ── Cache full parsed text before truncation ──────────────────
+    full_length = len(content)
+    _url_str = str(resp_url)
+    if full_length > 0:
+        with _page_text_cache_lock:
+            _page_text_cache[_url_str] = (content, time.time())
+
+    content = content[:max_chars]
+
+    return {
+        "ok": True, "content": content, "url": _url_str,
+        "blocked": False, "reason": "", "status_code": resp_status_code,
+        "retries": attempt, "_full_length": full_length,
+    }
+
+
+def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
+              css_selector: str = "", max_retries: int = 2, timeout: int = 20) -> dict:
+    """Fetch a web page with smart routing, domain blocklist, and multi-tier fallback.
+
+    Strategy:
+      1. If domain is in session blocklist → skip direct, go Jina first.
+      2. Otherwise: single direct probe (no retries on block/CF).
+         - If Cloudflare/WAF detected → blocklist domain, go Jina immediately.
+         - If transient error (timeout, 500) → retry once with backoff.
+      3. If direct content is suspiciously short → try Jina.
+      4. If Jina fails → Wayback Machine auto-fallback.
 
     Args:
         url: URL to fetch.
         max_chars: Max characters of extracted text to return.
         extract: "text" for cleaned page text, "table" for pipe-delimited tables.
         css_selector: Optional CSS selector to target specific elements.
-        max_retries: Number of retry attempts on failure.
+        max_retries: Number of retry attempts for transient (non-block) errors.
         timeout: Per-request timeout in seconds.
 
     Returns:
@@ -447,40 +844,165 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
         and optionally source, hint.
     """
     import httpx
-    from bs4 import BeautifulSoup
     import warnings
 
-    cookies = _get_cookie_jar()
     last_error = ""
     last_status = 0
     retries_done = 0
+    domain = _extract_domain(url)
+
+    # ── Fast path: domain already known to be blocked ─────────────────
+    _is_archive_url = "web.archive.org" in domain
+    _is_jina_url = "r.jina.ai" in domain or "s.jina.ai" in domain
+
+    if _is_domain_blocked(domain):
+        logger.debug(f"Domain {domain} is blocklisted — skipping direct, trying fallbacks")
+        jina_text = None
+        if not _is_jina_url:
+            jina_text = _jina_reader_fallback(url, max_chars)
+        if jina_text:
+            _jina_lower = jina_text[:1500].lower()
+            if "page not found" not in _jina_lower and "404" not in _jina_lower:
+                # For table extraction from Jina text, do a quick parse
+                if extract == "table" or css_selector:
+                    parsed = _parse_html_content(
+                        jina_text, url, 200, extract, css_selector, max_chars, 0)
+                    parsed["source"] = "jina_reader (blocklisted domain)"
+                    return parsed
+                return {
+                    "ok": True, "content": jina_text, "url": url,
+                    "blocked": False, "reason": "", "status_code": 200,
+                    "retries": 0, "source": "jina_reader (blocklisted domain)",
+                    "_full_length": _get_cached_full_length(url),
+                }
+        # Jina failed or skipped — try Wayback (skip if URL is already a Wayback URL)
+        if not _is_archive_url:
+            try:
+                wb_result = fetch_cached(url=url, max_chars=max_chars)
+                if wb_result.get("ok") and wb_result.get("content", "").strip():
+                    wb_result["source"] = "wayback (blocklisted domain)"
+                    return wb_result
+            except Exception:
+                pass
+        # Last resort: try direct anyway — the block may have been transient
+        _domain_rate_wait(domain)
+        try:
+            _lr_resp = httpx.get(url, headers=_BROWSER_HEADERS, timeout=timeout, follow_redirects=True)
+            if _lr_resp.status_code < 400:
+                _lr_blocked, _, _ = _is_blocked(_lr_resp.text, _lr_resp.status_code)
+                if not _lr_blocked and len(_lr_resp.text.strip()) > 200:
+                    parsed = _parse_html_content(
+                        _lr_resp.text, _lr_resp.url, _lr_resp.status_code,
+                        extract, css_selector, max_chars, 0)
+                    parsed["source"] = "direct (last-resort, blocklisted domain)"
+                    return parsed
+        except Exception:
+            pass
+        return {
+            "ok": False, "content": "", "url": url,
+            "blocked": True, "reason": f"Domain {domain} is blocklisted; Jina, Wayback, and direct all failed",
+            "status_code": 0, "retries": 0,
+            "hint": "Do NOT retry this URL. Search for the same information from a different source.",
+        }
+
+    # ── Check URL response cache ─────────────────────────────────────
+    with _url_cache_lock:
+        _cached = _url_cache.get(url)
+    if _cached:
+        _c_html, _c_final_url, _c_status, _c_ts = _cached
+        if time.time() - _c_ts < _URL_CACHE_TTL:
+            logger.debug(f"URL cache hit for {url} ({len(_c_html)} chars, age {time.time()-_c_ts:.0f}s)")
+            parsed = _parse_html_content(
+                _c_html, _c_final_url, _c_status,
+                extract, css_selector, max_chars, 0)
+            parsed["source"] = "cache"
+            return parsed
+        else:
+            # Expired — remove
+            with _url_cache_lock:
+                _url_cache.pop(url, None)
+
+    # ── Normal path: single direct probe ──────────────────────────────
+    # Known-hostile domains: skip direct entirely, go Jina first
+    if domain in _JINA_FIRST_DOMAINS:
+        logger.debug(f"Domain {domain} in JINA_FIRST — skipping direct fetch")
+        jina_text = _jina_reader_fallback(url, max_chars)
+        if jina_text:
+            _jina_lower = jina_text[:1500].lower()
+            if "page not found" not in _jina_lower and "404" not in _jina_lower:
+                if extract == "table" or css_selector:
+                    parsed = _parse_html_content(
+                        jina_text, url, 200, extract, css_selector, max_chars, 0)
+                    parsed["source"] = "jina_reader (jina-first domain)"
+                    return parsed
+                return {
+                    "ok": True, "content": jina_text, "url": url,
+                    "blocked": False, "reason": "", "status_code": 200,
+                    "retries": 0, "source": "jina_reader (jina-first domain)",
+                    "_full_length": _get_cached_full_length(url),
+                }
+        # Jina failed — try Wayback
+        try:
+            wb_result = fetch_cached(url=url, max_chars=max_chars)
+            if wb_result.get("ok") and wb_result.get("content", "").strip():
+                wb_result["source"] = "wayback (jina-first domain)"
+                return wb_result
+        except Exception:
+            pass
+        # Last resort: try direct anyway — even hostile domains sometimes
+        # serve partial content (paywall intro, first paragraphs) that's
+        # better than returning nothing at all.
+        _domain_rate_wait(domain)
+        try:
+            _lr_resp = httpx.get(url, headers=_BROWSER_HEADERS, timeout=timeout, follow_redirects=True)
+            if _lr_resp.status_code < 400:
+                _lr_blocked, _, _ = _is_blocked(_lr_resp.text, _lr_resp.status_code)
+                if not _lr_blocked and len(_lr_resp.text.strip()) > 200:
+                    parsed = _parse_html_content(
+                        _lr_resp.text, _lr_resp.url, _lr_resp.status_code,
+                        extract, css_selector, max_chars, 0)
+                    parsed["source"] = "direct (last-resort, jina-first domain)"
+                    return parsed
+        except Exception:
+            pass
+        return {
+            "ok": False, "content": "", "url": url,
+            "blocked": True, "reason": f"Domain {domain} is hostile; Jina, Wayback, and direct all failed",
+            "status_code": 0, "retries": 0,
+            "hint": "Do NOT retry this URL. Search for the same information from a different source.",
+        }
+
+    # Per-domain rate limiting: wait if we recently fetched from this domain
+    _domain_rate_wait(domain)
 
     for attempt in range(1 + max_retries):
         try:
             resp = httpx.get(
-                url, headers=_BROWSER_HEADERS, cookies=cookies,
+                url, headers=_BROWSER_HEADERS,
                 timeout=timeout, follow_redirects=True,
             )
-            # Persist any cookies the server set
-            cookies.update(resp.cookies)
             last_status = resp.status_code
 
             if resp.status_code >= 400:
-                blocked, reason = True, f"HTTP {resp.status_code}"
-                last_error = reason
+                blocked, reason, is_cf = _is_blocked(resp.text, resp.status_code)
+                last_error = reason if blocked else f"HTTP {resp.status_code}"
                 retries_done = attempt
-                if attempt < max_retries:
-                    time.sleep(1.5 * (attempt + 1))  # backoff
+                if is_cf:
+                    # Cloudflare — blocklist and skip to Jina immediately
+                    _block_domain(domain)
+                    logger.debug(f"Cloudflare detected on {domain} — blocklisted, going to Jina")
+                    break
+                # Non-CF error: retry once for transient issues (500, 502, timeout)
+                if attempt < max_retries and resp.status_code in (500, 502, 503, 504):
+                    time.sleep(1.5 * (attempt + 1))
                     continue
-                break  # fall through to Jina
+                break  # 4xx or exhausted retries
 
             # ── Detect binary/PDF responses before parsing as HTML ─────
             content_type = resp.headers.get("content-type", "")
             if "application/pdf" in content_type or (
                 resp.content[:5] == b"%PDF-" and "html" not in content_type
             ):
-                # URL serves a PDF — extract text with read_pdf instead of
-                # returning binary garbage through the HTML parser.
                 try:
                     pdf_text = read_pdf(url, max_chars=max_chars)
                     if pdf_text and len(pdf_text.strip()) > 20:
@@ -492,7 +1014,6 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
                         }
                 except Exception as pdf_err:
                     logger.debug(f"PDF extraction failed for {url}: {pdf_err}")
-                # If PDF extraction failed, return structured error
                 return {
                     "ok": False, "content": "", "url": str(resp.url),
                     "blocked": False, "reason": "URL serves a PDF file that could not be parsed",
@@ -501,68 +1022,41 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
                 }
 
             # Check for soft blocks (200 but Cloudflare challenge page, etc.)
-            blocked, reason = _is_blocked(resp.text, resp.status_code)
+            blocked, reason, is_cf = _is_blocked(resp.text, resp.status_code)
             if blocked:
                 last_error = reason
                 retries_done = attempt
+                if is_cf:
+                    _block_domain(domain)
+                    logger.debug(f"Soft Cloudflare block on {domain} — blocklisted, going to Jina")
+                    break  # skip to Jina immediately, no retries
+                # Non-CF soft block: retry once
                 if attempt < max_retries:
                     time.sleep(1.5 * (attempt + 1))
                     continue
-                break  # fall through to Jina
+                break
 
             # ── Parse successfully ────────────────────────────────────
-            content_type = resp.headers.get("content-type", "")
-            raw = resp.text
+            parsed = _parse_html_content(
+                resp.text, resp.url, resp.status_code,
+                extract, css_selector, max_chars, attempt)
 
-            # Detect XML vs HTML
-            if "xml" in content_type or raw.lstrip()[:20].startswith("<?xml"):
-                parser = "xml"
-            else:
-                parser = "html.parser"
-
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
-                soup = BeautifulSoup(raw, parser)
-
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                tag.decompose()
-
-            # Apply CSS selector if provided
-            if css_selector:
-                selected = soup.select(css_selector)
-                if selected:
-                    from bs4 import BeautifulSoup as BS
-                    combined = "\n".join(str(el) for el in selected)
-                    soup = BS(combined, "html.parser")
-
-            if extract == "table":
-                tables = soup.find_all("table")
-                rows = []
-                for tbl in tables:
-                    for tr in tbl.find_all("tr"):
-                        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                        rows.append(" | ".join(cells))
-                content = "\n".join(rows)[:max_chars] if rows else ""
-                if not content:
-                    content = soup.get_text(separator="\n", strip=True)[:max_chars]
-            else:
-                content = soup.get_text(separator="\n", strip=True)[:max_chars]
-
-            # Suspiciously short? Might be a JS-only page
-            if len(content) < 200 and resp.status_code == 200:
+            # Suspiciously short? Might be a JS-only page → try Jina
+            if len(parsed["content"]) < 200 and resp.status_code == 200:
                 jina_text = _jina_reader_fallback(url, max_chars)
-                if jina_text and len(jina_text) > len(content):
+                if jina_text and len(jina_text) > len(parsed["content"]):
                     return {
                         "ok": True, "content": jina_text, "url": str(resp.url),
                         "blocked": False, "reason": "", "status_code": 200,
                         "retries": attempt, "source": "jina_reader",
+                        "_full_length": _get_cached_full_length(url),
                     }
 
-            return {
-                "ok": True, "content": content, "url": str(resp.url),
-                "blocked": False, "reason": "", "status_code": resp.status_code,
-                "retries": attempt,
-            }
+            # ── Cache the raw HTML for future calls to the same URL ────
+            with _url_cache_lock:
+                _url_cache[url] = (resp.text, str(resp.url), resp.status_code, time.time())
+
+            return parsed
 
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
@@ -572,19 +1066,17 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
                 continue
             break
 
-    # ── All direct attempts failed — try Jina Reader ──────────────────
+    # ── Direct failed — try Jina Reader ───────────────────────────────
     jina_text = _jina_reader_fallback(url, max_chars)
     if jina_text:
-        # Sanity-check: if Jina returned a "Page Not Found" style page,
-        # don't treat it as success.
         _jina_lower = jina_text[:1500].lower()
         if "page not found" not in _jina_lower and "404" not in _jina_lower:
             return {
                 "ok": True, "content": jina_text, "url": url,
                 "blocked": False, "reason": "", "status_code": last_status,
                 "retries": retries_done, "source": "jina_reader",
+                "_full_length": _get_cached_full_length(url),
             }
-        # Jina returned a 404 page — fall through to Wayback
         logger.debug(f"Jina Reader returned a 404 page for {url}, trying Wayback")
 
     # ── Wayback Machine auto-fallback ─────────────────────────────────
@@ -607,7 +1099,7 @@ def fetch_url(url: str, max_chars: int = 8000, extract: str = "text",
         ),
     }
 
-def read_pdf(url: str, max_chars: int = 8000) -> str:
+def read_pdf(url: str, max_chars: int = 12000) -> str:
     """Download and extract text from a PDF at a URL."""
     import httpx, io
     import pypdf
@@ -624,14 +1116,166 @@ def read_pdf(url: str, max_chars: int = 8000) -> str:
     return text[:max_chars]
 
 
+# ── Shared table parsing ──────────────────────────────────────────────
+def _parse_tables_from_soup(soup, max_chars: int = 12000,
+                            css_selector: str = "") -> dict:
+    """Parse <table> elements from a BeautifulSoup object into structured data.
+
+    Shared by extract_tables and fetch_url(extract="table").
+    Returns a dict with rich per-table metadata (headers, caption,
+    nearest heading, row count, preview rows) and truncation info.
+
+    Args:
+        soup: BeautifulSoup object (already cleaned of script/style/nav).
+        max_chars: Soft cap on total JSON output size for table data.
+        css_selector: Optional CSS selector to target specific table(s).
+
+    Returns:
+        Dict with keys:
+          tables: list of table dicts (each with 'meta' and 'rows')
+          tables_found: total tables on page (before filtering)
+          tables_returned: tables included in output
+          truncated: whether any tables were dropped due to char limit
+          layout_tables_skipped: count of trivial layout tables filtered
+    """
+    # Locate tables
+    if css_selector:
+        containers = soup.select(css_selector)
+        tables_html = []
+        for c in containers:
+            if c.name == "table":
+                tables_html.append(c)
+            else:
+                tables_html.extend(c.find_all("table"))
+    else:
+        tables_html = soup.find_all("table")
+
+    total_found = len(tables_html)
+
+    # Filter out layout tables (≤2 rows AND ≤2 columns)
+    data_tables = []
+    layout_skipped = 0
+    for tbl in tables_html:
+        rows = tbl.find_all("tr")
+        if len(rows) <= 2:
+            max_cols = max(
+                (len(tr.find_all(["td", "th"])) for tr in rows), default=0
+            )
+            if max_cols <= 2:
+                layout_skipped += 1
+                continue
+        data_tables.append(tbl)
+
+    if not data_tables:
+        return {
+            "tables": [],
+            "tables_found": total_found,
+            "tables_returned": 0,
+            "truncated": False,
+            "layout_tables_skipped": layout_skipped,
+        }
+
+    all_tables = []
+    total_chars = 0
+    truncated = False
+
+    for idx, tbl in enumerate(data_tables):
+        # ── Extract headers ───────────────────────────────────────
+        headers = []
+        thead = tbl.find("thead")
+        if thead:
+            headers = [th.get_text(strip=True) for th in thead.find_all(["th", "td"])]
+        if not headers:
+            first_row = tbl.find("tr")
+            if first_row and first_row.find("th"):
+                headers = [th.get_text(strip=True) for th in first_row.find_all("th")]
+
+        # ── Extract all data rows ─────────────────────────────────
+        rows_data = []
+        body_rows = tbl.find_all("tr")
+        start_idx = 1 if headers else 0
+        for tr in body_rows[start_idx:]:
+            cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if not cells or all(c == "" for c in cells):
+                continue
+            if headers:
+                row_dict = {}
+                for i, h in enumerate(headers):
+                    row_dict[h or f"col_{i}"] = cells[i] if i < len(cells) else ""
+                for i in range(len(headers), len(cells)):
+                    row_dict[f"col_{i}"] = cells[i]
+                rows_data.append(row_dict)
+            else:
+                row_dict = {f"col_{i}": c for i, c in enumerate(cells)}
+                rows_data.append(row_dict)
+
+        if not rows_data:
+            continue
+
+        # ── Table context metadata ────────────────────────────────
+        # Caption
+        caption_tag = tbl.find("caption")
+        caption = caption_tag.get_text(strip=True) if caption_tag else ""
+
+        # Nearest heading (walk backwards through previous siblings / parents)
+        nearest_heading = ""
+        for prev in tbl.find_all_previous(["h1", "h2", "h3", "h4"]):
+            nearest_heading = prev.get_text(strip=True)
+            break
+
+        # Table id / class for re-targeting with css_selector
+        tbl_id = tbl.get("id", "")
+        tbl_classes = " ".join(tbl.get("class", []))
+
+        meta = {
+            "table_index": idx,
+            "headers": headers,
+            "caption": caption,
+            "nearest_heading": nearest_heading,
+            "total_rows": len(rows_data),
+            "preview_rows": rows_data[:2],
+        }
+        if tbl_id:
+            meta["id"] = tbl_id
+        if tbl_classes:
+            meta["class"] = tbl_classes
+
+        # ── Budget check ──────────────────────────────────────────
+        chunk = json.dumps(rows_data, ensure_ascii=False)
+        if total_chars + len(chunk) > max_chars and all_tables:
+            # Over budget — stop adding full tables but keep meta
+            truncated = True
+            # Add just the metadata (no rows) so model knows what was skipped
+            all_tables.append({"meta": meta, "rows": []})
+            continue
+
+        total_chars += len(chunk)
+        all_tables.append({"meta": meta, "rows": rows_data})
+
+    return {
+        "tables": all_tables,
+        "tables_found": total_found,
+        "tables_returned": sum(1 for t in all_tables if t["rows"]),
+        "truncated": truncated,
+        "layout_tables_skipped": layout_skipped,
+    }
+
+
 # ── extract_tables ────────────────────────────────────────────────────
 def extract_tables(url: str, max_chars: int = 12000, css_selector: str = "",
                    timeout: int = 20) -> dict:
     """Extract HTML tables from a URL as structured JSON arrays.
 
-    Returns a dict with 'ok', 'tables' (list of list-of-dicts), 'url', etc.
-    Each table is a list of row-dicts keyed by header names. If the table
-    has no <thead>/<th>, column names default to "col_0", "col_1", …
+    Returns a dict with 'ok', 'tables' (list of table dicts with 'meta' and
+    'rows'), truncation info, and per-table context metadata.
+
+    Each table dict has:
+      meta: {table_index, headers, caption, nearest_heading, total_rows,
+             preview_rows, id?, class?}
+      rows: list of row-dicts keyed by header names (empty if truncated)
+
+    The function uses the same robust fetch pipeline as fetch_url:
+    direct probe → Cloudflare detection → Jina Reader fallback → Wayback.
 
     Args:
         url: URL to fetch.
@@ -643,89 +1287,169 @@ def extract_tables(url: str, max_chars: int = 12000, css_selector: str = "",
     from bs4 import BeautifulSoup
     import warnings
 
-    try:
-        resp = httpx.get(
-            url, headers=_BROWSER_HEADERS, cookies=_get_cookie_jar(),
-            timeout=timeout, follow_redirects=True,
+    domain = _extract_domain(url)
+    html_text = None
+    final_url = url
+    source = "direct"
+
+    # ── Fetch with robustness (mirrors fetch_url strategy) ────────────
+    # 1. If domain is blocklisted or known-hostile, skip direct
+    if _is_domain_blocked(domain) or domain in _JINA_FIRST_DOMAINS:
+        _skip_reason = "blocklisted" if _is_domain_blocked(domain) else "jina-first"
+        logger.debug(f"[extract_tables] Domain {domain} {_skip_reason} — going Jina")
+    else:
+        # Per-domain rate limiting before direct probe
+        _domain_rate_wait(domain)
+        # Direct probe
+        try:
+            resp = httpx.get(
+                url, headers=_BROWSER_HEADERS,
+                timeout=timeout, follow_redirects=True,
+            )
+            final_url = str(resp.url)
+
+            if resp.status_code < 400:
+                blocked, reason, is_cf = _is_blocked(resp.text, resp.status_code)
+                if blocked:
+                    if is_cf:
+                        _block_domain(domain)
+                        logger.debug(f"[extract_tables] Cloudflare on {domain} — blocklisted")
+                    # Fall through to Jina
+                else:
+                    html_text = resp.text
+            else:
+                blocked, reason, is_cf = _is_blocked(resp.text, resp.status_code)
+                if is_cf:
+                    _block_domain(domain)
+                logger.debug(f"[extract_tables] HTTP {resp.status_code} from {url}")
+        except Exception as e:
+            logger.debug(f"[extract_tables] Direct fetch failed: {e}")
+
+    # 2. Jina Reader fallback — request HTML so we get <table> elements
+    #    (text/plain returns Markdown which has no parseable <table> tags)
+    #    Skip if URL is already a Jina URL (avoids circular fetch)
+    _is_archive_url = "web.archive.org" in domain
+    _is_jina_url = "r.jina.ai" in domain or "s.jina.ai" in domain
+
+    if html_text is None and not _is_jina_url:
+        jina_text = _jina_reader_fallback(
+            url, max_chars=100000, accept="text/html",
+            wait_for_selector="table",
         )
-        _get_cookie_jar().update(resp.cookies)
+        if jina_text and len(jina_text.strip()) > 50:
+            html_text = jina_text
+            source = "jina_reader"
+            logger.debug(f"[extract_tables] Using Jina Reader (HTML) for {url}")
 
-        if resp.status_code >= 400:
-            return {"ok": False, "tables": [], "url": str(resp.url),
-                    "reason": f"HTTP {resp.status_code}"}
+    # 3. Wayback fallback (skip if URL is already a Wayback URL)
+    if html_text is None and not _is_archive_url:
+        try:
+            wb_result = fetch_cached(url=url, max_chars=100000)
+            if wb_result.get("ok") and wb_result.get("content", "").strip():
+                html_text = wb_result["content"]
+                source = "wayback"
+                logger.debug(f"[extract_tables] Using Wayback for {url}")
+        except Exception:
+            pass
 
+    # 4. Last-resort direct fetch for blocklisted/jina-first domains
+    #    (skipped above, but Jina+Wayback both failed — try direct anyway)
+    if html_text is None and (_is_domain_blocked(domain) or domain in _JINA_FIRST_DOMAINS):
+        _domain_rate_wait(domain)
+        try:
+            resp = httpx.get(
+                url, headers=_BROWSER_HEADERS,
+                timeout=timeout, follow_redirects=True,
+            )
+            final_url = str(resp.url)
+            if resp.status_code < 400:
+                _lr_blocked, _, _ = _is_blocked(resp.text, resp.status_code)
+                if not _lr_blocked and len(resp.text.strip()) > 200:
+                    html_text = resp.text
+                    source = "direct (last-resort)"
+                    logger.debug(f"[extract_tables] Last-resort direct succeeded for {url}")
+        except Exception as e:
+            logger.debug(f"[extract_tables] Last-resort direct failed: {e}")
+
+    if html_text is None:
+        return {
+            "ok": False, "tables": [], "url": final_url,
+            "tables_found": 0, "tables_returned": 0, "truncated": False,
+            "reason": f"Could not fetch {url} (direct, Jina, and Wayback all failed)",
+            "hint": "Do NOT retry this URL. Search for the same data from a different source.",
+        }
+
+    # ── Parse HTML → soup ─────────────────────────────────────────────
+    try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup = BeautifulSoup(html_text, "html.parser")
 
-        if css_selector:
-            containers = soup.select(css_selector)
-            tables_html = []
-            for c in containers:
-                if c.name == "table":
-                    tables_html.append(c)
-                else:
-                    tables_html.extend(c.find_all("table"))
-        else:
-            tables_html = soup.find_all("table")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
 
-        if not tables_html:
-            return {"ok": False, "tables": [], "url": str(resp.url),
-                    "reason": "No <table> elements found on page",
-                    "hint": "Try fetch_url with extract='text' instead."}
+        result = _parse_tables_from_soup(soup, max_chars=max_chars, css_selector=css_selector)
 
-        all_tables = []
-        total_chars = 0
-        for tbl in tables_html:
-            # Determine headers
-            headers = []
-            thead = tbl.find("thead")
-            if thead:
-                headers = [th.get_text(strip=True) for th in thead.find_all(["th", "td"])]
-            if not headers:
-                first_row = tbl.find("tr")
-                if first_row and first_row.find("th"):
-                    headers = [th.get_text(strip=True) for th in first_row.find_all("th")]
+        if not result["tables"]:
+            # ── Heuristic retry: if direct fetch returned 0 tables but the URL
+            #    looks like a data page, the tables may be JS-rendered.  Try
+            #    Jina HTML mode before giving up (Jina renders JS).
+            _table_url_hints = ("data", "table", "stat", "rank", "list",
+                                "score", "result", "standing", "leaderboard",
+                                "dashboard", "chart", "report", "index")
+            _url_lower = url.lower()
+            _looks_like_data_page = any(h in _url_lower for h in _table_url_hints)
 
-            rows_data = []
-            body_rows = tbl.find_all("tr")
-            start_idx = 1 if headers else 0  # skip header row
-            for tr in body_rows[start_idx:]:
-                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if not cells or all(c == "" for c in cells):
-                    continue
-                if headers:
-                    row_dict = {}
-                    for i, h in enumerate(headers):
-                        row_dict[h or f"col_{i}"] = cells[i] if i < len(cells) else ""
-                    for i in range(len(headers), len(cells)):
-                        row_dict[f"col_{i}"] = cells[i]
-                    rows_data.append(row_dict)
-                else:
-                    row_dict = {f"col_{i}": c for i, c in enumerate(cells)}
-                    rows_data.append(row_dict)
+            if source == "direct" and _looks_like_data_page:
+                logger.debug(f"[extract_tables] 0 tables from direct but URL hints at data — retrying via Jina HTML")
+                jina_html = _jina_reader_fallback(
+                    url, max_chars=100000, accept="text/html",
+                    wait_for_selector="table",
+                )
+                if jina_html and len(jina_html.strip()) > 200:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message=".*XMLParsedAsHTMLWarning.*")
+                        soup2 = BeautifulSoup(jina_html, "html.parser")
+                    for tag in soup2(["script", "style", "nav", "footer", "header", "aside"]):
+                        tag.decompose()
+                    result2 = _parse_tables_from_soup(soup2, max_chars=max_chars, css_selector=css_selector)
+                    if result2["tables"]:
+                        result2["source"] = "jina_reader (table-retry)"
+                        result2["ok"] = True
+                        result2["url"] = final_url
+                        return result2
+                    logger.debug(f"[extract_tables] Jina HTML retry also returned 0 tables")
 
-            if rows_data:
-                chunk = json.dumps(rows_data, ensure_ascii=False)
-                total_chars += len(chunk)
-                all_tables.append(rows_data)
-                if total_chars > max_chars:
-                    break
+            return {
+                "ok": False, "tables": [], "url": final_url,
+                "tables_found": result["tables_found"],
+                "tables_returned": 0,
+                "truncated": False,
+                "layout_tables_skipped": result["layout_tables_skipped"],
+                "reason": "No data tables found on page (layout-only tables were filtered)",
+                "hint": "Try fetch_url with extract='text' instead, or use css_selector to target a specific element.",
+                "source": source,
+            }
 
         return {
             "ok": True,
-            "tables": all_tables,
-            "table_count": len(all_tables),
-            "url": str(resp.url),
+            "tables": result["tables"],
+            "tables_found": result["tables_found"],
+            "tables_returned": result["tables_returned"],
+            "truncated": result["truncated"],
+            "layout_tables_skipped": result["layout_tables_skipped"],
+            "table_count": result["tables_returned"],
+            "url": final_url,
+            "source": source,
         }
 
     except Exception as e:
-        return {"ok": False, "tables": [], "url": url,
+        return {"ok": False, "tables": [], "url": final_url,
                 "reason": f"{type(e).__name__}: {e}"}
 
 
 # ── wikipedia_lookup ──────────────────────────────────────────────────
-def wikipedia_lookup(title: str, section: str = "", max_chars: int = 8000) -> dict:
+def wikipedia_lookup(title: str, section: str = "", max_chars: int = 12000) -> dict:
     """Look up a Wikipedia article via the MediaWiki API.
 
     Returns parsed wikitext for the whole article or a specific section.
@@ -835,7 +1559,7 @@ def wikipedia_lookup(title: str, section: str = "", max_chars: int = 8000) -> di
 
 
 # ── fetch_cached (Wayback Machine) ───────────────────────────────────
-def fetch_cached(url: str, date: str = "", max_chars: int = 8000) -> dict:
+def fetch_cached(url: str, date: str = "", max_chars: int = 12000) -> dict:
     """Fetch a cached version of a URL from the Wayback Machine.
 
     Args:
@@ -1322,7 +2046,7 @@ def fetch_url_wrapper(**kwargs):
             if '#' in raw_title:
                 raw_title = raw_title.split('#')[0]
             logger.info(f"[fetch_url] Wikipedia URL detected — redirecting to wikipedia_lookup(title='{raw_title}')")
-            result_str, _ = wikipedia_lookup_wrapper(title=raw_title, max_chars=kwargs.get("max_chars", 8000))
+            result_str, _ = wikipedia_lookup_wrapper(title=raw_title, max_chars=kwargs.get("max_chars", 12000))
             return f"[Auto-redirected to wikipedia_lookup for reliable Wikipedia access]\n\n{result_str}", None
 
         # ── Early PDF detection by URL extension ──────────────────────
@@ -1331,13 +2055,13 @@ def fetch_url_wrapper(**kwargs):
         if url_path.endswith(".pdf"):
             try:
                 logger.info(f"[fetch_url] PDF URL detected — trying read_pdf first: {url}")
-                pdf_text = read_pdf(url=url, max_chars=kwargs.get("max_chars", 8000))
+                pdf_text = read_pdf(url=url, max_chars=kwargs.get("max_chars", 12000))
                 if pdf_text and len(pdf_text.strip()) > 30:
                     return f"[PDF detected by URL — extracted with read_pdf]\n\n{pdf_text}", None
             except Exception as pdf_err:
                 logger.debug(f"[fetch_url] read_pdf failed for {url}: {pdf_err} — falling through to normal fetch")
 
-        max_chars = kwargs.get("max_chars", 8000)
+        max_chars = kwargs.get("max_chars", 12000)
         extract = kwargs.get("extract", "text")
         css_selector = kwargs.get("css_selector", "")
         result = fetch_url(url=url, max_chars=max_chars, extract=extract, css_selector=css_selector)
@@ -1348,6 +2072,17 @@ def fetch_url_wrapper(**kwargs):
                 output = f"[Succeeded after {result['retries']} retry(ies), final URL: {result['url']}]\n\n{output}"
             if result.get("source") == "jina_reader":
                 output = f"[Rendered via Jina Reader]\n\n{output}"
+
+            # ── Truncation hint: tell the agent full page is cached ───
+            full_len = result.get("_full_length", 0)
+            shown_len = len(result["content"])
+            if full_len > shown_len + 200:
+                output += (
+                    f"\n\n[PAGE TRUNCATED: showing {shown_len:,} of {full_len:,} chars. "
+                    f"Full page is cached — call read_page(url=\"{url}\", offset={shown_len}) "
+                    f"to read more, or spawn_agent with this URL for focused analysis.]"
+                )
+
             return output, None
         else:
             # ── B: Add Wikipedia hint on 403 from Wikipedia domains ───
@@ -1362,6 +2097,59 @@ def fetch_url_wrapper(**kwargs):
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
 
+def read_page(url: str, offset: int = 0, max_chars: int = 12000) -> str:
+    """Read a section of a previously-fetched page from the parsed-text cache.
+
+    Pages are cached automatically when fetch_url succeeds.  This tool lets
+    you paginate through the full content without re-fetching or re-parsing.
+
+    Args:
+        url: The same URL passed to the earlier fetch_url call.
+        offset: Character offset to start reading from (0-based).
+        max_chars: Maximum characters to return (default: 12000).
+
+    Returns:
+        The requested text slice, or an error if the page isn't cached.
+    """
+    with _page_text_cache_lock:
+        cached = _page_text_cache.get(url)
+    if not cached:
+        return f"ERROR: No cached page for '{url}'. Call fetch_url(url=...) first."
+
+    full_text, ts = cached
+    if time.time() - ts > _URL_CACHE_TTL:
+        with _page_text_cache_lock:
+            _page_text_cache.pop(url, None)
+        return f"ERROR: Cached page for '{url}' has expired. Call fetch_url(url=...) again."
+
+    total = len(full_text)
+    if offset >= total:
+        return f"ERROR: offset {offset} is past end of page ({total:,} chars)."
+
+    chunk = full_text[offset : offset + max_chars]
+    end_pos = offset + len(chunk)
+    remaining = total - end_pos
+
+    header = f"[Page: {url}] chars {offset:,}–{end_pos:,} of {total:,}"
+    if remaining > 0:
+        header += f" ({remaining:,} remaining — read_page(offset={end_pos}) for next chunk)"
+
+    return f"{header}\n\n{chunk}"
+
+
+def read_page_wrapper(**kwargs):
+    """Wrapper for read_page tool. Returns (output, None)."""
+    try:
+        url = kwargs.get("url")
+        if not url:
+            return "ERROR: 'url' parameter is required", None
+        offset = int(kwargs.get("offset", 0))
+        max_chars_val = int(kwargs.get("max_chars", 12000))
+        return read_page(url=url, offset=offset, max_chars=max_chars_val), None
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {str(e)}", None
+
+
 def read_pdf_wrapper(**kwargs):
     """Wrapper for read_pdf tool. Returns (output, None)."""
     try:
@@ -1369,7 +2157,7 @@ def read_pdf_wrapper(**kwargs):
         if not url:
             return "ERROR: 'url' parameter is required", None
 
-        max_chars = kwargs.get("max_chars", 8000)
+        max_chars = kwargs.get("max_chars", 12000)
         text = read_pdf(url=url, max_chars=max_chars)
         return text, None
     except Exception as e:
@@ -1388,11 +2176,26 @@ def extract_tables_wrapper(**kwargs):
         result = extract_tables(url=url, max_chars=max_chars, css_selector=css_selector)
 
         if result["ok"]:
-            output = json.dumps({
+            out_dict = {
                 "table_count": result["table_count"],
+                "tables_found": result["tables_found"],
+                "tables_returned": result["tables_returned"],
+                "truncated": result["truncated"],
                 "url": result["url"],
                 "tables": result["tables"],
-            }, ensure_ascii=False, indent=2)
+            }
+            if result.get("source") and result["source"] != "direct":
+                out_dict["source"] = result["source"]
+            if result.get("layout_tables_skipped"):
+                out_dict["layout_tables_skipped"] = result["layout_tables_skipped"]
+            if result["truncated"]:
+                out_dict["hint"] = (
+                    f"Output was truncated — showed {result['tables_returned']} of "
+                    f"{result['tables_found']} tables. Use css_selector to target "
+                    "a specific table. Truncated tables include metadata (headers, "
+                    "caption, heading) but no rows — re-fetch with their css_selector."
+                )
+            output = json.dumps(out_dict, ensure_ascii=False, indent=2)
             return output, None
         else:
             return json.dumps(result, indent=2), None
@@ -1408,7 +2211,7 @@ def wikipedia_lookup_wrapper(**kwargs):
             return "ERROR: 'title' parameter is required", None
 
         section = kwargs.get("section", "")
-        max_chars = kwargs.get("max_chars", 8000)
+        max_chars = kwargs.get("max_chars", 12000)
         result = wikipedia_lookup(title=title, section=section, max_chars=max_chars)
 
         if result["ok"]:
@@ -1435,7 +2238,7 @@ def fetch_cached_wrapper(**kwargs):
             return "ERROR: 'url' parameter is required", None
 
         date = kwargs.get("date", "")
-        max_chars = kwargs.get("max_chars", 8000)
+        max_chars = kwargs.get("max_chars", 12000)
         result = fetch_cached(url=url, date=date, max_chars=max_chars)
 
         if result["ok"]:
@@ -1505,6 +2308,8 @@ def recall_memory_wrapper(_memory_store=None, **kwargs):
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
 
+
+
 def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: Optional[str] = None, reasoning_effort: Optional[str] = None, _sandbox_files: Optional[dict] = None, _memory_store=None):
     """Route tool calls to appropriate wrapper function.
     
@@ -1549,11 +2354,12 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
         return wikipedia_lookup_wrapper(**tool_args)
     elif tool_name == "fetch_cached":
         return fetch_cached_wrapper(**tool_args)
+    elif tool_name == "read_page":
+        return read_page_wrapper(**tool_args)
     elif tool_name == "recall_memory":
         return recall_memory_wrapper(_memory_store=_memory_store, **tool_args)
     else:
         return f"ERROR: Unknown tool '{tool_name}'", None
-
 
 # Define the tool schemas for vLLM
 TOOLS = [
@@ -1671,8 +2477,8 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters of extracted text to return (default: 8000).",
-                    "default": 8000
+                    "description": "Maximum characters of extracted text to return (default: 12000).",
+                    "default": 12000
                 },
                 "extract": {
                     "type": "string",
@@ -1752,8 +2558,8 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum number of characters of extracted text to return (default: 8000).",
-                    "default": 8000
+                    "description": "Maximum number of characters of extracted text to return (default: 12000).",
+                    "default": 12000
                 }
             },
             "required": ["url"]
@@ -1789,8 +2595,8 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters of text to return (default: 8000).",
-                    "default": 8000
+                    "description": "Maximum characters of text to return (default: 12000).",
+                    "default": 12000
                 }
             },
             "required": ["title"]
@@ -1826,8 +2632,41 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters of extracted text to return (default: 8000).",
-                    "default": 8000
+                    "description": "Maximum characters of extracted text to return (default: 12000).",
+                    "default": 12000
+                }
+            },
+            "required": ["url"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "read_page",
+        "description": (
+            "Read a section of a previously-fetched page from cache. "
+            "Pages are cached automatically when fetch_url succeeds.\\n\\n"
+            "Use this when fetch_url returned a [PAGE TRUNCATED] notice and you need "
+            "to read more of the page. Supports pagination via the offset parameter.\\n\\n"
+            "This is MUCH cheaper than re-calling fetch_url — no network request, instant response."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL previously fetched with fetch_url."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Character offset to start reading from (default: 0). Use the offset from the truncation notice.",
+                    "default": 0
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters to return (default: 12000).",
+                    "default": 12000
                 }
             },
             "required": ["url"]
@@ -2026,6 +2865,33 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "think",
+            "description": (
+                "Pause and reflect on your progress. Use this after every search or "
+                "fetch to assess what you found before taking the next action.\n\n"
+                "WHEN TO CALL:\n"
+                "  - After search_web: What results look promising? What's missing?\n"
+                "  - After fetch_url: Did I find the specific data I need?\n"
+                "  - After execute_code: Did the computation succeed? Is the result reasonable?\n"
+                "  - Before final_answer: Is my answer complete and well-sourced?\n\n"
+                "This costs nothing — it just helps you stay organized and avoid "
+                "wasting turns on unproductive searches."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Your assessment: what you found, what's missing, what to do next."
+                    }
+                },
+                "required": ["thought"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_available_tools",
             "description": (
                 "Look up the tools you have available and their parameter schemas. "
@@ -2193,6 +3059,81 @@ ROOT_TOOLS = [
                     }
                 },
                 "required": ["thought"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_webpage",
+            "description": (
+                "Fetch a URL and produce a focused, LLM-generated summary. "
+                "Use when you already know a specific URL and want distilled "
+                "information without spawning a full research sub-agent.\n\n"
+                "This is a lightweight tool (single fetch + single LLM call) — "
+                "much faster than conduct_research for targeted page reads.\n\n"
+                "USE WHEN:\n"
+                "  - A sub-agent returned a URL you want to read in more detail\n"
+                "  - You need specific data from a known page\n"
+                "  - You want a focused extraction (e.g. 'revenue figures only')\n\n"
+                "DO NOT USE WHEN:\n"
+                "  - You need to search for pages (use conduct_research instead)\n"
+                "  - You need multi-step research (search → fetch → analyze)"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch and summarize."
+                    },
+                    "focus": {
+                        "type": "string",
+                        "description": (
+                            "What to focus on when summarizing. Guides the LLM to "
+                            "extract specific information. E.g. 'revenue figures for "
+                            "2024', 'main arguments about climate policy', 'biographical "
+                            "details and career timeline'."
+                        )
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compress_findings",
+            "description": (
+                "Compress and structure all research findings collected so far "
+                "using an LLM. Returns a concise, organized summary of everything "
+                "you know, with gaps identified.\n\n"
+                "This tool reads your MemoryStore (all conduct_research results) "
+                "and produces a structured digest WITHOUT entering the raw data "
+                "into your context. Keeps your context lean.\n\n"
+                "USE WHEN:\n"
+                "  - You have 5+ research results and need to take stock\n"
+                "  - Before writing your first draft (to organize your material)\n"
+                "  - When your context feels cluttered and you need a clean summary\n"
+                "  - To identify what's well-supported vs. what has gaps\n\n"
+                "RETURNS: Structured summary organized by theme, with citations "
+                "and a 'gaps & contradictions' section."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": (
+                            "Optional focus to prioritize during compression. "
+                            "E.g. 'focus on quantitative data and statistics' or "
+                            "'prioritize information about environmental impact'. "
+                            "If omitted, all findings are compressed equally."
+                        )
+                    }
+                },
+                "required": []
             }
         }
     },

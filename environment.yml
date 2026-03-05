@@ -15,6 +15,7 @@ dependencies:
       - openai>=2.0
       - google-genai>=1.0.0
       - duckduckgo-search>=7.0
+      - trafilatura>=2.0
       - torch>=2.9
       - transformers
       - matplotlib

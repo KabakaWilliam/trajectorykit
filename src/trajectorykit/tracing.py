@@ -28,6 +28,8 @@ class ToolCallRecord:
     duration_s: float = 0.0
     # If this tool call was spawn_agent, the child's full trace is here
     child_trace: Optional["EpisodeTrace"] = None
+    # Auxiliary data (verifier results, link checks, etc.) — appears in JSON trace
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -412,6 +414,101 @@ body {
 .tool-result { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); color: var(--success); }
 .tool-error { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); color: var(--error); }
 
+/* ── Verifier metadata block ── */
+.verifier-block {
+  margin-top: 10px; padding: 10px 14px; border-radius: 3px;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px;
+}
+.verifier-block.approved { background: #f0faf0; border-color: var(--success); }
+.verifier-block.rejected { background: #fdf0f0; border-color: var(--error); }
+.verifier-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 3px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; margin-bottom: 8px;
+}
+.verifier-badge.approved { background: var(--success); color: white; }
+.verifier-badge.rejected { background: var(--error); color: white; }
+.verifier-detail {
+  margin-top: 6px; padding: 8px; background: var(--white);
+  border: 1px solid var(--border); border-radius: 3px;
+  max-height: 300px; overflow-y: auto; white-space: pre-wrap;
+  word-break: break-word; font-size: 11px; color: var(--text-mid);
+}
+.verifier-section-label {
+  font-size: 9px; color: var(--text-light); text-transform: uppercase;
+  letter-spacing: 0.1em; margin-top: 8px; margin-bottom: 4px;
+}
+
+/* ── Spot-check metadata block ── */
+.spotcheck-block {
+  margin-top: 8px; padding: 10px 14px; border-radius: 3px;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px;
+}
+.spotcheck-block.passed { background: #f0faf0; border-color: var(--success); }
+.spotcheck-block.failed { background: #fdf0f0; border-color: var(--error); }
+.spotcheck-block.challenged { background: #fff8f0; border-color: #e67e22; }
+.spotcheck-block.justified { background: #f0f6fa; border-color: #3498db; }
+.spotcheck-block.skipped { background: #fffcf0; border-color: #f1c40f; }
+.spotcheck-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 3px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; margin-bottom: 8px;
+}
+.spotcheck-badge.passed { background: var(--success); color: white; }
+.spotcheck-badge.failed { background: var(--error); color: white; }
+.spotcheck-badge.challenged { background: #e67e22; color: white; }
+.spotcheck-badge.justified { background: #3498db; color: white; }
+.spotcheck-badge.skipped { background: #f1c40f; color: #333; }
+.spotcheck-claims {
+  margin-top: 6px; padding: 8px; background: var(--white);
+  border: 1px solid var(--border); border-radius: 3px; font-size: 11px;
+}
+.spotcheck-claim-item {
+  padding: 4px 0; border-bottom: 1px solid #eee; color: var(--text-mid);
+}
+.spotcheck-claim-item:last-child { border-bottom: none; }
+.spotcheck-toggle {
+  cursor: pointer; color: var(--accent); font-size: 10px;
+  text-decoration: underline; margin-top: 4px; display: inline-block;
+}
+
+/* ── Draft card ── */
+.draft-card {
+  margin-top: 10px; padding: 14px 16px; border-radius: 4px;
+  border: 1px solid #c8d6e5; background: #f8fafe;
+  font-family: var(--sans); font-size: 13px; line-height: 1.6;
+}
+.draft-card.published {
+  border-color: var(--success); background: #f0faf0;
+}
+.draft-card.rejected {
+  border-color: var(--error); background: #fdf8f8;
+}
+.draft-badge {
+  display: inline-block; padding: 2px 8px; border-radius: 3px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; margin-bottom: 8px;
+  font-family: var(--mono);
+}
+.draft-badge.version { background: #c8d6e5; color: #2c3e50; }
+.draft-badge.published { background: var(--success); color: white; }
+.draft-badge.rejected { background: var(--error); color: white; }
+.draft-meta {
+  font-family: var(--mono); font-size: 10px; color: var(--text-light);
+  margin-bottom: 8px;
+}
+.draft-content {
+  padding: 10px 12px; background: var(--white); border: 1px solid var(--border);
+  border-radius: 3px; max-height: 400px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word; font-size: 12px;
+  color: var(--text); line-height: 1.65;
+}
+.draft-toggle {
+  cursor: pointer; color: var(--accent); font-size: 10px;
+  text-decoration: underline; margin-top: 6px; display: inline-block;
+  font-family: var(--mono);
+}
+
 /* ── Sub-agent spawn ── */
 .spawn-card {
   border-left: 3px solid var(--depth-1); padding: 12px 16px;
@@ -599,6 +696,92 @@ def _depth_badge(depth: int) -> str:
     return f'<span class="turn-badge {cls}">{label}</span>'
 
 
+def _render_verification_meta(meta: dict) -> list[str]:
+    """Render verifier + spot-check metadata blocks. Returns HTML fragments."""
+    parts: list[str] = []
+    verdict = meta.get("verification_verdict", "")
+    response = meta.get("verification_response", "")
+    link_report = meta.get("link_check_report", "")
+    attempt = meta.get("verification_attempt", "")
+
+    if verdict == "APPROVED":
+        v_cls = "approved"
+    elif verdict in ("REVISION_NEEDED", "SPOT_CHECK_FAILED"):
+        v_cls = "rejected"
+    else:
+        v_cls = ""
+    badge_label = verdict or "VERIFIED"
+    attempt_str = f" (attempt {attempt})" if attempt else ""
+
+    parts.append(f'<div class="verifier-block {v_cls}">')
+    parts.append(f'<span class="verifier-badge {v_cls}">\U0001f50d {_esc(badge_label)}{_esc(attempt_str)}</span>')
+
+    if response:
+        parts.append(f'<div class="verifier-section-label">Verifier Response</div>')
+        parts.append(f'<div class="verifier-detail">{_esc(response)}</div>')
+
+    if link_report:
+        parts.append(f'<div class="verifier-section-label">Link Check</div>')
+        parts.append(f'<div class="verifier-detail">{_esc(link_report)}</div>')
+
+    parts.append('</div>')  # .verifier-block
+
+    # ── Spot-check metadata ───────────────────────────────────────
+    sc = meta.get("spot_check")
+    if sc:
+        sc_verdict = sc.get("spot_check_verdict", "")
+        sc_skipped = sc.get("spot_check_skipped_reason", "")
+        sc_claims_n = sc.get("claims_checked", 0)
+        sc_extract = sc.get("extract_response", "")
+        sc_compare = sc.get("compare_response", "")
+        sc_refusal = sc.get("refusal_challenge_response", "")
+        sc_degraded = sc.get("degraded_claims", 0)
+
+        if sc_verdict == "PASSED":
+            sc_cls = "passed"
+        elif sc_verdict in ("FAILED", "SPOT_CHECK_FAILED"):
+            sc_cls = "failed"
+        elif sc_verdict == "REFUSAL_CHALLENGED":
+            sc_cls = "challenged"
+        elif sc_verdict == "REFUSAL_JUSTIFIED":
+            sc_cls = "justified"
+        elif sc_skipped:
+            sc_cls = "skipped"
+        else:
+            sc_cls = ""
+
+        sc_label = sc_verdict or (f"SKIPPED ({sc_skipped})" if sc_skipped else "RAN")
+        parts.append(f'<div class="spotcheck-block {sc_cls}">')
+        parts.append(f'<span class="spotcheck-badge {sc_cls}">\U0001f9ea Spot-Check: {_esc(sc_label)}</span>')
+
+        if sc_claims_n:
+            parts.append(f'<div class="verifier-section-label">Claims Checked: {sc_claims_n}</div>')
+        if sc_degraded:
+            parts.append(f'<div class="verifier-section-label">Degraded Evidence: {sc_degraded}/{sc_claims_n}</div>')
+
+        if sc_extract:
+            _sc_ext_id = f"sc-extract-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Claim Extraction</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_sc_ext_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_sc_ext_id}" class="verifier-detail" style="display:none">{_esc(sc_extract)}</div>')
+
+        if sc_compare:
+            _sc_cmp_id = f"sc-compare-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Claim Comparison</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_sc_cmp_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_sc_cmp_id}" class="verifier-detail" style="display:none">{_esc(sc_compare)}</div>')
+
+        if sc_refusal:
+            _sc_ref_id = f"sc-refusal-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Refusal Challenge</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_sc_ref_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_sc_ref_id}" class="verifier-detail" style="display:none">{_esc(sc_refusal)}</div>')
+
+        parts.append('</div>')  # .spotcheck-block
+
+    return parts
+
+
 def _render_tool_block(tc: dict) -> str:
     """Render a single tool call as a collapsible tool-block."""
     tname = _esc(tc.get("tool_name", "?"))
@@ -625,25 +808,84 @@ def _render_tool_block(tc: dict) -> str:
     )
     parts.append('<div class="tool-block-body">')
 
-    # Arguments
-    parts.append(f'<div style="font-size:9px;color:var(--text-light);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">Arguments</div>')
-    parts.append(f'<pre class="tool-args-pre">{_esc(args_json)}</pre>')
+    # ── refine_draft: styled draft card ──────────────────────────────
+    if tname == "refine_draft":
+        draft_content = targs.get("content", "")
+        # Parse version / char count from output: "✅ Draft v3 saved (1,639 chars)."
+        _ver_m = re.search(r"Draft v(\d+) saved \(([^)]+)\)", toutput)
+        is_rejected = toutput.startswith("Draft too short")
 
-    # Output / result
-    if display_output.strip():
-        # Detect actual errors — but not DDG fallback results or search results
-        # that merely mention the word "error" in their content.
-        _lower_head = display_output.lower()[:80]
-        is_error = (
-            _lower_head.startswith("error:") or
-            _lower_head.startswith("err:") or
-            "traceback" in _lower_head
-        )
-        result_cls = "tool-error" if is_error else "tool-result"
-        parts.append(f'<div class="{result_cls}">')
-        parts.append(f'<div style="font-size:9px;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">{"Error" if is_error else "Result"}</div>')
-        parts.append(f'<pre class="tool-output-pre">{_esc(display_output)}</pre>')
-        parts.append('</div>')
+        if _ver_m:
+            ver_num, char_info = _ver_m.group(1), _ver_m.group(2)
+            parts.append('<div class="draft-card">')
+            parts.append(f'<span class="draft-badge version">\U0001f4dd Draft v{_esc(ver_num)}</span>')
+            parts.append(f'<span class="draft-meta">{_esc(char_info)}</span>')
+        elif is_rejected:
+            parts.append('<div class="draft-card rejected">')
+            parts.append(f'<span class="draft-badge rejected">\u26a0\ufe0f Rejected</span>')
+            parts.append(f'<span class="draft-meta">{_esc(toutput.split(chr(10))[0])}</span>')
+        else:
+            parts.append('<div class="draft-card">')
+            parts.append('<span class="draft-badge version">\U0001f4dd Draft</span>')
+
+        if draft_content:
+            _dc_id = f"draft-{id(tc)}"
+            preview = draft_content[:500]
+            parts.append(f'<div class="draft-content">{_esc(preview)}')
+            if len(draft_content) > 500:
+                parts.append(f'<span id="{_dc_id}" style="display:none">{_esc(draft_content[500:])}</span>')
+                parts.append(f'<span class="draft-toggle" onclick="var e=document.getElementById(\'{_dc_id}\');if(e.style.display===\'none\'){{e.style.display=\'inline\';this.textContent=\'collapse\'}}else{{e.style.display=\'none\';this.textContent=\'show full draft\'}}">&hellip; show full draft</span>')
+            parts.append('</div>')  # .draft-content
+        parts.append('</div>')  # .draft-card
+
+    # ── research_complete: published / rejected draft + verification ──
+    elif tname == "research_complete":
+        meta = tc.get("metadata", {})
+        verdict = meta.get("verification_verdict", "")
+        is_approved = verdict == "APPROVED"
+
+        if is_approved:
+            parts.append('<div class="draft-card published">')
+            parts.append('<span class="draft-badge published">\u2705 Published</span>')
+            _dc_id = f"draft-pub-{id(tc)}"
+            preview = toutput[:600]
+            parts.append(f'<div class="draft-content">{_esc(preview)}')
+            if len(toutput) > 600:
+                parts.append(f'<span id="{_dc_id}" style="display:none">{_esc(toutput[600:])}</span>')
+                parts.append(f'<span class="draft-toggle" onclick="var e=document.getElementById(\'{_dc_id}\');if(e.style.display===\'none\'){{e.style.display=\'inline\';this.textContent=\'collapse\'}}else{{e.style.display=\'none\';this.textContent=\'show full draft\'}}">&hellip; show full draft</span>')
+            parts.append('</div>')  # .draft-content
+            parts.append('</div>')  # .draft-card
+        else:
+            badge_text = '\u274c Revision Needed' if verdict == 'REVISION_NEEDED' else f'\u26a0\ufe0f {_esc(verdict or "Reviewing")}'
+            parts.append('<div class="draft-card rejected">')
+            parts.append(f'<span class="draft-badge rejected">{badge_text}</span>')
+            if toutput.strip():
+                parts.append(f'<div class="draft-content">{_esc(toutput)}</div>')
+            parts.append('</div>')  # .draft-card
+
+        # Verification metadata (always present for research_complete)
+        if meta:
+            parts.extend(_render_verification_meta(meta))
+
+    # ── Generic tool rendering ───────────────────────────────────────
+    else:
+        # Arguments
+        parts.append(f'<div style="font-size:9px;color:var(--text-light);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">Arguments</div>')
+        parts.append(f'<pre class="tool-args-pre">{_esc(args_json)}</pre>')
+
+        # Output / result
+        if display_output.strip():
+            _lower_head = display_output.lower()[:80]
+            is_error = (
+                _lower_head.startswith("error:") or
+                _lower_head.startswith("err:") or
+                "traceback" in _lower_head
+            )
+            result_cls = "tool-error" if is_error else "tool-result"
+            parts.append(f'<div class="{result_cls}">')
+            parts.append(f'<div style="font-size:9px;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">{"Error" if is_error else "Result"}</div>')
+            parts.append(f'<pre class="tool-output-pre">{_esc(display_output)}</pre>')
+            parts.append('</div>')
 
     parts.append('</div>')  # .tool-block-body
 

@@ -16,7 +16,7 @@ model:
 # ── Agent behavior ─────────────────────────────────────────────────────
 agent:
   max_recursion_depth: 1
-  sub_agent_turn_budget: 15
+  sub_agent_turn_budget: 10
   token_safety_margin: 256
   # Symbolic references: compress large tool outputs to summaries at depth 0.
   # Full data stays in MemoryStore; the LLM sees a compact reference.
@@ -25,6 +25,11 @@ agent:
   # Research plan: inject a structured progress tracker every N turns.
   plan_state: false
   plan_inject_interval: 3         # inject plan every N turns
+  # Pre-publish verification: LLM audits draft before research_complete publishes.
+  verify_before_publish: true
+  # Stage 2 spot-check: after consistency passes, search-verify key claims.
+  spot_check_enabled: true
+  spot_check_claims: 3            # max claims to verify per spot-check
 
 # ── Sandbox ────────────────────────────────────────────────────────────
 sandbox:
@@ -38,6 +43,9 @@ traces:
 prompts:
   orchestrator: "configs/prompts/orchestrator.txt"
   worker: "configs/prompts/worker.txt"
+  verifier: "configs/prompts/verifier.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
 
 # ── Model profiles ─────────────────────────────────────────────────────
 # Each model's capabilities and defaults. Add new models here.

@@ -28,6 +28,7 @@ dependencies = [
     "python-dotenv",
     "pyyaml",
     "duckduckgo-search>=7.0",
+    "trafilatura>=2.0",
 ]
 
 [project.urls]

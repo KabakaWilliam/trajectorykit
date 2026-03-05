@@ -27,6 +27,11 @@ agent:
   plan_state: true
   plan_inject_interval: 3         # inject plan every N turns
   draft_report: true              # update_draft tool at root for answer safety net
+  verify_before_publish: true      # LLM audits draft before publishing
+  spot_check_enabled: true          # Stage 2: search-verify key claims
+  spot_check_claims: 5
+  max_verification_rejections: 5    # Stage 1: verifier can reject up to N times before force-publish
+  max_spot_check_rejections: 5      # Stage 2: spot-check can reject up to N times before force-publish
 
 sandbox:
   url: "http://localhost:8080/run_code"
@@ -41,6 +46,9 @@ traces:
 prompts:
   orchestrator: "configs/prompts/orchestrator.txt"
   worker: "configs/prompts/worker.txt"
+  verifier: "configs/prompts/verifier.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
 
 model_profiles:
   "Qwen/Qwen3-8B":
@@ -70,10 +78,13 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: null
-  workers: 10
+  workers: 8
 
 judge:
   enabled: true
   model: "gpt-4.1-mini" #gemini-2.5-flash #gpt-4.1-mini
   threads: 5
   # rpm: 5   # uncomment to throttle (free tier = 5 RPM). Omit or null for unlimited (paid tier).
+
+# need to re-run tomorrow with the fixed cookie issue
+# our main limitation seems to be data fetching.

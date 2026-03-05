@@ -17,7 +17,7 @@ vllm:
 
 agent:
   max_recursion_depth: 1
-  sub_agent_turn_budget: 15
+  sub_agent_turn_budget: 10
   token_safety_margin: 256
 
 sandbox:
@@ -34,6 +34,8 @@ prompts:
   orchestrator: "configs/prompts/orchestrator.txt"
   worker: "configs/prompts/worker.txt"
   synthesizer: "configs/prompts/synthesizer.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
 
 model_profiles:
   "Qwen/Qwen3-8B":

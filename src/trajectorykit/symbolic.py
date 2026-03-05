@@ -40,7 +40,8 @@ def make_symbolic(
         f"[Stored → {memory_key}]\n"
         f"{summary}\n"
         f"({len(output):,} chars in memory — "
-        f"use spawn_agent to analyse details or retrieve during synthesis)"
+        f"use read_page(url=..., offset=...) to paginate, "
+        f"or spawn_agent(memory_keys=['{memory_key}']) for deep analysis)"
     )
 
 

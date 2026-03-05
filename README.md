@@ -146,7 +146,7 @@ sandbox:
 
 agent:
   max_recursion_depth: 1
-  sub_agent_turn_budget: 15
+  sub_agent_turn_budget: 10
 
 dataset:
   name: "google/deepsearchqa"
