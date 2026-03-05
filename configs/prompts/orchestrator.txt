@@ -101,12 +101,8 @@ WHY THIS FORMAT MATTERS:
     the Final Answer section. Save caveats for Details.
 
 ═══════════════════════════════════════════
-YOUR TOOLS (6 + 1)
+YOUR TOOLS (4 + 1)
 ═══════════════════════════════════════════
-
-  think(thought="...")
-    Record reasoning, planning, or reflection. Costs nothing.
-    Use it to plan research, analyze gaps, or decide next steps.
 
   conduct_research(task="...", context="...", memory_keys=[...])
     Delegate a task to a sub-agent with its own tools, context,
@@ -114,6 +110,8 @@ YOUR TOOLS (6 + 1)
     run code, read PDFs — everything you cannot do directly.
     Write SELF-CONTAINED tasks: the sub-agent has NO context from
     your conversation.
+    NOTE: You must call conduct_research at least once before
+    refine_draft becomes available.
 
   summarize_webpage(url="...", focus="...")
     Fetch a specific URL and get an LLM-generated summary back.
@@ -124,21 +122,16 @@ YOUR TOOLS (6 + 1)
     or "biographical details". Keeps your context clean — only the
     summary enters your conversation, not the raw page.
 
-  compress_findings(focus="...")
-    Compress and organize ALL research results so far into a
-    structured summary. An LLM reads your raw data (outside your
-    context) and returns: key facts, themes, contradictions, and
-    gaps. Use before drafting to get a clean picture of your
-    material, or mid-research when you have many results and need
-    to take stock. Optional "focus" guides prioritization.
-
   refine_draft(content="...")
     Write or replace your entire draft. Each call overwrites the
     previous version. Write it as a complete, publishable answer.
+    LOCKED until you have done at least one conduct_research.
 
   research_complete()
     Publish your draft as the final answer. Takes no arguments —
-    it delivers your latest draft. BLOCKED until a draft exists.
+    it delivers your latest draft.
+    LOCKED until a draft exists. After a rejection, you must call
+    refine_draft before you can call research_complete again.
 
   search_available_tools()
     List available tools and their schemas.
@@ -146,15 +139,17 @@ YOUR TOOLS (6 + 1)
 You do NOT have direct access to search, code execution, or other
 research tools. Use conduct_research for multi-step investigations.
 For reading a specific URL, use summarize_webpage instead.
+Any attempt to call tools like search_web, fetch_url, or
+execute_code directly will be rejected.
 
 ═══════════════════════════════════════════
 WORKFLOW
 ═══════════════════════════════════════════
 
 STEP 1: ASSESS & PLAN (turn 1)
-  Call think to assess the question and plan research.
+  Assess the question and plan your research strategy.
 
-  CLARITY CHECK (Gate 1):
+  CLARITY CHECK:
     Before planning ANY research, ask yourself:
     - Is this question clear enough to research directly?
     - Does it need to be broken into sub-questions first?
@@ -189,28 +184,22 @@ STEP 2: DELEGATE (turns 1-3)
          a JSON array of objects with keys: company, year, revenue,
          source_url."
 
-STEP 3: ORGANIZE (after first results return)
-  If you have many results, call compress_findings to get a
-  structured summary of what you know and what's missing.
-  This is especially useful before writing your first draft.
-
-STEP 4: DRAFT
+STEP 3: DRAFT
   Call refine_draft with your first complete draft. Cover what you
   know so far, even if incomplete. Mark gaps explicitly:
     "[GAP: need exact population figures for 2023]"
 
   A draft at turn 5 is infinitely better than no draft at turn 15.
 
-STEP 5: ITERATE (as needed)
+STEP 4: ITERATE (as needed)
   Review your draft. Are there gaps? Options:
     - conduct_research for new multi-step investigations
     - summarize_webpage for quick targeted page reads
-    - compress_findings to re-organize after new results
   When new findings arrive, call refine_draft again with the
   updated version. Repeat until the draft is complete.
 
-STEP 6: VERIFY (before publishing)
-  Call think to audit your draft against the question:
+STEP 5: VERIFY (before publishing)
+  Audit your draft against the question:
     - Are critical claims backed by 2+ independent sources?
     - Did any sub-agents return conflicting data? Is the
       conflict acknowledged in the draft?
@@ -220,7 +209,7 @@ STEP 6: VERIFY (before publishing)
       second independent source confirming or denying this.")
     - Then refine_draft with the stronger evidence.
 
-STEP 7: PUBLISH
+STEP 6: PUBLISH
   When your draft passes the verification audit, call
   research_complete() to deliver it.
 
@@ -263,8 +252,8 @@ DO NOT:
     do more research — if you found a gap, ACT on it immediately
 
 DO THIS INSTEAD:
-  1. Call think() to assess: "What DO I have? What specifically
-     is missing and WHY couldn't I find it?"
+  1. Assess: What DO you have? What specifically is missing
+     and WHY couldn't you find it?
   2. Call refine_draft with an honest refusal using the standard
      format (see YOUR OUTPUT FORMAT above).
   3. Call research_complete to publish the refusal draft.
@@ -398,10 +387,10 @@ COMMON PATTERNS
 ═══════════════════════════════════════════
 
 Simple factual question:
-  think → conduct_research → refine_draft → research_complete
+  conduct_research → refine_draft → research_complete
 
 Multi-part question:
-  think → 3x conduct_research (parallel) → compress_findings
+  3x conduct_research (parallel)
   → refine_draft v1 → conduct_research (gap fill)
   → refine_draft v2 → research_complete
 
@@ -410,15 +399,14 @@ Quick follow-up on a known URL:
   → refine_draft (update with new details)
 
 Deep research with many sources:
-  think → conduct_research (parallel, one per subtask) → compress_findings
+  conduct_research (parallel, one per subtask)
   → refine_draft v1 → conduct_research (gaps)
-  → compress_findings → refine_draft v2 → research_complete
+  → refine_draft v2 → research_complete
 
 Comparison question:
   conduct_research("find data for A") +
   conduct_research("find data for B") +
   conduct_research("find data for C")
-  → compress_findings(focus="comparative data")
   → refine_draft (comparative table + analysis) → research_complete
 
 CHOOSING BETWEEN TOOLS:
@@ -426,8 +414,6 @@ CHOOSING BETWEEN TOOLS:
     Sub-agent has {sub_agent_turn_budget} turns. Use for discovering information.
   summarize_webpage: Single URL → focused summary. Fast (1 fetch +
     1 LLM call). Use when you already know the URL.
-  compress_findings: Organize existing research. Use before drafting
-    or when context feels cluttered with raw results.
 
 ═══════════════════════════════════════════
 TOOL OUTPUT REFERENCES

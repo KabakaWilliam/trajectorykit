@@ -426,6 +426,8 @@ _JINA_FIRST_DOMAINS: frozenset[str] = frozenset({
     "www.bloomberg.com", "bloomberg.com",
     "www.economist.com", "economist.com",
     "www.theatlantic.com", "theatlantic.com",
+    # News — heavy CF / JS-rendered pages
+    "www.theguardian.com", "theguardian.com",
     # Heavy CF protection
     "www.glassdoor.com", "glassdoor.com",
     "www.linkedin.com", "linkedin.com",
@@ -467,6 +469,31 @@ _blocked_domains_lock = _threading.Lock()
 _URL_CACHE_TTL = 600  # seconds (10 min)
 _url_cache: dict[str, tuple[str, str, int, float]] = {}  # url → (html, final_url, status, ts)
 _url_cache_lock = _threading.Lock()
+
+# ── URL fetch counter + content fingerprint ───────────────────────────
+# Tracks how many times each URL has been requested across all agents in
+# the same process, plus a content hash so we can tell agents "you are
+# seeing identical content that N other agents already saw."
+import hashlib as _hashlib
+_url_fetch_counts: dict[str, int] = {}     # url → total fetch count
+_url_content_hashes: dict[str, str] = {}   # url → md5 hex of last content
+_url_fetch_meta_lock = _threading.Lock()
+
+def _record_url_access(url: str, content: str) -> tuple[int, bool]:
+    """Record a URL access.  Returns (fetch_count, content_unchanged).
+
+    fetch_count:       total number of times this URL has been requested.
+    content_unchanged: True if the content hash is the same as the previous
+                       fetch (i.e. the page hasn't changed).
+    """
+    h = _hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
+    with _url_fetch_meta_lock:
+        _url_fetch_counts[url] = _url_fetch_counts.get(url, 0) + 1
+        count = _url_fetch_counts[url]
+        prev = _url_content_hashes.get(url)
+        _url_content_hashes[url] = h
+        unchanged = prev is not None and prev == h
+    return count, unchanged
 
 # ── Parsed-text page cache: full cleaned text, keyed by URL ──────────
 # Populated by _parse_html_content *before* truncation so that read_page
@@ -2066,12 +2093,34 @@ def fetch_url_wrapper(**kwargs):
         css_selector = kwargs.get("css_selector", "")
         result = fetch_url(url=url, max_chars=max_chars, extract=extract, css_selector=css_selector)
 
+        # ── Track cross-agent fetch count + content fingerprint ────────
+        _content_for_hash = result.get("content", "") if result["ok"] else ""
+        _fetch_count, _content_unchanged = _record_url_access(url, _content_for_hash)
+
         if result["ok"]:
             output = result["content"]
             if result["retries"] > 0:
                 output = f"[Succeeded after {result['retries']} retry(ies), final URL: {result['url']}]\n\n{output}"
             if result.get("source") == "jina_reader":
                 output = f"[Rendered via Jina Reader]\n\n{output}"
+
+            # ── Repetition warning: other agents already saw this page ─
+            if _fetch_count > 1:
+                _rep_note = (
+                    f"\n\n[REPEATED URL ({_fetch_count}x): This URL has been fetched "
+                    f"{_fetch_count} times across agents in this session"
+                )
+                if _content_unchanged:
+                    _rep_note += (
+                        " and returned identical content each time. "
+                        "Other agents already tried to extract information from this "
+                        "page and could not get more than what you see above"
+                    )
+                _rep_note += (
+                    ". Do NOT spend additional effort on this URL — search for "
+                    "the information from a different source instead.]"
+                )
+                output += _rep_note
 
             # ── Truncation hint: tell the agent full page is cached ───
             full_len = result.get("_full_length", 0)
@@ -3098,42 +3147,6 @@ ROOT_TOOLS = [
                     }
                 },
                 "required": ["url"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "compress_findings",
-            "description": (
-                "Compress and structure all research findings collected so far "
-                "using an LLM. Returns a concise, organized summary of everything "
-                "you know, with gaps identified.\n\n"
-                "This tool reads your MemoryStore (all conduct_research results) "
-                "and produces a structured digest WITHOUT entering the raw data "
-                "into your context. Keeps your context lean.\n\n"
-                "USE WHEN:\n"
-                "  - You have 5+ research results and need to take stock\n"
-                "  - Before writing your first draft (to organize your material)\n"
-                "  - When your context feels cluttered and you need a clean summary\n"
-                "  - To identify what's well-supported vs. what has gaps\n\n"
-                "RETURNS: Structured summary organized by theme, with citations "
-                "and a 'gaps & contradictions' section."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "focus": {
-                        "type": "string",
-                        "description": (
-                            "Optional focus to prioritize during compression. "
-                            "E.g. 'focus on quantitative data and statistics' or "
-                            "'prioritize information about environmental impact'. "
-                            "If omitted, all findings are compressed equally."
-                        )
-                    }
-                },
-                "required": []
             }
         }
     },
