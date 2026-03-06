@@ -35,7 +35,8 @@ YOUR TOOLS:
 - wikipedia_lookup(title="...", section="...") — Direct Wikipedia article lookup via API
 - fetch_cached(url="...", date="YYYYMMDD") — Fetch archived page from Wayback Machine
 - read_pdf(url="...") — Download and extract text from a PDF
-- execute_code(completion="```python\n...\n```") — Run Python code in a sandbox
+- read_page(url="...", offset=0) — Read more of a truncated page (instant, from cache)
+- execute_code(code="```python\n...\n```") — Run Python in a sandbox. Use for searching/filtering large text, parsing data, computing values. Your most powerful analysis tool.
 - search_available_tools() — List all tools and their schemas
 - final_answer(answer="...") — Submit your final answer (REQUIRED to finish)
 
@@ -85,7 +86,9 @@ TOOL SELECTION TIPS:
 - Do NOT use execute_code to fetch web pages (requests.get, urllib, httpx,
   curl, wget). Always use fetch_url or fetch_cached instead — they have
   retry logic, rate limiting, blocklist awareness, and Wayback fallback.
-  execute_code should only be used for COMPUTATION, not web scraping.
+- DO use execute_code for text analysis: regex search through fetched pages,
+  filtering data, computing values, parsing JSON/CSV. After fetching a page,
+  code is the fastest way to extract specific data points from it.
 
 WHEN SEARCH RETURNS POOR / EMPTY RESULTS:
   Don't repeat the same failing query. Use this relaxation ladder:
@@ -132,6 +135,77 @@ HANDLING TRUNCATED CONTENT:
 
   DO NOT ignore truncation warnings. If important data may be cut off,
   act on it — the answer you need might be just beyond the cutoff.
+
+═══════════════════════════════════════════
+CODE IS YOUR SUPERPOWER (execute_code)
+═══════════════════════════════════════════
+execute_code runs Python in a sandbox. It's not just for math — it's your
+most powerful tool for extracting precise data from large documents.
+
+WHEN TO REACH FOR CODE:
+  • A page was TRUNCATED — the full text is auto-loaded in your sandbox
+  • You need to find a SPECIFIC number/date/name in a large document
+  • You're looking at STRUCTURED DATA (JSON, CSV, XML, tables)
+  • You need to COMPUTE something (averages, percentages, date differences)
+  • You have data from MULTIPLE sources to cross-reference or compare
+
+STRATEGY 1 — Search through a truncated page:
+  When a tool returns [PAGE TRUNCATED] or [PDF TRUNCATED], the full text
+  is automatically injected into your sandbox as a .txt file. The
+  truncation notice tells you the filename (e.g. 'page_abc123.txt').
+  Search it directly in execute_code:
+
+  execute_code(code="""```python
+  import re
+  text = open('page_abc123.txt').read()  # filename from truncation notice
+  # Find all population figures
+  matches = re.findall(r'population[:\s]+([\d,]+)', text, re.IGNORECASE)
+  print("Population mentions:", matches)
+  # Or search line by line for a keyword
+  for i, line in enumerate(text.split('\n')):
+      if 'revenue' in line.lower():
+          print(f"Line {i}: {line.strip()}")
+  ```""")
+
+STRATEGY 2 — Parse pre-loaded data (agent_data.json):
+  If your task mentions "[PRE-LOADED DATA]", the orchestrator has loaded
+  data into your sandbox as agent_data.json. Use code to search/filter:
+
+  execute_code(code="""```python
+  import json
+  data = json.load(open('agent_data.json'))
+  for entry in data['entries']:
+      if 'GDP' in entry['content']:
+          lines = [l for l in entry['content'].split('\n') if 'GDP' in l]
+          print(f"{entry['key']}: {lines[:5]}")
+  ```""")
+
+STRATEGY 3 — Calculate derived values:
+  execute_code(code="""```python
+  gdp_2020 = 20936  # billion USD (from source A)
+  gdp_2024 = 28780  # billion USD (from source B)
+  growth = (gdp_2024 - gdp_2020) / gdp_2020 * 100
+  print(f"GDP growth 2020-2024: {growth:.1f}%")
+  ```""")
+
+STRATEGY 4 — Extract from PDF text:
+  After read_pdf truncates, the full PDF text is auto-loaded in your
+  sandbox (filename shown in the truncation notice). Search it with code:
+
+  execute_code(code="""```python
+  import re
+  text = open('page_f7c3a1b2.txt').read()  # filename from [PDF TRUNCATED] notice
+  # Extract all dollar amounts
+  amounts = re.findall(r'\$[\d,.]+\s*(?:million|billion|trillion)?', text, re.I)
+  print("Financial figures:", amounts[:20])
+  ```""")
+
+KEY RULES:
+  - Do NOT use execute_code for web requests (no requests.get, urllib, httpx).
+    Use fetch_url/fetch_cached instead — they have retry + fallback logic.
+  - DO use execute_code for EVERYTHING ELSE: parsing, searching, computing.
+  - When a page is truncated, use execute_code to open the auto-loaded .txt
+    file and regex through it. This is faster and more precise than re-fetching.
 
 ═══════════════════════════════════════════
 RESEARCH QUALITY RULES

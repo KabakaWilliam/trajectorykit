@@ -65,17 +65,31 @@ CHAIN COHERENCE (if chain claims present)
 If claims include "depends_on" fields, they form a reasoning chain.
 Verify CHAIN INTEGRITY in addition to individual claim accuracy:
 
-  - Does the verified result of Step N match the entity used in
-    Step N+1? E.g., if Step 2 evidence says birthplace was
-    "Cincinnati" but Step 3 checked the population of "Columbus",
-    the chain is broken — flag it.
+  1. INTERMEDIATE VALIDATION
+     Each chain step's claim asserts an intermediate fact (e.g.
+     "the director of Jaws is Spielberg"). Verify this against
+     the evidence. If the evidence says the intermediate is
+     WRONG, this is a critical failure — flag it explicitly:
+     "CHAIN STEP N CONTRADICTED: evidence says [correct value]
+     instead of [claimed value]."
 
-  - If ANY link in the chain is contradicted by evidence, EVERY
-    downstream claim is suspect. Flag the broken link AND note
-    that subsequent claims depend on it.
+  2. ENTITY FLOW
+     Does the verified result of Step N match the entity used in
+     Step N+1? E.g., if Step 2 evidence says birthplace was
+     "Cincinnati" but Step 3 checked the population of "Columbus",
+     the chain is broken — flag it.
 
-  - A chain with all links individually verified AND coherently
-    connected end-to-end is strong evidence for the core answer.
+  3. CASCADE FAILURE
+     If ANY link in the chain is contradicted by evidence, EVERY
+     downstream claim is suspect. Flag the broken link AND note
+     that subsequent claims depend on it. The final answer
+     (usually Claim 1) inherits this failure.
+
+  4. END-TO-END CHECK
+     A chain with all links individually verified AND coherently
+     connected end-to-end is strong evidence for the core answer.
+     If all intermediate steps pass but the final answer doesn't
+     follow logically from the chain, flag that too.
 
 ═══════════════════════════════════════════
 OUTPUT FORMAT — CHOOSE EXACTLY ONE

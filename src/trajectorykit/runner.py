@@ -98,6 +98,62 @@ def _recover_final_answer_from_raw(raw_args: str) -> str | None:
     return None
 
 
+def _sanitize_raw_args(raw: str) -> dict | None:
+    """Try to recover valid JSON tool args from common model noise.
+
+    Handles patterns produced by models that wrap arguments in function-call
+    syntax (e.g. ``({...})`` instead of ``{...}``) or emit trailing garbage
+    after the closing brace.
+
+    Strategies (tried in order):
+      1. Strip trailing parens / whitespace and re-parse.
+      2. Find the outermost balanced ``{ ... }`` and parse that.
+
+    Returns the parsed dict on success, ``None`` on failure.
+    """
+    # Strategy 1: strip trailing noise  ─  covers  {…})  {…})\n  {…}) )
+    stripped = raw.rstrip(") \t\r\n")
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 2: extract the outermost balanced { … } block
+    start = raw.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    end = -1
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if c == "\\" and in_string:
+            escape_next = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
 def _extract_final_answer(assistant_msg: dict) -> str:
     """Extract the answer from a final_answer tool call in an assistant message.
 
@@ -332,43 +388,52 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
     # ── Budget-aware tool restriction (sub-agents only) ───────────────
     if state.depth > 0 and state.turn_length is not None:
         remaining = state.turn_length - state.turn
-        q_echo = state.user_input[:500] + ("\u2026" if len(state.user_input) > 500 else "")
-        _ckpt_interval = max(state.turn_length // 3, 2)
 
-        # Periodic checkpoint
-        if state.turn > 0 and state.turn % _ckpt_interval == 0 and remaining >= _ckpt_interval:
-            state.messages.append({"role": "system", "content": (
-                f"\U0001f4ca CHECKPOINT (turn {state.turn}/{state.turn_length}): "
-                "Pause and assess your progress.\n"
-                "  1. What key facts have you found so far?\n"
-                "  2. Do you have enough to answer the question?\n"
-                "  3. If YES \u2192 call final_answer now with what you have.\n"
-                "  4. If NO \u2192 what ONE specific thing is still missing?\n\n"
-                f"Question: {q_echo}\n\n"
-                "A good answer with 3 sources beats a perfect answer with 0. "
-                "Call think() to assess, then act."
-            )})
-            if state.verbose:
-                print(f"\U0001f4ca  Checkpoint injected (turn {state.turn}/{state.turn_length}, interval={_ckpt_interval})")
+        # Short-budget sub-agents (verifiers, refusal challengers) are
+        # purpose-built with tight budgets.  Injecting countdown messages
+        # leaks orchestration internals and distracts from the task.
+        # Only inject checkpoints / warnings for longer-running sub-agents.
+        _SHORT_BUDGET_THRESHOLD = 5
+        if state.turn_length > _SHORT_BUDGET_THRESHOLD:
+            q_echo = state.user_input[:500] + ("\u2026" if len(state.user_input) > 500 else "")
+            _ckpt_interval = max(state.turn_length // 3, 2)
 
-        # Escalating warnings
-        if remaining == 3:
-            state.messages.append({"role": "system", "content": (
-                "\u26a0\ufe0f BUDGET WARNING: You have 4 turns remaining (including this one). "
-                "Start synthesizing NOW. Call think() to organize your findings, "
-                "then call final_answer on the next turn.\n"
-                f"Question: {q_echo}"
-            )})
-        elif remaining == 2:
-            state.messages.append({"role": "system", "content": (
-                "\U0001f6a8 FINAL WARNING: 3 turns left. Call final_answer THIS TURN "
-                "or NEXT TURN. Do NOT start new searches."
-            )})
-        elif remaining == 1:
-            state.messages.append({"role": "system", "content": (
-                "\U0001f6a8 LAST CHANCE: 2 turns remaining. Call final_answer NOW."
-            )})
-        elif remaining == 0:
+            # Periodic checkpoint
+            if state.turn > 0 and state.turn % _ckpt_interval == 0 and remaining >= _ckpt_interval:
+                state.messages.append({"role": "system", "content": (
+                    f"\U0001f4ca CHECKPOINT (turn {state.turn}/{state.turn_length}): "
+                    "Pause and assess your progress.\n"
+                    "  1. What key facts have you found so far?\n"
+                    "  2. Do you have enough to answer the question?\n"
+                    "  3. If YES \u2192 call final_answer now with what you have.\n"
+                    "  4. If NO \u2192 what ONE specific thing is still missing?\n\n"
+                    f"Question: {q_echo}\n\n"
+                    "A good answer with 3 sources beats a perfect answer with 0. "
+                    "Call think() to assess, then act."
+                )})
+                if state.verbose:
+                    print(f"\U0001f4ca  Checkpoint injected (turn {state.turn}/{state.turn_length}, interval={_ckpt_interval})")
+
+            # Escalating warnings
+            if remaining == 3:
+                state.messages.append({"role": "system", "content": (
+                    "\u26a0\ufe0f BUDGET WARNING: You have 4 turns remaining (including this one). "
+                    "Start synthesizing NOW. Call think() to organize your findings, "
+                    "then call final_answer on the next turn.\n"
+                    f"Question: {q_echo}"
+                )})
+            elif remaining == 2:
+                state.messages.append({"role": "system", "content": (
+                    "\U0001f6a8 FINAL WARNING: 3 turns left. Call final_answer THIS TURN "
+                    "or NEXT TURN. Do NOT start new searches."
+                )})
+            elif remaining == 1:
+                state.messages.append({"role": "system", "content": (
+                    "\U0001f6a8 LAST CHANCE: 2 turns remaining. Call final_answer NOW."
+                )})
+
+        # Hard stop: restrict to terminal tool on final turn (all sub-agents)
+        if remaining == 0:
             tools_for_turn = [state.terminal_tool]
             if state.verbose:
                 print(f"\U0001f512 Restricting to {state.terminal_tool_name} only (last turn)")
@@ -934,7 +999,14 @@ def run_agent_loop(state: AgentState) -> Dict[str, Any]:
                 tool_args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
                 args_were_malformed = True
-                if tool_name in ("final_answer", "refine_draft") and raw_args:
+                # ── General sanitizer: strip common model noise ───────
+                _sanitized = _sanitize_raw_args(raw_args)
+                if _sanitized is not None:
+                    tool_args = _sanitized
+                    if state.verbose:
+                        print(f"   \U0001f527 Sanitized malformed args for {tool_name} "
+                              f"({len(raw_args)} raw chars → {len(tool_args)} keys)")
+                elif tool_name in ("final_answer", "refine_draft") and raw_args:
                     _recovered = _recover_final_answer_from_raw(raw_args)
                     if _recovered:
                         _param = "answer" if tool_name == "final_answer" else "content"
@@ -1006,6 +1078,33 @@ def run_agent_loop(state: AgentState) -> Dict[str, Any]:
                 turn_record.tool_calls.append(tc_record)
                 if state.verbose:
                     print(f"       🚫 Blocked root tool leakage: {tool_name}")
+                continue
+
+            # Sub-agents (depth>0) must not call orchestrator-only or
+            # recursion-inducing tools.  The tool list already excludes
+            # them (agent_state.py), but models sometimes hallucinate
+            # tool calls anyway.  Hard-block here as defence-in-depth.
+            _SUB_AGENT_BLOCKED = {"spawn_agent", "conduct_research", "recall_memory", "update_draft"}
+            if state.depth > 0 and tool_name in _SUB_AGENT_BLOCKED:
+                error_msg = (
+                    f"⛔ Tool '{tool_name}' is not available to sub-agents. "
+                    "You have search_web, fetch_url, execute_code, extract_tables, "
+                    "think, and final_answer. Use those tools directly to complete "
+                    "your task, then call final_answer with your results."
+                )
+                state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": error_msg,
+                })
+                tc_record = ToolCallRecord(
+                    tool_name=tool_name, tool_args=tool_args,
+                    tool_call_id=tool_call["id"], output=error_msg,
+                    duration_s=0.0,
+                )
+                turn_record.tool_calls.append(tc_record)
+                if state.verbose:
+                    print(f"       🚫 Blocked sub-agent recursion: {tool_name} at depth {state.depth}")
                 continue
 
             # ── Dispatch to handler ───────────────────────────────────

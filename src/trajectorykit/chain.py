@@ -99,6 +99,31 @@ class ChainPlan:
             step.resolved_value = value
             logger.info("Chain step %d resolved → %s", step_num, value[:100])
 
+    def contest_step(self, step_num: int) -> List[int]:
+        """Clear a chain step's resolved value and cascade to dependents.
+
+        Returns the list of step numbers that were cleared.
+        """
+        to_clear: set[int] = {step_num}
+        # Cascade: any step depending on a cleared step must also clear
+        changed = True
+        while changed:
+            changed = False
+            for s in self.chain_steps:
+                if s.step not in to_clear and s.depends_on in to_clear:
+                    to_clear.add(s.step)
+                    changed = True
+        cleared = []
+        for s in self.chain_steps:
+            if s.step in to_clear and s.is_resolved:
+                logger.info(
+                    "Chain step %d contested (was: %s)",
+                    s.step, s.resolved_value[:80] if s.resolved_value else "?",
+                )
+                s.resolved_value = None
+                cleared.append(s.step)
+        return sorted(cleared)
+
     def unresolved_dependencies_for(self, task_text: str) -> List[ChainStep]:
         """Return unresolved chain steps whose placeholders appear in task_text."""
         missing = []

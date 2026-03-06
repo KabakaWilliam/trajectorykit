@@ -695,6 +695,16 @@ body {
   0% { transform: scale(1.15); box-shadow: 0 0 0 4px rgba(45,138,86,0.3); }
   100% { transform: scale(1); box-shadow: 0 0 0 2px rgba(45,138,86,0.2); }
 }
+.chain-pill.contested {
+  color: var(--error); border-color: var(--error); background: #fde8e8;
+  font-weight: 600; box-shadow: 0 0 0 2px rgba(204,51,51,0.2);
+  animation: chain-contest-pulse 0.6s ease-out;
+  text-decoration: line-through;
+}
+@keyframes chain-contest-pulse {
+  0% { transform: scale(1.15); box-shadow: 0 0 0 4px rgba(204,51,51,0.3); }
+  100% { transform: scale(1); box-shadow: 0 0 0 2px rgba(204,51,51,0.2); }
+}
 
 /* ── Collapsible sub-agent groups ── */
 .sub-agent-group {
@@ -1133,6 +1143,22 @@ def _render_verification_meta(meta: dict) -> list[str]:
             parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_sc_ref_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
             parts.append(f'<div id="{_sc_ref_id}" class="verifier-detail" style="display:none">{_esc(sc_refusal)}</div>')
 
+        # Chain contestation display
+        sc_contested = sc.get("chain_contested", [])
+        if sc_contested:
+            parts.append(f'<div class="verifier-section-label" style="color:var(--error)">'
+                         f'⚠️ Chain Steps Contested: {len(sc_contested)}</div>')
+            for cr in sc_contested:
+                step_num = cr.get("step", "?")
+                old_val = _esc(str(cr.get("old_value", "?"))[:100])
+                reason = cr.get("reason", "")
+                reason_label = " (cascade)" if "cascade" in reason else ""
+                parts.append(
+                    f'<div class="verifier-detail" style="color:var(--error);padding:2px 0">'
+                    f'Step {step_num}: <s>{old_val}</s> — cleared{reason_label}'
+                    f'</div>'
+                )
+
         parts.append('</div>')  # .spotcheck-block
 
     return parts
@@ -1372,25 +1398,42 @@ def _render_chain_progress(chain_snapshot: Optional[list], prev_snapshot: Option
 
     Shows each step as a small pill: 🔒 locked, 🔓 unlocked, ✅ resolved.
     If a step just resolved this turn (wasn't resolved in prev_snapshot), highlight it.
+    If a step was resolved in prev_snapshot but is now cleared (contested by
+    spot-check), show it with a ⚠️ contested indicator.
     Returns empty string if no chain data.
     """
     if not chain_snapshot:
         return ""
 
     # Build previous resolution state for diff detection
-    prev_resolved = set()
+    prev_resolved: dict[int, str] = {}  # step_num -> resolved_value
     if prev_snapshot:
         for s in prev_snapshot:
-            if s.get("resolved_value"):
-                prev_resolved.add(s.get("step"))
+            rv = s.get("resolved_value")
+            if rv:
+                prev_resolved[s.get("step", 0)] = rv
 
     pills = []
+    has_contested = False
     for s in chain_snapshot:
         step_num = s.get("step", "?")
         resolved = s.get("resolved_value")
         lookup = s.get("lookup", "")[:60]
 
-        if resolved:
+        # Detect contested: was resolved before, now cleared
+        was_resolved = step_num in prev_resolved
+        just_contested = was_resolved and not resolved
+
+        if just_contested:
+            has_contested = True
+            old_val = prev_resolved.get(step_num, "?")
+            cls = "chain-pill contested"
+            icon = "⚠️"
+            tooltip = (
+                f"Step {step_num}: {lookup} — CONTESTED by spot-check "
+                f"(was: {_esc(str(old_val)[:60])})"
+            )
+        elif resolved:
             just_resolved = step_num not in prev_resolved
             cls = "chain-pill resolved" + (" just-resolved" if just_resolved else "")
             icon = "✅"
@@ -1417,9 +1460,13 @@ def _render_chain_progress(chain_snapshot: Optional[list], prev_snapshot: Option
             f'</span>'
         )
 
+    label = "⛓ Chain:"
+    if has_contested:
+        label = "⛓ Chain (contested):"
+
     return (
         '<div class="chain-progress">'
-        '<span class="chain-progress-label">⛓ Chain:</span>'
+        f'<span class="chain-progress-label">{label}</span>'
         + "".join(pills)
         + '</div>'
     )

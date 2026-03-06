@@ -864,6 +864,10 @@ def _jina_reader_fallback(url: str, max_chars: int = 12000,
         "x-timeout": "30",
         "x-wait-for-selector": _wfs,
     }
+    # Authenticate if a Jina API key is available (higher rate limits + priority)
+    _jina_key = os.getenv("JINA_API_KEY", "")
+    if _jina_key:
+        headers["Authorization"] = f"Bearer {_jina_key}"
     if target_selector:
         headers["x-target-selector"] = target_selector
 
@@ -920,6 +924,63 @@ def _jina_reader_fallback(url: str, max_chars: int = 12000,
             _page_text_cache[url] = (get_text, time.time())
         return get_text[:max_chars]
     return None
+
+
+def _exa_contents_fallback(url: str, max_chars: int = 12000) -> str | None:
+    """Fallback: use Exa.ai contents API to retrieve page text.
+
+    Exa maintains its own crawl index and can serve content even when
+    the live page blocks direct/Jina access or requires JS/cookies.
+
+    Sits between Jina and Wayback in the fallback chain.
+    Requires EXA_API_KEY in the environment (.env).
+
+    Returns cleaned text or None on failure / missing API key.
+    """
+    import httpx
+
+    api_key = os.getenv("EXA_API_KEY", "")
+    if not api_key:
+        return None
+
+    try:
+        resp = httpx.post(
+            "https://api.exa.ai/contents",
+            headers={
+                "x-api-key": api_key,
+                "Content-Type": "application/json",
+            },
+            json={
+                "ids": [url],
+                "text": {"maxCharacters": max_chars},
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            logger.debug(f"Exa contents API returned {resp.status_code} for {url}")
+            return None
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            logger.debug(f"Exa contents API returned no results for {url}")
+            return None
+
+        text = results[0].get("text", "").strip()
+        if len(text) < 50:
+            logger.debug(f"Exa contents returned only {len(text)} chars for {url}")
+            return None
+
+        # Cache for read_page / memory
+        with _page_text_cache_lock:
+            _page_text_cache[url] = (text, time.time())
+
+        logger.info(f"[fetch_url] Exa contents fallback succeeded for {url} ({len(text)} chars)")
+        return text[:max_chars]
+
+    except Exception as e:
+        logger.debug(f"Exa contents fallback failed for {url}: {e}")
+        return None
 
 
 def _parse_html_content(resp_text: str, resp_url, resp_status_code: int,
@@ -1168,7 +1229,16 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
                     "retries": 0, "source": "jina_reader (blocklisted domain)",
                     "_full_length": _get_cached_full_length(url),
                 }
-        # Jina failed or skipped — try Wayback (skip if URL is already a Wayback URL)
+        # Jina failed or skipped — try Exa contents
+        exa_text = _exa_contents_fallback(url, max_chars)
+        if exa_text:
+            return {
+                "ok": True, "content": exa_text, "url": url,
+                "blocked": False, "reason": "", "status_code": 200,
+                "retries": 0, "source": "exa_contents (blocklisted domain)",
+                "_full_length": len(exa_text),
+            }
+        # Exa failed — try Wayback (skip if URL is already a Wayback URL)
         if not _is_archive_url:
             try:
                 wb_result = fetch_cached(url=url, max_chars=max_chars)
@@ -1269,7 +1339,16 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
                     "retries": 0, "source": "jina_reader (jina-first domain)",
                     "_full_length": _get_cached_full_length(url),
                 }
-        # Jina failed — try Wayback
+        # Jina failed — try Exa contents
+        exa_text = _exa_contents_fallback(url, max_chars)
+        if exa_text:
+            return {
+                "ok": True, "content": exa_text, "url": url,
+                "blocked": False, "reason": "", "status_code": 200,
+                "retries": 0, "source": "exa_contents (jina-first domain)",
+                "_full_length": len(exa_text),
+            }
+        # Exa failed — try Wayback
         try:
             wb_result = fetch_cached(url=url, max_chars=max_chars)
             if wb_result.get("ok") and wb_result.get("content", "").strip():
@@ -1360,7 +1439,8 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
                 resp.content[:5] == b"%PDF-" and "html" not in content_type
             ):
                 try:
-                    pdf_text = read_pdf(url, max_chars=max_chars)
+                    _pdf_result = read_pdf(url, max_chars=max_chars)
+                    pdf_text = _pdf_result.get("content", "") if isinstance(_pdf_result, dict) else str(_pdf_result)
                     if pdf_text and len(pdf_text.strip()) > 20:
                         return {
                             "ok": True, "content": f"[PDF detected — extracted text]\n\n{pdf_text}",
@@ -1498,7 +1578,17 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
                 "retries": retries_done, "source": "jina_reader",
                 "_full_length": _get_cached_full_length(url),
             }
-        logger.debug(f"Jina Reader returned a 404 page for {url}, trying Wayback")
+        logger.debug(f"Jina Reader returned a 404 page for {url}, trying Exa")
+
+    # ── Exa contents fallback ─────────────────────────────────────────
+    exa_text = _exa_contents_fallback(url, max_chars)
+    if exa_text:
+        return {
+            "ok": True, "content": exa_text, "url": url,
+            "blocked": False, "reason": "", "status_code": last_status,
+            "retries": retries_done, "source": "exa_contents",
+            "_full_length": len(exa_text),
+        }
 
     # ── Wayback Machine auto-fallback ─────────────────────────────────
     try:
@@ -1520,8 +1610,12 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
         "hint": _status_code_hint(last_status),
     }
 
-def read_pdf(url: str, max_chars: int = 12000) -> str:
-    """Download and extract text from a PDF at a URL."""
+def read_pdf(url: str, max_chars: int = 12000) -> dict:
+    """Download and extract text from a PDF at a URL.
+
+    Returns a dict with keys: ok, content, full_length, url.
+    Caches full text in _page_text_cache so read_page() works for PDFs.
+    """
     import httpx, io
     import pypdf
     resp = httpx.get(url, timeout=30)
@@ -1531,10 +1625,21 @@ def read_pdf(url: str, max_chars: int = 12000) -> str:
     try:
         pdf_logger.setLevel(logging.ERROR)
         reader = pypdf.PdfReader(io.BytesIO(resp.content))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
     finally:
         pdf_logger.setLevel(prev_level)
-    return text[:max_chars]
+
+    # Cache full text so read_page() can paginate through it
+    with _page_text_cache_lock:
+        _page_text_cache[url] = (full_text, time.time())
+
+    return {
+        "ok": True,
+        "content": full_text[:max_chars],
+        "full_length": len(full_text),
+        "url": url,
+        "page_count": len(reader.pages),
+    }
 
 
 # ── Shared table parsing ──────────────────────────────────────────────
@@ -1994,16 +2099,29 @@ def wikipedia_lookup(title: str, section: str = "", max_chars: int = 12000) -> d
                     text = sibling.get_text(separator=" ", strip=True)
                     if text:
                         content_parts.append(text)
-                content = "\n\n".join(content_parts)[:max_chars]
+                content = "\n\n".join(content_parts)
+                full_content = content
+                content = content[:max_chars]
             else:
                 content = f"Section '{section}' not found. Available sections: {', '.join(sections_list)}"
+                full_content = content
         else:
-            content = soup.get_text(separator="\n", strip=True)[:max_chars]
+            full_content = soup.get_text(separator="\n", strip=True)
+            content = full_content[:max_chars]
+
+        # Cache full text in _page_text_cache so read_page() works for Wikipedia
+        wiki_url = f"https://en.wikipedia.org/wiki/{actual_title.replace(' ', '_')}"
+        with _page_text_cache_lock:
+            _page_text_cache[wiki_url] = (full_content, time.time())
+            # Also cache under the title as passed (common lookup key)
+            _page_text_cache[f"wikipedia:{title}"] = (full_content, time.time())
 
         result = {
             "ok": True,
             "title": actual_title,
             "content": content,
+            "_full_length": len(full_content),
+            "_cache_url": wiki_url,
             "sections": sections_list,
         }
         if infobox:
@@ -2063,11 +2181,20 @@ def fetch_cached(url: str, date: str = "", max_chars: int = 12000) -> dict:
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
             tag.decompose()
 
-        content = soup.get_text(separator="\n", strip=True)[:max_chars]
+        full_content = soup.get_text(separator="\n", strip=True)
+        content = full_content[:max_chars]
+
+        # Cache full text so read_page() works for Wayback results
+        with _page_text_cache_lock:
+            _page_text_cache[url] = (full_content, time.time())
+            # Also cache under archive URL for direct lookups
+            if archive_url != url:
+                _page_text_cache[archive_url] = (full_content, time.time())
 
         return {
             "ok": True,
             "content": content,
+            "_full_length": len(full_content),
             "url": archive_url,
             "original_url": url,
             "snapshot_date": snapshot_date,
@@ -2405,11 +2532,26 @@ def spawn_agent_wrapper(_depth: int = 0, _model: Optional[str] = None, _reasonin
                 child_sandbox_files["agent_data.json"] = _b64.b64encode(data_json.encode("utf-8")).decode("ascii")
                 # Prepend a note to the task so the worker knows about the file
                 file_summary = ", ".join(f"{e['key']} ({e['content_length']:,} chars)" for e in entries)
+                _total_chars = sum(e["content_length"] for e in entries)
+                _code_hint = ""
+                if _total_chars > 15000:
+                    _code_hint = (
+                        "⚡ The pre-loaded data is large. Use execute_code to search it efficiently:\n"
+                        "  execute_code(code=\"\"\"```python\n"
+                        "  import json, re\n"
+                        "  data = json.load(open('agent_data.json'))\n"
+                        "  for entry in data['entries']:\n"
+                        "      matches = re.findall(r'YOUR_PATTERN', entry['content'], re.I)\n"
+                        "      if matches: print(f\"{entry['key']}: {matches}\")\n"
+                        "  ```\"\"\")\n"
+                        "Do NOT try to eyeball-read large entries. Use code to search/filter.\n\n"
+                    )
                 task = (
                     f"[PRE-LOADED DATA] The file agent_data.json is available in your sandbox. "
                     f"Read it with: import json; data = json.load(open('agent_data.json'))\n"
-                    f"It contains {len(entries)} entries: {file_summary}\n"
-                    f"Each entry has 'key', 'content', and 'content_length' fields.\n\n"
+                    f"It contains {len(entries)} entries ({_total_chars:,} chars total): {file_summary}\n"
+                    f"Each entry has 'key', 'content', and 'content_length' fields.\n"
+                    f"{_code_hint}"
                     f"{task}"
                 )
             if missing:
@@ -2477,6 +2619,206 @@ def search_available_tools_wrapper(**kwargs):
             return "Available tools:\n\n" + "\n\n".join(summary), None
     except Exception as e:
         return f"ERROR: {str(e)}", None
+
+
+# ── Direct data-file download helper ──────────────────────────────────
+# Bypasses Jina/JS rendering for URLs that clearly point to data files.
+# Uses a raw httpx.get() with browser headers + redirect following.
+# On success, caches the content and returns a preview with guidance.
+
+_DATA_DL_TIMEOUT = 60       # Data files can be large — generous timeout
+_DATA_DL_MAX_BYTES = 50_000_000  # 50 MB hard limit
+_DATA_FILE_EXTS = (".csv", ".tsv", ".json", ".jsonl", ".xlsx", ".xls",
+                   ".parquet", ".xml", ".ndjson")
+
+def _try_direct_data_download(url: str, max_chars: int = 12000) -> str | None:
+    """Attempt a raw HTTP download of a data-file URL.
+
+    Returns a formatted output string on success, or None on failure
+    (so the caller can fall through to regular fetch_url).
+    """
+    import httpx
+    from urllib.parse import urlparse
+    import hashlib as _hl
+
+    domain = _extract_domain(url)
+    _domain_rate_wait(domain)
+
+    try:
+        with httpx.stream("GET", url, headers=_BROWSER_HEADERS,
+                          timeout=_DATA_DL_TIMEOUT, follow_redirects=True) as resp:
+            if resp.status_code >= 400:
+                logger.debug(f"[data_download] HTTP {resp.status_code} for {url} — falling back")
+                # For 403 on data files, steer toward execute_code instead of
+                # letting fetch_url retry (Jina can't render CSVs/JSONs anyway).
+                if resp.status_code in (403, 401):
+                    _path_lc = urlparse(url).path.lower().split("?")[0]
+                    _pandas_reader = (
+                        "pd.read_csv" if _path_lc.endswith((".csv", ".tsv")) else
+                        "pd.read_json" if _path_lc.endswith((".json", ".jsonl", ".ndjson")) else
+                        "pd.read_excel" if _path_lc.endswith((".xlsx", ".xls")) else
+                        "pd.read_parquet" if _path_lc.endswith(".parquet") else
+                        "pd.read_csv"
+                    )
+                    return (
+                        f"FETCH FAILED: HTTP {resp.status_code} — the server blocked direct download "
+                        f"of this data file.\nDo NOT retry this URL with fetch_url. "
+                        f"Instead, try loading it programmatically with execute_code:\n"
+                        f"  execute_code(code=\"\"\"```python\n"
+                        f"  import pandas as pd\n"
+                        f"  df = {_pandas_reader}('{url}')\n"
+                        f"  print(df.shape)\n"
+                        f"  print(df.head(10))\n"
+                        f"  ```\"\"\")\n"
+                        f"Some servers allow programmatic Python access even when they "
+                        f"block browser-style downloads."
+                    )
+                return None
+
+            # Read content with size limit
+            chunks = []
+            total = 0
+            for chunk in resp.iter_bytes(chunk_size=65536):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > _DATA_DL_MAX_BYTES:
+                    logger.warning(f"[data_download] {url} exceeds {_DATA_DL_MAX_BYTES/1e6:.0f} MB — truncating")
+                    break
+            raw_bytes = b"".join(chunks)
+
+            ct = resp.headers.get("content-type", "").lower()
+            final_url = str(resp.url)
+
+            # Determine file type from content-type or URL extension
+            _path = urlparse(url).path.lower().split("?")[0]
+            is_csv = "csv" in ct or _path.endswith((".csv", ".tsv"))
+            is_json = "json" in ct or _path.endswith((".json", ".jsonl", ".ndjson"))
+            is_excel = "spreadsheet" in ct or "excel" in ct or _path.endswith((".xlsx", ".xls"))
+            is_parquet = "parquet" in ct or _path.endswith(".parquet")
+            is_xml = "xml" in ct or _path.endswith(".xml")
+
+            # Try to decode as text
+            try:
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = raw_bytes.decode("latin-1")
+                except Exception:
+                    text = None
+
+            if text is None and not (is_excel or is_parquet):
+                # Binary file we can't decode — fall through
+                logger.debug(f"[data_download] Binary content from {url}, can't decode — falling back")
+                return None
+
+            # ── Cache raw text for read_page / memory ─────────────────
+            url_hash = _hl.md5(url.encode()).hexdigest()[:8]
+
+            if text:
+                full_length = len(text)
+                with _page_text_cache_lock:
+                    _page_text_cache[url] = (text, time.time())
+                    if final_url != url:
+                        _page_text_cache[final_url] = (text, time.time())
+                with _url_cache_lock:
+                    _url_cache[url] = (text, final_url, resp.status_code, time.time(), ct)
+
+                # ── Build preview ─────────────────────────────────────
+                if is_csv:
+                    file_label = "CSV"
+                    sandbox_name = f"data_{url_hash}.csv"
+                    lines = text.split("\n")
+                    header = lines[0] if lines else ""
+                    n_rows = len(lines) - 1  # approximate
+                    preview_lines = lines[:min(6, len(lines))]
+                    preview = "\n".join(preview_lines)
+                    if n_rows > 5:
+                        preview += f"\n... ({n_rows:,} total rows)"
+                    hint = (
+                        f"import pandas as pd\n"
+                        f"df = pd.read_csv('{sandbox_name}')\n"
+                        f"print(df.shape)\n"
+                        f"print(df.head())"
+                    )
+                elif is_json:
+                    file_label = "JSON"
+                    sandbox_name = f"data_{url_hash}.json"
+                    preview = text[:max_chars] if full_length > max_chars else text
+                    if full_length > max_chars:
+                        preview += f"\n... ({full_length:,} chars total)"
+                    hint = (
+                        f"import json\n"
+                        f"data = json.load(open('{sandbox_name}'))\n"
+                        f"print(type(data), len(data) if isinstance(data, list) else list(data.keys())[:10])"
+                    )
+                elif is_xml:
+                    file_label = "XML"
+                    sandbox_name = f"data_{url_hash}.xml"
+                    preview = text[:max_chars] if full_length > max_chars else text
+                    if full_length > max_chars:
+                        preview += f"\n... ({full_length:,} chars total)"
+                    hint = (
+                        f"import xml.etree.ElementTree as ET\n"
+                        f"tree = ET.parse('{sandbox_name}')\n"
+                        f"root = tree.getroot()\n"
+                        f"print(root.tag, len(root))"
+                    )
+                else:
+                    file_label = "DATA"
+                    sandbox_name = f"data_{url_hash}.txt"
+                    preview = text[:max_chars] if full_length > max_chars else text
+                    hint = f"text = open('{sandbox_name}').read()"
+
+                output = (
+                    f"[DATA FILE DOWNLOADED: {file_label}, {full_length:,} chars]\n\n"
+                    f"{preview}\n\n"
+                    f"[FULL FILE ({full_length:,} chars) AVAILABLE AS '{sandbox_name}' IN SANDBOX.\n"
+                    f" Analyze it with execute_code:\n"
+                    f"  execute_code(code=\"\"\"```python\n"
+                    f"  {hint}\n"
+                    f"  ```\"\"\")]"
+                )
+                logger.info(
+                    f"[data_download] {file_label} from {domain}: "
+                    f"{full_length:,} chars → sandbox '{sandbox_name}'"
+                )
+                return output
+
+            elif is_excel or is_parquet:
+                # Binary structured data — encode and provide sandbox file
+                import base64 as _b64dl
+                ext = "xlsx" if is_excel else "parquet"
+                file_label = "Excel" if is_excel else "Parquet"
+                sandbox_name = f"data_{url_hash}.{ext}"
+                # We can't preview binary, but we can tell the model to use pandas
+                output = (
+                    f"[DATA FILE DOWNLOADED: {file_label}, {len(raw_bytes):,} bytes]\n\n"
+                    f"Binary file — cannot preview inline.\n\n"
+                    f"[FULL FILE ({len(raw_bytes):,} bytes) AVAILABLE AS '{sandbox_name}' IN SANDBOX.\n"
+                    f" Load it with execute_code:\n"
+                    f"  execute_code(code=\"\"\"```python\n"
+                    f"  import pandas as pd\n"
+                    f"  df = pd.read_{'excel' if is_excel else 'parquet'}('{sandbox_name}')\n"
+                    f"  print(df.shape)\n"
+                    f"  print(df.head())\n"
+                    f"  ```\"\"\")]"
+                )
+                # Cache as base64 so sandbox injection picks it up
+                with _page_text_cache_lock:
+                    _b64_str = _b64dl.b64encode(raw_bytes).decode("ascii")
+                    _page_text_cache[url] = (_b64_str, time.time())
+                logger.info(
+                    f"[data_download] {file_label} from {domain}: "
+                    f"{len(raw_bytes):,} bytes → sandbox '{sandbox_name}'"
+                )
+                return output
+
+    except Exception as e:
+        logger.debug(f"[data_download] Direct download failed for {url}: {e}")
+        return None
+
+    return None
+
     
 def fetch_url_wrapper(**kwargs):
     """Wrapper for fetch_url tool. Returns (output, None).
@@ -2509,14 +2851,29 @@ def fetch_url_wrapper(**kwargs):
         # ── Early PDF detection by URL extension ──────────────────────
         from urllib.parse import urlparse
         url_path = urlparse(url).path.lower()
-        if url_path.endswith(".pdf"):
+        # Strip ?query from extension check
+        _ext_path = url_path.split("?")[0]
+        if _ext_path.endswith(".pdf"):
             try:
                 logger.info(f"[fetch_url] PDF URL detected — trying read_pdf first: {url}")
-                pdf_text = read_pdf(url=url, max_chars=kwargs.get("max_chars", 12000))
+                _pdf_result = read_pdf(url=url, max_chars=kwargs.get("max_chars", 12000))
+                pdf_text = _pdf_result.get("content", "") if isinstance(_pdf_result, dict) else str(_pdf_result)
                 if pdf_text and len(pdf_text.strip()) > 30:
                     return f"[PDF detected by URL — extracted with read_pdf]\n\n{pdf_text}", None
             except Exception as pdf_err:
                 logger.debug(f"[fetch_url] read_pdf failed for {url}: {pdf_err} — falling through to normal fetch")
+
+        # ── Early data-file detection: direct download to sandbox ─────
+        # When the URL clearly points to a data file (CSV, JSON, XLSX,
+        # etc.), attempt a raw httpx.get() first.  This avoids the
+        # Jina/JS-rendering pipeline which can timeout or 403 on direct
+        # file downloads.  On success, cache the raw content and return
+        # a preview + sandbox injection notice.
+        _is_data_url = _ext_path.endswith(_DATA_FILE_EXTS) or "download=1" in url.lower()
+        if _is_data_url:
+            _dl_result = _try_direct_data_download(url, kwargs.get("max_chars", 12000))
+            if _dl_result is not None:
+                return _dl_result, None
 
         max_chars = kwargs.get("max_chars", 12000)
         extract = kwargs.get("extract", "text")
@@ -2591,20 +2948,22 @@ def fetch_url_wrapper(**kwargs):
                     # Data was too large — model sees only a preview
                     output += (
                         f"\n\n[STRUCTURED DATA: {ct}, {full_len:,} chars total "
-                        f"(only a preview is shown above). Full data is cached in memory. "
-                        f"To analyze, use:\n"
-                        f"  conduct_research(task='Analyze the {ct} data from {url[:80]}... "
-                        f"Extract <what you need>.', memory_keys=['<key from [Stored → ...]>'])\n"
-                        f"The sub-agent can load the full dataset and use pandas/json to filter it.\n"
-                        f"Do NOT eyeball-parse large structured data — delegate to a sub-agent.]"
+                        f"(only a preview is shown above). Full data is cached and will "
+                        f"be auto-loaded as a file in your sandbox when you call execute_code.\n"
+                        f"Options:\n"
+                        f"  1. execute_code(code=\"import json; data = json.loads(open('data_XXXX.txt').read()); ...\")\n"
+                        f"     The filename will appear in a follow-up notice.\n"
+                        f"  2. conduct_research(task='Analyze the {ct} data from {url[:80]}...', "
+                        f"memory_keys=['<key from [Stored → ...]>']) to delegate to a sub-agent.\n"
+                        f"Do NOT eyeball-parse large structured data — use code or delegate.]"
                     )
                 else:
                     # Full data returned inline — just tag it
                     output += (
                         f"\n\n[STRUCTURED DATA: {ct}, {shown_len:,} chars. "
-                        f"This is the complete response. You can pass it to a sub-agent via "
-                        f"conduct_research(memory_keys=['<key from [Stored → ...]>']) "
-                        f"for programmatic analysis if needed.]"
+                        f"Use execute_code() to parse/filter this data programmatically, "
+                        f"or pass to a sub-agent via conduct_research(memory_keys=['<key from [Stored → ...]>'])."
+                        f"]"
                     )
 
             # ── Truncation hint: tell the agent full page is cached ───
@@ -2626,7 +2985,22 @@ def fetch_url_wrapper(**kwargs):
                     "Use wikipedia_lookup(title='Article Title') instead — "
                     "it uses the MediaWiki API which is not blocked."
                 )
-            return json.dumps(result, indent=2), None
+            # ── Return a clear, human-readable error — not raw JSON ───
+            # The model often just passes through opaque JSON errors into
+            # its draft ("blocked", etc.). Give it a sentence it can act on.
+            _sc = result.get("status_code", 0)
+            _reason = result.get("reason", "")
+            _hint = result.get("hint", "")
+            _src_url = result.get("url", url)
+            _parts = [f"FETCH FAILED: {_src_url}"]
+            if _sc:
+                _parts.append(f"HTTP {_sc}")
+            if _reason:
+                _parts.append(_reason)
+            _error_line = " — ".join(_parts)
+            if _hint:
+                _error_line += f"\n{_hint}"
+            return _error_line, None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
@@ -2692,8 +3066,25 @@ def read_pdf_wrapper(**kwargs):
             return "ERROR: 'url' parameter is required", None
 
         max_chars = kwargs.get("max_chars", 12000)
-        text = read_pdf(url=url, max_chars=max_chars)
-        return text, None
+        result = read_pdf(url=url, max_chars=max_chars)
+
+        if not result.get("ok", False):
+            return json.dumps(result, indent=2), None
+
+        output = result["content"]
+        shown = len(result["content"])
+        full = result.get("full_length", shown)
+        pages = result.get("page_count", "?")
+
+        if full > shown + 200:
+            output += (
+                f"\n\n[PDF TRUNCATED: showing {shown:,} of {full:,} chars "
+                f"({pages} pages). Full text is cached — use "
+                f"read_page(url=\"{url}\", offset={shown}) to continue reading, "
+                f"or use execute_code() to search/parse the full text programmatically.]"
+            )
+
+        return output, None
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {str(e)}", None
 
@@ -2757,7 +3148,22 @@ def wikipedia_lookup_wrapper(**kwargs):
             parts.append(f"\n{result['content']}")
             if result.get("sections"):
                 parts.append(f"\n[Sections: {', '.join(result['sections'][:20])}]")
-            return "\n".join(parts), None
+
+            output = "\n".join(parts)
+
+            # Truncation notice
+            shown = len(result["content"])
+            full = result.get("_full_length", shown)
+            cache_url = result.get("_cache_url", "")
+            if full > shown + 200 and cache_url:
+                output += (
+                    f"\n\n[ARTICLE TRUNCATED: showing {shown:,} of {full:,} chars. "
+                    f"Full text is cached — use read_page(url=\"{cache_url}\", "
+                    f"offset={shown}) for more, or pass a section= parameter to "
+                    f"target a specific section.]"
+                )
+
+            return output, None
         else:
             return json.dumps(result, indent=2), None
     except Exception as e:
@@ -2778,7 +3184,20 @@ def fetch_cached_wrapper(**kwargs):
         if result["ok"]:
             header = f"[Wayback Machine snapshot: {result.get('snapshot_date', '?')}]\n"
             header += f"[Original URL: {result.get('original_url', url)}]\n\n"
-            return header + result["content"], None
+            output = header + result["content"]
+
+            # Truncation notice
+            shown = len(result["content"])
+            full = result.get("_full_length", shown)
+            if full > shown + 200:
+                output += (
+                    f"\n\n[PAGE TRUNCATED: showing {shown:,} of {full:,} chars. "
+                    f"Full page is cached — use read_page(url=\"{url}\", "
+                    f"offset={shown}) for more, or use execute_code() to "
+                    f"search/parse the full text programmatically.]"
+                )
+
+            return output, None
         else:
             return json.dumps(result, indent=2), None
     except Exception as e:
@@ -2906,6 +3325,24 @@ TOOLS = [
             "input/output handling, file I/O, and resource limits. "
             "The code should be provided in a markdown code block (e.g., ```python code here ```). "
             "Returns execution results including stdout, stderr, exit status, and any requested output files.\n\n"
+            "WHEN TO USE:\n"
+            "- SEARCH truncated pages: when a page is truncated, the full text is auto-loaded "
+            "as a .txt file in your sandbox (e.g. 'page_abc123.txt'). Open it and search with regex.\n"
+            "- COMPUTE derived values: averages, percentages, date math, unit conversions.\n"
+            "- PARSE structured data: load JSON/CSV with pandas or json module, filter rows, aggregate.\n"
+            "- ANALYZE agent_data.json: when pre-loaded data is available, use code to search/filter it.\n"
+            "- CROSS-REFERENCE: compare data from multiple fetched pages programmatically.\n\n"
+            "PATTERNS:\n"
+            "  # Search a truncated page (full text auto-loaded in sandbox):\n"
+            "  import re\n"
+            "  text = open('page_abc123.txt').read()  # filename from truncation notice\n"
+            "  matches = re.findall(r'population[:\\s]+(\\d[\\d,]+)', text, re.I)\n"
+            "  print(matches)\n\n"
+            "  # Parse pre-loaded data from orchestrator:\n"
+            "  import json\n"
+            "  data = json.load(open('agent_data.json'))\n"
+            "  for entry in data['entries']:\n"
+            "      if 'GDP' in entry['content']: print(entry['key'], entry['content'][:200])\n\n"
             "FILE HANDLING:\n"
             "- `files`: Upload input files (e.g. CSVs, images, data) into the sandbox before execution. "
             "Provide as a dict of {filename: base64_encoded_string}. "
@@ -3501,11 +3938,6 @@ ROOT_TOOLS = [
                             "Memory keys to pre-load into the sub-agent's sandbox "
                             "as agent_data.json. Example: ['search_t1_query', 'page_t3_url']"
                         )
-                    },
-                    "turn_length": {
-                        "type": "integer",
-                        "description": f"Maximum turns for the sub-agent (default: {SUB_AGENT_TURN_BUDGET})",
-                        "default": SUB_AGENT_TURN_BUDGET
                     },
                 },
                 "required": ["task"]

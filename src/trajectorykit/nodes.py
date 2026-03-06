@@ -22,7 +22,7 @@ import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .chain import ChainPlan, ChainStep
@@ -397,7 +397,7 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
             total = 0
             for i, f in enumerate(state.findings, 1):
                 entry = f"{i}. {f}"
-                if total + len(entry) > 15000:
+                if total + len(entry) > 60000:
                     lines.append(f"... ({len(state.findings) - i + 1} more entries truncated)")
                     break
                 lines.append(entry)
@@ -538,6 +538,49 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
         return True, "", "", meta
 
 
+def _find_relevant_memory_keys(state: AgentState, claim_text: str, max_keys: int = 3) -> List[str]:
+    """Find memory keys whose content is likely relevant to a claim.
+
+    Uses simple keyword overlap: tokenise the claim into meaningful words,
+    then score each memory entry by how many claim-words appear in the
+    entry's key + first 500 chars of content.  Returns the top-scoring
+    keys (up to *max_keys*), or all conduct_research keys if nothing
+    matches.
+    """
+    if not state.memory:
+        return []
+
+    # Tokenise claim into lowercase keyword set
+    _STOP = {"the", "and", "for", "that", "this", "with", "from", "are",
+             "was", "were", "has", "have", "been", "its", "not", "but",
+             "than", "which", "about", "into", "after", "before", "more",
+             "most", "over", "also", "between", "through", "each", "any"}
+    claim_words = set(
+        w for w in re.findall(r"[a-z0-9]{3,}", claim_text.lower())
+        if w not in _STOP
+    )
+    if not claim_words:
+        # Fall back: return all conduct_research keys
+        return [e.key for e in state.memory.entries
+                if e.source_tool == "conduct_research"][:max_keys]
+
+    scored: list[tuple[int, str]] = []
+    for entry in state.memory.entries:
+        # Match against key + content preview
+        haystack = (entry.key + " " + entry.content[:500]).lower()
+        hits = sum(1 for w in claim_words if w in haystack)
+        if hits > 0:
+            scored.append((hits, entry.key))
+
+    if not scored:
+        # No overlap at all — give all conduct_research entries
+        return [e.key for e in state.memory.entries
+                if e.source_tool == "conduct_research"][:max_keys]
+
+    scored.sort(reverse=True)
+    return [key for _, key in scored[:max_keys]]
+
+
 def _spot_check_claims(
     state: AgentState,
     draft_content: str,
@@ -565,25 +608,44 @@ def _spot_check_claims(
 
         # ── Build a focused verification task for a sub-agent ─────────
         # The sub-agent gets the full tool suite (search, fetch, read_pdf,
-        # wikipedia_lookup, etc.) and can reason about what to check.
+        # wikipedia_lookup, execute_code, etc.) and can reason about
+        # what to check.
+        _prior_evidence = claim_obj.get("_prior_evidence", "")
         task_parts = [
-            "VERIFY this claim by gathering evidence from the web.\n",
+            "VERIFY this claim by gathering evidence.\n",
             f"CLAIM: {_c}\n",
         ]
+        if _prior_evidence:
+            task_parts.append(f"\n{_prior_evidence}\n")
         if _source_url:
-            task_parts.append(
-                f"The draft CITES this source: {_source_url}\n"
-                f"Fetch this page FIRST to check whether the claim actually appears there.\n"
-            )
+            # Determine if this is an API/data endpoint vs a regular page
+            _is_api = any(p in _source_url.lower() for p in [
+                "/api/", "/resource/", ".json", ".csv", ".xml",
+                "$select", "$where", "query=", "format=json",
+            ])
+            if _is_api:
+                task_parts.append(
+                    f"The draft used this API/data endpoint: {_source_url}\n"
+                    f"Fetch it with fetch_url and use execute_code to parse the "
+                    f"response (JSON/CSV/XML). Verify the claimed values appear in the data.\n"
+                )
+            else:
+                task_parts.append(
+                    f"The draft CITES this source: {_source_url}\n"
+                    f"Fetch this page FIRST to check whether the claim actually appears there.\n"
+                )
         if _q:
             task_parts.append(f"SUGGESTED SEARCH: {_q}\n")
         task_parts.append(
             "\nINSTRUCTIONS:\n"
-            "1. Search for evidence about this claim\n"
-            "2. Prioritise primary sources: PDFs, .gov/.edu sites, Wikipedia\n"
-            "3. If initial search results are weak, try different queries\n"
-            "4. Fetch and READ the most relevant pages — don’t rely on snippets alone\n"
-            "5. Use read_pdf for PDF documents, wikipedia_lookup for encyclopedic facts\n"
+            "1. If a source_url was provided, fetch it FIRST (use fetch_url for web pages/APIs, "
+            "read_pdf for PDFs, wikipedia_lookup for Wikipedia articles)\n"
+            "2. If the source returns structured data (JSON/CSV), use execute_code to parse "
+            "and verify the specific values claimed\n"
+            "3. Search the web for corroborating evidence if the source is unavailable or insufficient\n"
+            "4. Prioritise primary sources: data portals, .gov/.edu sites, PDFs, Wikipedia\n"
+            "5. If initial search results are weak, try different queries\n"
+            "6. Fetch and READ the most relevant pages — don’t rely on snippets alone\n"
             "\nIn your final_answer, report:\n"
             "  • SOURCES CHECKED: [url] — [what it says about the claim]\n"
             "  • ASSESSMENT: SUPPORTED / CONTRADICTED / INSUFFICIENT\n"
@@ -630,14 +692,74 @@ def _spot_check_claims(
                 "evidence_report": f"(verification failed: {e})",
             }
 
-    max_workers = min(len(sc_claims), 4)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_verify_one_claim, c): c for c in sc_claims}
-        sc_evidence = []
-        for fut in as_completed(futures):
-            result = fut.result()
-            if result is not None:
-                sc_evidence.append(result)
+    # ── Tiered execution: respect chain dependencies ─────────────
+    # Partition claims into dependency tiers.  Tier 0 = no depends_on;
+    # tier N = depends on a claim in tier N-1.  Verify each tier in
+    # parallel, but tiers execute sequentially so a dependent claim
+    # can receive the verified evidence from its predecessor.
+    claim_by_idx: dict[int, dict] = {}
+    for i, c in enumerate(sc_claims, 1):
+        claim_by_idx[i] = c
+    tier_results: dict[int, dict] = {}  # claim-index → evidence dict
+
+    def _build_tiers(claims_list):
+        """Return list of tiers; each tier is a list of (index, claim)."""
+        tiers: list[list[tuple[int, dict]]] = []
+        placed = set()
+        remaining = [(i, c) for i, c in enumerate(claims_list, 1)]
+        while remaining:
+            tier = []
+            still_remaining = []
+            for idx, c in remaining:
+                dep = c.get("depends_on")
+                if dep is None or dep in placed:
+                    tier.append((idx, c))
+                else:
+                    still_remaining.append((idx, c))
+            if not tier:
+                # Circular or broken deps — flush everything into one tier
+                tier = still_remaining
+                still_remaining = []
+            for idx, _ in tier:
+                placed.add(idx)
+            tiers.append(tier)
+            remaining = still_remaining
+        return tiers
+
+    tiers = _build_tiers(sc_claims)
+    sc_evidence: list[dict] = []
+
+    for tier_num, tier in enumerate(tiers):
+        if state.verbose and len(tiers) > 1:
+            print(f"       ⛓ Spot-check tier {tier_num + 1}/{len(tiers)}: "
+                  f"{len(tier)} claim(s)")
+
+        # Inject prior-tier evidence into dependent claims so the
+        # verifier knows what the predecessor actually resolved to.
+        updated_tier = []
+        for idx, claim_obj in tier:
+            dep = claim_obj.get("depends_on")
+            if dep is not None and dep in tier_results:
+                prior_ev = tier_results[dep]
+                prior_summary = prior_ev.get("evidence_report", "")[:500]
+                claim_obj = {**claim_obj}  # shallow copy
+                claim_obj["_prior_evidence"] = (
+                    f"PRIOR STEP (Claim {dep}) verified result:\n"
+                    f"{prior_summary}\n"
+                    f"Use this to check whether THIS claim's entity/value "
+                    f"is consistent with the verified prior step."
+                )
+            updated_tier.append((idx, claim_obj))
+
+        max_workers = min(len(updated_tier), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_verify_one_claim, c): (i, c) for i, c in updated_tier}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None:
+                    idx = futures[fut][0]
+                    tier_results[idx] = result
+                    sc_evidence.append(result)
 
     meta["claims_checked"] = len(sc_evidence)
 
@@ -682,10 +804,27 @@ def _spot_check_claims(
 
     chain_note = ""
     if has_chain:
+        # Build a concrete chain summary showing resolved values so the
+        # compare LLM can check entity flow between steps.
+        _chain_summary_parts = []
+        if state.chain_plan and state.chain_plan.has_chain:
+            for cs in state.chain_plan.chain_steps:
+                rv = cs.resolved_value or "(unresolved)"
+                _chain_summary_parts.append(
+                    f"  Step {cs.step}: {cs.lookup} → {rv}"
+                )
+        _chain_body = "\n".join(_chain_summary_parts) if _chain_summary_parts else ""
         chain_note = (
-            "\n\nNOTE: Some claims have DEPENDS ON annotations indicating "
-            "a reasoning chain. Verify chain coherence: does the verified "
-            "result of each step match the entity used in the next step?"
+            "\n\nCHAIN COHERENCE CHECK:\n"
+            "The draft answers a chain question. The pre-computed chain resolved as:\n"
+            f"{_chain_body}\n\n"
+            "Verify:\n"
+            "1. Does the VERIFIED evidence for each step match the resolved value "
+            "used in the next step? (e.g. if Step 1 resolved to 'Cincinnati' but "
+            "Step 2's evidence checked 'Columbus', the chain is BROKEN.)\n"
+            "2. If any intermediate step's evidence CONTRADICTS its resolved value, "
+            "flag it — all downstream steps are then suspect.\n"
+            "3. Check that the FINAL answer follows logically from the verified chain."
         )
 
     compare_msgs = [
@@ -724,6 +863,15 @@ def _spot_check_claims(
             if not feedback:
                 feedback = compare_text
             raw_text = f"[SPOT-CHECK] {compare_text}"
+            # ── Chain contestation: clear contradicted resolved values ──
+            # If the failure feedback mentions a specific chain step being
+            # wrong, clear its resolved_value so the model doesn't repeat
+            # the same error on the next attempt.
+            if state.chain_plan and state.chain_plan.has_chain:
+                contest_records = _contest_chain_steps(state.chain_plan, feedback)
+                if contest_records:
+                    meta["chain_contested"] = contest_records
+
             if state.verbose:
                 print(f"       \u274c Spot-check: FAILED \u2014 factual issues found "
                       f"(rejection {state.spot_check_rejections}/{state.MAX_SPOT_CHECK_REJECTIONS})")
@@ -736,6 +884,83 @@ def _spot_check_claims(
         if state.verbose:
             print(f"       \u26a0\ufe0f  Spot-check: compare API error ({compare_resp.status_code}), skipping")
     return True, "", "", meta
+
+
+def _contest_chain_steps(chain_plan: "ChainPlan", feedback: str) -> List[dict]:
+    """Clear resolved_value on chain steps contradicted by spot-check feedback.
+
+    Scans the compare LLM's failure feedback for references to chain
+    step entities.  If a step's resolved_value appears near words like
+    "contradicted", "incorrect", "wrong", "actually", "instead", we
+    clear it (and all downstream steps via ``contest_step``) so the
+    model doesn't blindly re-use the bad intermediate on revision.
+
+    Returns a list of dicts describing each contested step (for trace
+    metadata), e.g. [{"step": 2, "old_value": "Cincinnati", "reason": "direct"}].
+    """
+    if not chain_plan.chain_steps:
+        return []
+
+    feedback_lower = feedback.lower()
+
+    # Heuristic: for each resolved step, check if the feedback explicitly
+    # mentions its resolved value near contradiction language.
+    _CONTRADICT_PATTERNS = re.compile(
+        r"(contradict|incorrect|wrong|actually|instead|not\s+\w+\s+but|"
+        r"evidence\s+says|should\s+be|was\s+actually|misidentif|"
+        r"chain\s+step\s+\d+\s+contradicted)",
+        re.IGNORECASE,
+    )
+
+    contested: set[int] = set()
+
+    for step in chain_plan.chain_steps:
+        if not step.is_resolved or not step.resolved_value:
+            continue
+        rv = step.resolved_value.lower()
+        # Skip very short values that would false-match everywhere
+        if len(rv) < 4:
+            continue
+        # Check if the resolved value appears within 200 chars of
+        # contradiction language in the feedback.
+        for m in re.finditer(re.escape(rv), feedback_lower):
+            window_start = max(0, m.start() - 200)
+            window_end = min(len(feedback_lower), m.end() + 200)
+            window = feedback_lower[window_start:window_end]
+            if _CONTRADICT_PATTERNS.search(window):
+                contested.add(step.step)
+                break
+
+    # Also check for explicit "CHAIN STEP N CONTRADICTED" patterns
+    for m in re.finditer(r"chain\s+step\s+(\d+)\s+contradict", feedback_lower):
+        contested.add(int(m.group(1)))
+
+    if not contested:
+        return []
+
+    # Snapshot old values before clearing
+    contest_records: list[dict] = []
+    all_cleared: list[int] = []
+    for step_num in contested:
+        step = chain_plan.get_step(step_num)
+        old_val = step.resolved_value if step else None
+        cleared = chain_plan.contest_step(step_num)
+        for sn in cleared:
+            s_obj = chain_plan.get_step(sn)
+            contest_records.append({
+                "step": sn,
+                "old_value": old_val if sn == step_num else "(cascade)",
+                "reason": "direct" if sn == step_num else f"depends_on_step_{step_num}",
+            })
+        all_cleared.extend(cleared)
+
+    if all_cleared:
+        logger.info(
+            "Spot-check contested chain step(s): %s (cleared: %s)",
+            sorted(contested), sorted(set(all_cleared)),
+        )
+
+    return contest_records
 
 
 def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tuple[bool, str, str, dict]:
@@ -966,8 +1191,8 @@ def handle_research_complete(
                 f"{verify_feedback}\n\n"
                 f"Please correct these specific claims with refine_draft(), then call "
                 f"research_complete() again. "
-                f"(Spot-check rejection {state.spot_check_rejections}/{state.MAX_SPOT_CHECK_REJECTIONS} \u2014 "
-                f"{'next attempt will force-publish' if state.spot_check_rejections >= state.MAX_SPOT_CHECK_REJECTIONS else f'{state.MAX_SPOT_CHECK_REJECTIONS - state.spot_check_rejections} correction(s) remaining'})"
+                # f"(Spot-check rejection {state.spot_check_rejections}/{state.MAX_SPOT_CHECK_REJECTIONS} \u2014 "
+                # f"{'next attempt will force-publish' if state.spot_check_rejections >= state.MAX_SPOT_CHECK_REJECTIONS else f'{state.MAX_SPOT_CHECK_REJECTIONS - state.spot_check_rejections} correction(s) remaining'})"
             )
         else:
             reject_msg = (
@@ -1134,6 +1359,86 @@ def _find_similar_prior_research(state: AgentState, new_task: str) -> Optional[s
     return None
 
 
+# ── Evidence extraction from child traces ─────────────────────────────
+# Walk a sub-agent's EpisodeTrace to build a compact evidence block that
+# gives the verifier actual data values (URLs fetched, table rows, search
+# snippets) rather than just the sub-agent's final_answer JSON wrapper.
+
+_EVIDENCE_TOOLS = {"fetch_url", "extract_tables", "search_web", "wikipedia_lookup", "execute_code"}
+_EVIDENCE_CAP = 4000       # total chars budget for evidence block
+_PER_SNIPPET_CAP = 800     # max chars per individual tool output snippet
+
+def _extract_child_evidence(child_trace, task_desc: str = "", mem_key: str | None = None) -> str | None:
+    """Extract key data snippets from a child trace for the verifier.
+
+    Returns a compact evidence string, or None if nothing useful found.
+    """
+    if child_trace is None:
+        return None
+
+    snippets: list[str] = []
+    total_len = 0
+
+    for turn in child_trace.turns:
+        for tc in turn.tool_calls:
+            if tc.tool_name not in _EVIDENCE_TOOLS:
+                continue
+            raw = (tc.output or "").strip()
+            if not raw or raw.startswith("ERROR:") or raw.startswith("\u26d4"):
+                continue
+            # Skip very short outputs (not useful as evidence)
+            if len(raw) < 60:
+                continue
+
+            # Build label
+            label_parts = [tc.tool_name]
+            if tc.tool_name == "fetch_url":
+                url = (tc.tool_args or {}).get("url", "")
+                if url:
+                    label_parts.append(url[:120])
+            elif tc.tool_name == "search_web":
+                query = (tc.tool_args or {}).get("query", "")
+                if query:
+                    label_parts.append(f'q="{query[:80]}"')
+            elif tc.tool_name == "execute_code":
+                label_parts.append("(code output)")
+
+            label = " | ".join(label_parts)
+
+            # Truncate the output to a useful snippet
+            # Prefer the start — contains headers/first rows/first results
+            snippet = raw[:_PER_SNIPPET_CAP]
+            if len(raw) > _PER_SNIPPET_CAP:
+                # Try to cut at a newline boundary
+                last_nl = snippet.rfind("\n")
+                if last_nl > _PER_SNIPPET_CAP // 2:
+                    snippet = snippet[:last_nl]
+                snippet += f"\n  ... ({len(raw):,} chars total)"
+
+            entry = f"  [{label}]: {snippet}"
+            if total_len + len(entry) > _EVIDENCE_CAP:
+                remaining = len([tc2 for t in child_trace.turns for tc2 in t.tool_calls
+                                 if tc2.tool_name in _EVIDENCE_TOOLS])
+                snippets.append(f"  ... (evidence cap reached, {remaining} evidence calls total)")
+                break
+            snippets.append(entry)
+            total_len += len(entry)
+        else:
+            continue
+        break  # break outer loop if inner loop broke
+
+    if not snippets:
+        return None
+
+    header = f"[EVIDENCE from sub-agent"
+    if task_desc:
+        header += f': "{task_desc[:80]}"'
+    header += "]"
+    if mem_key:
+        header += f" (full data in memory key: {mem_key})"
+    return header + "\n" + "\n".join(snippets)
+
+
 def handle_conduct_research(
     state: AgentState,
     tool_call: dict,
@@ -1223,7 +1528,7 @@ def handle_conduct_research(
     mem_key = None
     if not output.startswith("ERROR:"):
         state.conduct_research_count += 1
-        state.findings.append(f"[conduct_research] {output[:1500].strip()}")
+        state.findings.append(f"[conduct_research] {output.strip()}")
         desc = str(tool_args.get("task", ""))[:60]
         mem_key = state.memory.add(
             tool_name="conduct_research", turn=state.turn,
@@ -1643,6 +1948,36 @@ def handle_generic_tool(
     if "<|" in tool_name:
         tool_name = tool_name.split("<|")[0]
 
+    # ── Pre-dispatch: hard-block search when think() is required ──────
+    # If the consecutive-search limit was already hit, block the call
+    # BEFORE execution so we don't waste API calls or tokens.
+    _SEARCH_TOOLS = ("search_web", "fetch_url", "read_pdf", "extract_tables", "fetch_cached", "wikipedia_lookup")
+    if (state.depth > 0
+            and tool_name in _SEARCH_TOOLS
+            and state.consecutive_search_count >= state.MAX_CONSECUTIVE_SEARCHES):
+        state.consecutive_search_count += 1
+        block_msg = (
+            f"\u26d4 SEARCH BLOCKED ({state.consecutive_search_count} consecutive search/fetch calls). "
+            "Call NOT executed. You MUST call think() now to reflect on:\n"
+            "  1. What data you have gathered so far\n"
+            "  2. What is still missing\n"
+            "  3. Your plan for the next steps\n"
+            "After think(), you can resume searching. "
+            "Do NOT call another search tool — it will also be blocked."
+        )
+        tc_record = ToolCallRecord(
+            tool_name=tool_name, tool_args=tool_args,
+            tool_call_id=tool_call["id"], output=block_msg,
+            duration_s=0.0, child_trace=None,
+        )
+        turn_record.tool_calls.append(tc_record)
+        state.messages.append({
+            "role": "tool", "tool_call_id": tool_call["id"], "content": block_msg,
+        })
+        if state.verbose:
+            print(f"       \u26d4  Search #{state.consecutive_search_count} hard-blocked (must think())")
+        return _CONTINUE
+
     tc_start = time.time()
     child_trace = None
     try:
@@ -1690,22 +2025,13 @@ def handle_generic_tool(
     # "blocked" in the consecutive-search warning triggering is_blocked).
     _raw_output = output
 
-    # ── Consecutive search enforcement (sub-agents only) ──────────────
-    _SEARCH_TOOLS = ("search_web", "fetch_url", "read_pdf", "extract_tables", "fetch_cached", "wikipedia_lookup")
+    # ── Consecutive search tracking & warning (sub-agents only) ───────
+    # The hard-block fires above (pre-dispatch) once the limit is hit.
+    # Here we track the count for calls that ARE executed and issue the
+    # approaching-limit warning.
     if state.depth > 0 and tool_name in _SEARCH_TOOLS:
         state.consecutive_search_count += 1
-        if state.consecutive_search_count > state.MAX_CONSECUTIVE_SEARCHES:
-            output = (
-                f"\u26d4 SEARCH LIMIT: {state.consecutive_search_count} consecutive search/fetch calls. "
-                "Output suppressed. You MUST call think() now to reflect on:\n"
-                "  1. What data you have gathered so far\n"
-                "  2. What is still missing\n"
-                "  3. Your plan for the next steps\n"
-                "After think(), you can resume searching."
-            )
-            if state.verbose:
-                print(f"       \u26d4  Consecutive search #{state.consecutive_search_count} \u2014 blocked, must think()")
-        elif state.consecutive_search_count == state.CONSECUTIVE_SEARCH_WARNING:
+        if state.consecutive_search_count == state.CONSECUTIVE_SEARCH_WARNING:
             output += (
                 f"\n\n\u26a0\ufe0f WARNING: {state.consecutive_search_count} consecutive search/fetch calls. "
                 "Call think() to reflect on what you have before your next "
@@ -1731,11 +2057,23 @@ def handle_generic_tool(
                 )
         elif tool_name in ("fetch_url", "extract_tables", "wikipedia_lookup"):
             content_len = len(_raw_output.strip())
-            is_blocked = any(p in _raw_output.lower() for p in [
-                "blocked", "access denied", "403", "captcha",
-                "cloudflare", "do not retry this url",
-            ])
-            if is_blocked or content_len < 150:
+            # Only check for block markers in the first 500 chars (error
+            # headers), NOT the page body.  Body text like "403rd Wing"
+            # or an article mentioning "blocked" caused false positives
+            # on perfectly valid 100K+ responses.
+            _head_for_block = _raw_output[:500].lower()
+            _starts_with_error = _raw_output.startswith("FETCH FAILED:")
+            is_blocked = _starts_with_error or any(
+                p in _head_for_block for p in [
+                    "blocked", "access denied", "403", "captcha",
+                    "cloudflare", "do not retry this url",
+                ]
+            )
+            # Skip the nudge entirely when the response is large — a
+            # 2 KB+ page is clearly not "blocked" regardless of
+            # incidental keyword matches in its content.
+            _has_real_content = content_len > 2000
+            if (is_blocked or content_len < 150) and not _has_real_content:
                 tool_url = tool_args.get("url", "")
                 is_archive = "web.archive.org" in tool_url
                 is_jina = "r.jina.ai" in tool_url or "s.jina.ai" in tool_url
@@ -1756,26 +2094,173 @@ def handle_generic_tool(
                         "  3. Try wikipedia_lookup() if the topic has a Wikipedia article\n"
                         "  4. Accept the gap and note it in your final_answer"
                     )
+        # Don't stack LOW-QUALITY with more specific nudges that fire below
+        if empty_nudge and tool_name in ("fetch_url", "extract_tables", "wikipedia_lookup"):
+            _skip = []
+            if "[STRUCTURED DATA:" in _raw_output:
+                _skip.append("structured-data")
+            if any(m in _raw_output for m in ("[PDF TRUNCATED:", "[ARTICLE TRUNCATED:", "[PAGE TRUNCATED:")):
+                _skip.append("truncated")
+            if "[DATA FILE DOWNLOADED:" in _raw_output:
+                _skip.append("data-downloaded")
+            if _skip:
+                empty_nudge = ""
+                if state.verbose:
+                    print(f"       ↳  Skipped LOW-QUALITY nudge ({', '.join(_skip)} nudge takes priority)")
         if empty_nudge:
             output += empty_nudge
             if state.verbose:
                 print(f"       \u26a0\ufe0f  Empty/low-quality result detected \u2014 nudge injected")
 
+    # ── Shared marker list (reused by struct-data and truncation checks) ──
+    _truncation_markers = ("[PDF TRUNCATED:", "[ARTICLE TRUNCATED:", "[PAGE TRUNCATED:")
+
+    # ── Data-file sandbox injection (when _try_direct_data_download handled it) ──
+    # The download function cached the text in _page_text_cache but doesn't
+    # have access to state.sandbox_files.  Inject here so execute_code can
+    # actually open the file.
+    if (
+        tool_name == "fetch_url"
+        and "[DATA FILE DOWNLOADED:" in _raw_output
+    ):
+        _dl_url = str(tool_args.get("url", ""))
+        try:
+            from .tool_store import _page_text_cache, _page_text_cache_lock, _URL_CACHE_TTL
+            import base64 as _b64dl
+            import hashlib as _hldl
+            import re as _re_dl
+            with _page_text_cache_lock:
+                _dlcache = _page_text_cache.get(_dl_url)
+            if _dlcache and (time.time() - _dlcache[1] < _URL_CACHE_TTL):
+                _dl_data = _dlcache[0]
+                _dl_hash = _hldl.md5(_dl_url.encode()).hexdigest()[:8]
+                # Extract the sandbox filename from output (e.g. data_abc123.csv)
+                _fname_match = _re_dl.search(r"'(data_[0-9a-f]+\.\w+)'", output)
+                _dl_sandbox = _fname_match.group(1) if _fname_match else f"data_{_dl_hash}.txt"
+                # Try encoding as UTF-8 text first; fall back to raw (already base64 for binary)
+                try:
+                    _dl_enc = _b64dl.b64encode(_dl_data.encode("utf-8")).decode("ascii")
+                except (UnicodeDecodeError, AttributeError):
+                    _dl_enc = _dl_data  # already base64 for binary files
+                if state.sandbox_files is None:
+                    state.sandbox_files = {}
+                state.sandbox_files[_dl_sandbox] = _dl_enc
+                if state.verbose:
+                    print(f"       📂  Injected data download as {_dl_sandbox} into sandbox_files")
+        except Exception:
+            pass
+
     # ── Structured data nudge (sub-agents): use code, not eyeballing ──
+    # Skip if the direct-download path already handled the file, or if a
+    # truncation nudge will fire below (it injects the sandbox file too).
     if (
         state.depth > 0
         and tool_name == "fetch_url"
         and "[STRUCTURED DATA:" in _raw_output
+        and "[DATA FILE DOWNLOADED:" not in _raw_output
+        and not any(m in output for m in _truncation_markers)
     ):
-        output += (
-            "\n\n\u26a0\ufe0f STRUCTURED DATA: The response is machine-readable data (JSON/CSV/XML). "
-            "Do NOT try to read it manually. Instead:\n"
-            "  1. Use execute_code() to load and filter with pandas/json\n"
-            "  2. read_page(url=..., offset=0, max_chars=100000) can retrieve the full raw data\n"
-            "  3. Parse, filter, and extract only the values you need"
-        )
+        # Check if we already injected a sandbox file from the truncation nudge below;
+        # if so, reference that file name.  Otherwise, try to inject now.
+        _struct_sandbox_file = None
+        _struct_url = str(tool_args.get("url", ""))
+        try:
+            from .tool_store import _page_text_cache, _page_text_cache_lock, _URL_CACHE_TTL
+            import base64 as _b64s
+            import hashlib as _hls
+            with _page_text_cache_lock:
+                _sptc = _page_text_cache.get(_struct_url)
+            if _sptc and (time.time() - _sptc[1] < _URL_CACHE_TTL):
+                _sfull = _sptc[0]
+                _shash = _hls.md5(_struct_url.encode()).hexdigest()[:8]
+                _struct_sandbox_file = f"data_{_shash}.txt"
+                _senc = _b64s.b64encode(_sfull.encode("utf-8")).decode("ascii")
+                if state.sandbox_files is None:
+                    state.sandbox_files = {}
+                state.sandbox_files[_struct_sandbox_file] = _senc
+        except Exception:
+            pass
+
+        if _struct_sandbox_file:
+            output += (
+                f"\n\n\u26a0\ufe0f STRUCTURED DATA — USE CODE:\n"
+                f"  Full data ({len(_sfull):,} chars) is auto-loaded as '{_struct_sandbox_file}'.\n"
+                f"  Do NOT read it manually. Use execute_code instead:\n"
+                f"  execute_code(code=\"\"\"```python\n"
+                f"  import json\n"
+                f"  data = json.loads(open('{_struct_sandbox_file}').read())\n"
+                f"  # Filter, aggregate, extract what you need\n"
+                f"  print(json.dumps(data[:5], indent=2))  # preview first 5 entries\n"
+                f"  ```\"\"\")\n"
+            )
+        else:
+            output += (
+                "\n\n\u26a0\ufe0f STRUCTURED DATA: The response is machine-readable data (JSON/CSV/XML). "
+                "Do NOT try to read it manually. Instead:\n"
+                "  1. Use execute_code() to load and filter with pandas/json\n"
+                "  2. Parse, filter, and extract only the values you need\n"
+                "  3. For large datasets, use conduct_research with memory_keys to delegate to a sub-agent"
+            )
         if state.verbose:
             print(f"       \U0001f4ca  Structured data detected \u2014 code nudge injected")
+
+    # ── Truncation nudge: auto-inject full text into sandbox + steer to code ──
+    if (
+        tool_name in ("read_pdf", "fetch_cached", "wikipedia_lookup", "fetch_url")
+        and any(m in output for m in _truncation_markers)
+    ):
+        # Auto-inject full cached text into state.sandbox_files so the model's
+        # execute_code calls can open() it directly in the sandbox.
+        _trunc_url = str(tool_args.get("url", tool_args.get("title", "")))
+        _sandbox_filename = None
+        try:
+            from .tool_store import _page_text_cache, _page_text_cache_lock, _URL_CACHE_TTL
+            import base64 as _b64
+            import hashlib as _hl
+            with _page_text_cache_lock:
+                _ptc = _page_text_cache.get(_trunc_url)
+                # Also try wikipedia: prefix for wikipedia_lookup
+                if not _ptc and tool_name == "wikipedia_lookup":
+                    _ptc = _page_text_cache.get(f"wikipedia:{tool_args.get('title', '')}")
+            if _ptc and (time.time() - _ptc[1] < _URL_CACHE_TTL):
+                _full_text = _ptc[0]
+                # Generate a short stable filename from the URL
+                _url_hash = _hl.md5(_trunc_url.encode()).hexdigest()[:8]
+                _sandbox_filename = f"page_{_url_hash}.txt"
+                _encoded = _b64.b64encode(_full_text.encode("utf-8")).decode("ascii")
+                if state.sandbox_files is None:
+                    state.sandbox_files = {}
+                state.sandbox_files[_sandbox_filename] = _encoded
+                if state.verbose:
+                    print(f"       📂  Injected {len(_full_text):,} chars as {_sandbox_filename} into sandbox_files")
+        except Exception:
+            pass
+
+        # For sub-agents, add a concrete code nudge referencing the injected file
+        if state.depth > 0 and _sandbox_filename:
+            output += (
+                f"\n\n⚠️ TRUNCATED — FULL TEXT AVAILABLE IN SANDBOX:\n"
+                f"  The complete text ({len(_full_text):,} chars) has been auto-loaded as '{_sandbox_filename}'.\n"
+                f"  Search it with execute_code instead of reading page-by-page:\n"
+                f"  execute_code(code=\"\"\"```python\n"
+                f"  import re\n"
+                f"  text = open('{_sandbox_filename}').read()\n"
+                f"  # Find what you need:\n"
+                f"  matches = re.findall(r'your_pattern', text, re.I)\n"
+                f"  print(matches)\n"
+                f"  # Or search line by line:\n"
+                f"  for i, line in enumerate(text.split('\\n')):\n"
+                f"      if 'keyword' in line.lower(): print(f'Line {{i}}: {{line.strip()}}')\n"
+                f"  ```\"\"\")\n"
+            )
+            if state.verbose:
+                print(f"       📄  Truncated content — code strategy injected with {_sandbox_filename}")
+        elif state.depth > 0:
+            # Fallback nudge if injection failed
+            output += (
+                "\n\n⚠️ TIP: Use read_page(url=..., offset=0, max_chars=50000) to get more "
+                "of the text, then use execute_code to regex/filter through it."
+            )
 
     # ── Record in trace ───────────────────────────────────────────────
     tc_record = ToolCallRecord(
@@ -1810,6 +2295,40 @@ def handle_generic_tool(
                 pass
         elif tool_name == "read_pdf":
             desc = str(tool_args.get("url", ""))[:60]
+            # Store full PDF text from cache (same pattern as fetch_url)
+            try:
+                from .tool_store import _page_text_cache, _page_text_cache_lock, _URL_CACHE_TTL
+                pdf_url_str = str(tool_args.get("url", ""))
+                with _page_text_cache_lock:
+                    ptc = _page_text_cache.get(pdf_url_str)
+                if ptc and (time.time() - ptc[1] < _URL_CACHE_TTL):
+                    memory_content = ptc[0]
+            except Exception:
+                pass
+        elif tool_name == "wikipedia_lookup":
+            desc = str(tool_args.get("title", ""))[:60]
+            # Store full Wikipedia text from cache
+            try:
+                from .tool_store import _page_text_cache, _page_text_cache_lock, _URL_CACHE_TTL
+                wiki_key = f"wikipedia:{tool_args.get('title', '')}"
+                with _page_text_cache_lock:
+                    ptc = _page_text_cache.get(wiki_key)
+                if ptc and (time.time() - ptc[1] < _URL_CACHE_TTL):
+                    memory_content = ptc[0]
+            except Exception:
+                pass
+        elif tool_name == "fetch_cached":
+            desc = str(tool_args.get("url", ""))[:60]
+            # Store full Wayback text from cache
+            try:
+                from .tool_store import _page_text_cache, _page_text_cache_lock, _URL_CACHE_TTL
+                cached_url_str = str(tool_args.get("url", ""))
+                with _page_text_cache_lock:
+                    ptc = _page_text_cache.get(cached_url_str)
+                if ptc and (time.time() - ptc[1] < _URL_CACHE_TTL):
+                    memory_content = ptc[0]
+            except Exception:
+                pass
         elif tool_name == "spawn_agent":
             desc = str(tool_args.get("task", ""))[:60]
         mem_key = state.memory.add(

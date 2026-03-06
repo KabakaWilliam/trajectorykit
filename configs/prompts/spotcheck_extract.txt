@@ -31,6 +31,11 @@ resolution order. You should:
   - Map each chain step to the corresponding claim in the draft
   - Add the correct "depends_on" fields based on the pre-computed
     chain, not your own re-analysis
+  - For EACH intermediate chain step, extract a SEPARATE claim that
+    verifies the intermediate value itself (e.g. "The draft
+    identifies X as [intermediate]"). These intermediate claims
+    are essential — if any intermediate is wrong, the final answer
+    is wrong too.
   - Still extract any additional non-chain claims the draft makes
 
 If NO pre-computed chain is provided, determine the chain structure
@@ -68,6 +73,8 @@ PRIORITIZE:
   - Named events, people, or organizations with factual assertions
   - "First", "largest", "only", or other superlative claims
   - Claims central to answering the question (not peripheral detail)
+  - Data from API queries or databases (include the API URL in source_url)
+  - Quotes/Figures extracted from PDFs (include the PDF URL in source_url and guidance on where to check)
 
 SKIP:
   - Opinions or subjective assessments
@@ -107,9 +114,12 @@ RULES:
     "depends_on" for each link that relies on a previous link.
   - Each search_query should be a natural web search query — concise
     and specific enough to get relevant results.
-  - Include "source_url" ONLY when the draft explicitly cites a URL
-    for that claim. This lets us fetch the source directly to verify
-    the claim appears in it. Omit if no URL is cited.
+  - Include "source_url" when the draft explicitly cites a URL for
+    that claim — this includes API endpoints, PDF URLs, dataset pages,
+    and regular web pages.  The verifier will fetch it directly and
+    check whether the claimed data actually appears there.
+  - If the draft used an API query (e.g. data.gov, Socrata, REST API),
+    include the EXACT API URL as source_url — the verifier can re-run it.
   - If the draft is a refusal ("I couldn't find...") or contains no
     checkable factual claims, return: <claims>{"claims": []}</claims>
   - Do NOT fabricate claims that aren't in the draft.
