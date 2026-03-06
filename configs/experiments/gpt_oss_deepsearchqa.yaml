@@ -29,10 +29,17 @@ agent:
   draft_report: true              # update_draft tool at root for answer safety net
   verify_before_publish: true      # LLM audits draft before publishing
   spot_check_enabled: true          # Stage 2: search-verify key claims
-  spot_check_claims: 3
-  max_verification_rejections: 3    # Stage 1: verifier can reject up to N times before force-publish
-  max_spot_check_rejections: 3      # Stage 2: spot-check can reject up to N times before force-publish
+  spot_check_claims: 5
+  max_verification_rejections: 4    # Stage 1: verifier can reject up to N times before force-publish
+  max_spot_check_rejections: 4      # Stage 2: spot-check can reject up to N times before force-publish
   chain_analysis_enabled: true       # Pre-dispatch causal chain decomposition
+    # History compaction: replace old root messages with a compact summary once
+  # the draft absorbs their findings, reclaiming context window.
+  history_compaction_enabled: true
+  history_compaction_msg_threshold: 30  # min messages before first compaction
+  history_compaction_min_interval: 4   # min turns between compactions
+  history_compaction_recent_turns: 3   # keep last N turn-groups in full
+
 
 sandbox:
   url: "http://localhost:8080/run_code"
@@ -89,7 +96,12 @@ judge:
   threads: 5
   # rpm: 5   # uncomment to throttle (free tier = 5 RPM). Omit or null for unlimited (paid tier).
 
-# need to re-run tomorrow with the fixed cookie issue
-# our main limitation seems to be data fetching.
+ntfy:
+  enabled: true
+  url: "https://ntfy.sh"
+  topic: "trajectorykit-eval"
+  interval_pct: 10                # push notification every N% (0 = start/finish only)
+
+# For Deep Research Bench, use configs/experiments/gpt_oss_deep_research_bench.yaml
 
 

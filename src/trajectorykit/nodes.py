@@ -237,6 +237,90 @@ def handle_refine_draft(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# READ_DRAFT  (root only — view previous drafts + feedback)
+# ═══════════════════════════════════════════════════════════════════════
+
+def handle_read_draft(
+    state: AgentState,
+    tool_call: dict,
+    tool_args: dict,
+    turn_record: TurnRecord,
+    **kw,
+) -> NodeResult:
+    """Return a previous draft version and/or its verifier feedback."""
+    if state.depth != 0:
+        return _CONTINUE
+
+    if not state.draft_versions:
+        rd_output = "No drafts have been written yet. Use refine_draft(content='...') first."
+    else:
+        version = tool_args.get("version")
+        list_versions = tool_args.get("list_versions", False)
+        include_feedback = tool_args.get("include_feedback", False)
+
+        if list_versions:
+            # Show a compact table of all versions
+            lines = [f"Draft history ({len(state.draft_versions)} version{'s' if len(state.draft_versions) != 1 else ''}):"]
+            for i, (turn, text) in enumerate(state.draft_versions, 1):
+                fb = state.draft_feedback.get(i)
+                fb_tag = " \u274c rejected" if fb else ""
+                lines.append(f"  v{i}: turn {turn}, {len(text):,} chars{fb_tag}")
+            rd_output = "\n".join(lines)
+
+        elif version is not None:
+            # Return a specific version
+            try:
+                v = int(version)
+            except (ValueError, TypeError):
+                v = -1
+            if v < 1 or v > len(state.draft_versions):
+                rd_output = (
+                    f"Version {version} does not exist. "
+                    f"Valid versions: 1\u2013{len(state.draft_versions)}. "
+                    f"Call read_draft(list_versions=true) to see all."
+                )
+            else:
+                turn, text = state.draft_versions[v - 1]
+                rd_output = (
+                    f"\U0001f4c4 DRAFT v{v} (turn {turn}, {len(text):,} chars):\n\n"
+                    f"{text}"
+                )
+                if include_feedback:
+                    fb = state.draft_feedback.get(v)
+                    if fb:
+                        rd_output += f"\n\n\u2500\u2500\u2500 VERIFIER FEEDBACK (v{v}) \u2500\u2500\u2500\n{fb}"
+                    else:
+                        rd_output += f"\n\n(No verifier feedback recorded for v{v})"
+        else:
+            # Default: return the latest draft (same as what's injected)
+            v = len(state.draft_versions)
+            turn, text = state.draft_versions[-1]
+            rd_output = (
+                f"\U0001f4c4 CURRENT DRAFT v{v} (turn {turn}, {len(text):,} chars):\n\n"
+                f"{text}"
+            )
+            if include_feedback:
+                fb = state.draft_feedback.get(v)
+                if fb:
+                    rd_output += f"\n\n\u2500\u2500\u2500 VERIFIER FEEDBACK (v{v}) \u2500\u2500\u2500\n{fb}"
+                else:
+                    rd_output += f"\n\n(No verifier feedback recorded for v{v})"
+
+    tc_record = ToolCallRecord(
+        tool_name="read_draft", tool_args=tool_args,
+        tool_call_id=tool_call["id"], output=rd_output,
+        duration_s=0, child_trace=None,
+    )
+    turn_record.tool_calls.append(tc_record)
+    state.messages.append({
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "content": rd_output,
+    })
+    return _CONTINUE
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # RESEARCH_COMPLETE  (root only — verification + spot-check pipeline)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -646,6 +730,22 @@ def _spot_check_claims(
             "4. Prioritise primary sources: data portals, .gov/.edu sites, PDFs, Wikipedia\n"
             "5. If initial search results are weak, try different queries\n"
             "6. Fetch and READ the most relevant pages — don’t rely on snippets alone\n"
+            "7. VERSION MATCH: If the claim references a specific edition, year, or data "
+            "snapshot (e.g. 'Guardian 2024 rankings', '2020 Census'), verify against THAT "
+            "exact version — not a different year's edition. If you can only find a different "
+            "version, note the mismatch explicitly in your assessment.\n"
+            "8. ACCESS FAILURES: If you cannot access a source (paywall, 403/404, login-wall, "
+            "rate-limit, geo-block, API auth error):\n"
+            "   a) ALWAYS try the original URL first — paywalls aren't always enforced and "
+            "APIs sometimes allow limited unauthenticated access\n"
+            "   b) If blocked, state clearly: 'ACCESS FAILED: [url] — [reason]'\n"
+            "   c) Do NOT guess what the page contains — never fabricate evidence\n"
+            "   d) Pivot quickly to alternatives: open-access mirrors (Semantic Scholar, "
+            "PubMed Central, Internet Archive/Wayback Machine), cached versions, or "
+            "different search queries — do not retry the same blocked URL\n"
+            "   e) If you get partial access (e.g. abstract-only for a paper), report what you "
+            "CAN see and note it is partial\n"
+            "   f) If no alternative works, report INSUFFICIENT with the access failure details\n"
             "\nIn your final_answer, report:\n"
             "  • SOURCES CHECKED: [url] — [what it says about the claim]\n"
             "  • ASSESSMENT: SUPPORTED / CONTRADICTED / INSUFFICIENT\n"
@@ -1221,6 +1321,9 @@ def handle_research_complete(
             "role": "tool", "tool_call_id": tool_call["id"], "content": reject_msg,
         })
         state.draft_revised_since_rejection = False
+        # Store feedback keyed by draft version for read_draft retrieval
+        _fb_ver = len(state.draft_versions)
+        state.draft_feedback[_fb_ver] = verify_feedback
         return _CONTINUE
 
 
@@ -2378,6 +2481,7 @@ TOOL_HANDLERS.update({
     "think":                    handle_think,
     "search_available_tools":   handle_search_available_tools,
     "refine_draft":             handle_refine_draft,
+    "read_draft":               handle_read_draft,
     "research_complete":        handle_research_complete,
     "conduct_research":         handle_conduct_research,
     "summarize_webpage":        handle_summarize_webpage,

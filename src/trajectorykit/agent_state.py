@@ -12,7 +12,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple  # Dict used for draft_feedback
 
 from . import config as _cfg
 from .config import get_model_profile
@@ -83,6 +83,7 @@ class AgentState:
     # ── Draft management (root only) ──────────────────────────────────
     draft_path: Optional[str] = None
     draft_versions: List[Tuple[int, str]] = field(default_factory=list)
+    draft_feedback: Dict[int, str] = field(default_factory=dict)  # version → feedback
 
     # ── Verification (root only) ──────────────────────────────────────
     verification_rejections: int = 0
@@ -94,6 +95,9 @@ class AgentState:
 
     # ── Degeneration flag ─────────────────────────────────────────────
     degenerated: bool = False
+
+    # ── History truncation (root only) ────────────────────────────────
+    _last_truncation_turn: int = 0
 
     # ── Constants (configurable per run via config.yaml) ──────────────
     MAX_CONSECUTIVE_ERRORS: int = 3

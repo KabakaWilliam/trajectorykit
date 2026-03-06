@@ -39,6 +39,10 @@ _FALLBACK_CONFIG = {
         "plan_state": True,
         "plan_inject_interval": 3,
         "draft_report": True,
+        "history_compaction_enabled": True,
+        "history_compaction_msg_threshold": 30,
+        "history_compaction_min_interval": 4,
+        "history_compaction_recent_turns": 3,
     },
     "sandbox": {
         "url": "http://localhost:8080/run_code",
@@ -179,6 +183,8 @@ def _update_module_constants():
     global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
     global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
     global CHAIN_ANALYSIS_ENABLED, CHAIN_ANALYSIS_PROMPT
+    global HISTORY_COMPACTION_ENABLED, HISTORY_COMPACTION_MSG_THRESHOLD
+    global HISTORY_COMPACTION_MIN_INTERVAL, HISTORY_COMPACTION_RECENT_TURNS
 
     c = _config
 
@@ -259,6 +265,12 @@ def _update_module_constants():
         SPOTCHECK_REFUSAL_PROMPT = _load_prompt(spotcheck_refusal_path)
     except FileNotFoundError:
         SPOTCHECK_REFUSAL_PROMPT = ""
+
+    # History compaction (root context window management)
+    HISTORY_COMPACTION_ENABLED = agent_cfg.get("history_compaction_enabled", True)
+    HISTORY_COMPACTION_MSG_THRESHOLD = agent_cfg.get("history_compaction_msg_threshold", 30)
+    HISTORY_COMPACTION_MIN_INTERVAL = agent_cfg.get("history_compaction_min_interval", 4)
+    HISTORY_COMPACTION_RECENT_TURNS = agent_cfg.get("history_compaction_recent_turns", 3)
 
     # Chain analysis (pre-dispatch decomposition)
     CHAIN_ANALYSIS_ENABLED = agent_cfg.get("chain_analysis_enabled", False)

@@ -32,6 +32,12 @@ agent:
   spot_check_claims: 3            # max claims to verify per spot-check
   # Chain analysis: pre-dispatch causal chain decomposition for multi-hop questions.
   chain_analysis_enabled: false
+  # History compaction: replace old root messages with a compact summary once
+  # the draft absorbs their findings, reclaiming context window.
+  history_compaction_enabled: true
+  history_compaction_msg_threshold: 30  # min messages before first compaction
+  history_compaction_min_interval: 4   # min turns between compactions
+  history_compaction_recent_turns: 3   # keep last N turn-groups in full
 
 # ── Sandbox ────────────────────────────────────────────────────────────
 sandbox:
@@ -76,6 +82,15 @@ dataset:
   split: "eval"
   sample_n: 50               # random sample of N rows (null = use full dataset)
   seed: 42                    # random seed for reproducible sampling
+
+# ── Notifications (ntfy.sh push updates during eval) ──────────────────
+# Set a topic to get phone/desktop push notifications with progress.
+# Requires no signup — just subscribe to the same topic in the ntfy app.
+ntfy:
+  enabled: false
+  url: "https://ntfy.sh"          # server URL (or self-hosted instance)
+  topic: "trajectorykit-eval"     # topic name — pick something unique
+  interval_pct: 10                # notify every N% of prompts (0 = start/finish only)
 
 # ── Eval settings ──────────────────────────────────────────────────────
 eval:

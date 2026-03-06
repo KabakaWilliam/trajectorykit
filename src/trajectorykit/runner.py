@@ -268,6 +268,125 @@ def _finalize(state: AgentState, final_content: str) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# HISTORY COMPACTION  (evict stale messages once draft absorbs them)
+# Settings loaded from config: HISTORY_COMPACTION_*
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _compact_history(state: AgentState) -> None:
+    """Replace old messages with a compact summary, keeping recent turns.
+
+    Preserves:
+      - msg[0] (system prompt) and msg[1] (user question)
+      - A synthetic summary of evicted messages
+      - The last ``_RECENT_TURNS_KEEP`` turn-groups (assistant + tool msgs)
+
+    Everything else living on ``state`` (chain_plan, memory, findings,
+    draft_versions) is untouched — they live on Python objects, not in
+    the message list.  The chain plan and draft are re-injected every
+    turn by ``_inject_pre_turn``, so evicting their old injections is
+    safe.
+    """
+    msgs = state.messages
+    if len(msgs) < _cfg.HISTORY_COMPACTION_MSG_THRESHOLD:
+        return  # nothing to do
+
+    # ── Find the "recent window" boundary ─────────────────────────────
+    #  Walk backwards counting assistant messages (each one starts a
+    #  turn-group of assistant + subsequent tool/system messages).
+    keep_from = len(msgs)  # index from which we keep everything
+    asst_seen = 0
+    recent_keep = _cfg.HISTORY_COMPACTION_RECENT_TURNS
+    for i in range(len(msgs) - 1, 1, -1):  # skip msg[0] and msg[1]
+        if msgs[i].get("role") == "assistant":
+            asst_seen += 1
+            if asst_seen >= recent_keep:
+                keep_from = i
+                break
+    # Safety: never evict if we can't find enough turns
+    if keep_from <= 2:
+        return
+
+    evicted = msgs[2:keep_from]  # everything between header and recent
+    if not evicted:
+        return
+
+    # ── Build the synthetic summary ───────────────────────────────────
+    tool_counts: dict[str, int] = {}
+    mem_keys: list[str] = []
+    evicted_turns = set()
+    for m in evicted:
+        role = m.get("role", "")
+        content = m.get("content", "") or ""
+        if role == "assistant":
+            for tc in m.get("tool_calls", []):
+                tname = tc.get("function", {}).get("name", "?")
+                tool_counts[tname] = tool_counts.get(tname, 0) + 1
+        elif role == "tool":
+            # Capture any [Stored → key] references
+            import re as _re_compact
+            for match in _re_compact.finditer(r'\[Stored → ([^\]]+)\]', content):
+                mem_keys.append(match.group(1))
+
+    # Tool call summary line
+    tool_parts = [f"{cnt}x {name}" for name, cnt in sorted(tool_counts.items(), key=lambda x: -x[1])]
+    tool_line = ", ".join(tool_parts) if tool_parts else "(none)"
+
+    # Memory keys line
+    mem_line = ", ".join(mem_keys[:15]) if mem_keys else "(none stored)"
+    if len(mem_keys) > 15:
+        mem_line += f" … and {len(mem_keys) - 15} more"
+
+    # Chain status (rendered from live object, NOT from old messages)
+    chain_line = ""
+    if state.chain_plan is not None and state.chain_plan.has_chain:
+        parts = []
+        for s in state.chain_plan.chain_steps:
+            if s.is_resolved and s.resolved_value:
+                parts.append(f"Step {s.step} ✅ \"{s.resolved_value[:40]}\"")
+            else:
+                parts.append(f"Step {s.step} {'🔓' if s.is_unlocked else '🔒'}")
+        chain_line = f"\nChain progress: {' → '.join(parts)}"
+
+    # Draft status
+    draft_line = ""
+    if state.draft_versions:
+        _dv = len(state.draft_versions)
+        _dt, _dd = state.draft_versions[-1]
+        draft_line = (
+            f"\nDraft status: v{_dv} ({len(_dd):,} chars, saved turn {_dt}) "
+            f"already incorporates findings from evicted history."
+        )
+
+    summary = (
+        f"[HISTORY COMPRESSED — earlier messages archived]\n"
+        f"Tool calls in archived turns: {tool_line}\n"
+        f"Memory keys available: {mem_line}"
+        f"{chain_line}"
+        f"{draft_line}\n\n"
+        f"All research data remains accessible via memory_keys in "
+        f"conduct_research(). Your draft is the canonical summary of "
+        f"prior findings — focus on remaining gaps."
+    )
+
+    # ── Splice ────────────────────────────────────────────────────────
+    recent = msgs[keep_from:]
+    state.messages = [
+        msgs[0],                                        # system prompt
+        msgs[1],                                        # user question
+        {"role": "system", "content": summary},          # compressed history
+    ] + recent
+
+    if state.verbose:
+        evicted_chars = sum(len(m.get("content", "") or "") for m in evicted)
+        print(
+            f"📦  History compacted: {len(evicted)} messages ({evicted_chars:,} chars) "
+            f"→ 1 summary ({len(summary):,} chars). "
+            f"Keeping {len(recent)} recent messages."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # PRE-TURN INJECTIONS  (plan, draft, reminders, budget warnings)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -311,18 +430,36 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
             print(f"\U0001f50e  Injected periodic question reminder (turn {state.turn})")
 
     # ── Draft injection (root only, every turn after first draft) ────
+    # Inject the FULL current draft.  Avg draft is ~1.6K chars (p95 ~3K),
+    # so this is affordable.  After history compaction evicts old turns,
+    # this is the only copy in the context — must be complete.
     if state.depth == 0 and state.draft_versions:
         _draft_turn, _draft_text = state.draft_versions[-1]
-        _draft_preview = _draft_text[:4000] + ("\u2026" if len(_draft_text) > 4000 else "")
+        _ver = len(state.draft_versions)
+        _prev_note = ""
+        if _ver > 1:
+            _prev_note = f"  ({_ver - 1} previous version{'s' if _ver > 2 else ''} available via read_draft)\n"
         state.messages.append({"role": "system", "content": (
-            f"\U0001f4c4 YOUR CURRENT DRAFT (v{len(state.draft_versions)}, saved turn {_draft_turn}, "
+            f"\U0001f4c4 YOUR CURRENT DRAFT (v{_ver}, saved turn {_draft_turn}, "
             f"{len(_draft_text):,} chars):\n"
-            f"{_draft_preview}\n\n"
+            f"{_draft_text}\n\n"
+            f"{_prev_note}"
             "Review your draft. Are there gaps? Delegate more research with "
             "conduct_research. When satisfied, call research_complete to publish."
         )})
         if state.verbose:
-            print(f"\U0001f4c4  Injected draft v{len(state.draft_versions)} ({len(_draft_text):,} chars)")
+            print(f"\U0001f4c4  Injected full draft v{_ver} ({len(_draft_text):,} chars)")
+
+    # ── History compaction (root only, after draft exists) ────────────
+    # Once a draft absorbs research findings, old messages are redundant.
+    # Replace them with a compact summary to reclaim context window.
+    if (state.depth == 0
+            and _cfg.HISTORY_COMPACTION_ENABLED
+            and state.draft_versions
+            and len(state.messages) > _cfg.HISTORY_COMPACTION_MSG_THRESHOLD
+            and state.turn - state._last_truncation_turn >= _cfg.HISTORY_COMPACTION_MIN_INTERVAL):
+        _compact_history(state)
+        state._last_truncation_turn = state.turn
 
     # ── Tool gates (root only) ────────────────────────────────────────
     #
@@ -333,12 +470,13 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
     _hidden_reasons: list = []
 
     if state.depth == 0:
-        # Gate 1: research_complete hidden until a draft exists
+        # Gate 1: research_complete + read_draft hidden until a draft exists
         if not state.draft_versions:
             _hidden_tools.add("research_complete")
+            _hidden_tools.add("read_draft")
             _hidden_reasons.append(
-                "research_complete is not available yet — you must write a "
-                "draft first with refine_draft(content='...')."
+                "research_complete and read_draft are not available yet — you "
+                "must write a draft first with refine_draft(content='...')."
             )
 
         # Gate 2: research_complete hidden after rejection until draft revised

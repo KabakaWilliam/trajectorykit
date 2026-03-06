@@ -84,6 +84,29 @@ SKIP:
   - Vague statements that can't be verified via search
 
 ═══════════════════════════════════════════
+SOURCE VERSION AWARENESS
+═══════════════════════════════════════════
+
+Questions often reference a SPECIFIC edition, year, or snapshot of a
+data source (e.g. "Michellin 2024 rankings", "2020 US Census",
+"FIFA World Rankings as of March 2023").
+
+When you detect a version-specific reference:
+  1. Note the SOURCE NAME and VERSION/YEAR in the claim text itself.
+     e.g. "According to the Michellin 2024 university rankings, X is
+     ranked #6" — not just "X is ranked #6".
+  2. Make the search_query version-specific so the verifier fetches
+     the correct edition. e.g. "Michellin 2024 university rankings
+     career prospects" — not just "university career rankings".
+  3. If the draft uses a data mirror or cached copy (e.g. a third-party
+     site re-hosting government data), note which ORIGINAL source and
+     edition the data should correspond to.
+
+This ensures verifiers check the SAME version of the data the question
+asks about, not a different year's edition that may give different
+answers.
+
+═══════════════════════════════════════════
 OUTPUT FORMAT
 ═══════════════════════════════════════════
 
@@ -120,6 +143,20 @@ RULES:
     check whether the claimed data actually appears there.
   - If the draft used an API query (e.g. data.gov, Socrata, REST API),
     include the EXACT API URL as source_url — the verifier can re-run it.
+  - ACCESS-RESTRICTED SOURCES: If the draft cites a source likely to
+    be access-restricted (paywalled journals, authenticated APIs,
+    login-gated portals, geo-restricted content), still include the
+    source_url but add "access_note" to the claim:
+      "access_note": "paywalled journal — try original first, then fall back to open-access mirror"
+    The verifier will STILL attempt the original URL (paywalls aren't
+    always enforced, some APIs allow limited unauthenticated access),
+    but the note tells it to pivot quickly to alternatives if blocked
+    rather than retrying or spending many turns on the same source.
+    Common access-restricted patterns:
+      • Academic papers behind publisher paywalls (Elsevier, Springer, Wiley)
+      • Government portals requiring authentication or FOIA requests
+      • Premium data APIs (Bloomberg, Statista) requiring API keys
+      • Regional/geo-restricted news sites
   - If the draft is a refusal ("I couldn't find...") or contains no
     checkable factual claims, return: <claims>{"claims": []}</claims>
   - Do NOT fabricate claims that aren't in the draft.

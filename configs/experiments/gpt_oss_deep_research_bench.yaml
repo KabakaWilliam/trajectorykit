@@ -1,0 +1,104 @@
+# Experiment: GPT-OSS-20B on Deep Research Bench
+# Usage: python evals/eval_deep_research_bench.py --config configs/experiments/gpt_oss_deep_research_bench.yaml
+
+model:
+  name: "openai/gpt-oss-20b"
+  api_url: "http://localhost:3030/v1"
+
+vllm:
+  port: 3030
+  gpu_devices: [2]
+  gpu_memory_utilization: 0.9
+  tool_call_parser: "openai"
+  reasoning_parser: null
+  extra_args: ["--async-scheduling"]
+  env:
+    TIKTOKEN_CACHE_DIR: "/VData/resources/huggingface/tiktoken-cache"
+
+agent:
+  max_recursion_depth: 1
+  sub_agent_turn_budget: 15
+  token_safety_margin: 256
+  symbolic_references: false
+  symbolic_threshold: 500
+  plan_state: true
+  plan_inject_interval: 3
+  draft_report: true
+  verify_before_publish: true
+  spot_check_enabled: true
+  spot_check_claims: 5
+  max_verification_rejections: 4
+  max_spot_check_rejections: 4
+  chain_analysis_enabled: true
+  history_compaction_enabled: true
+  history_compaction_msg_threshold: 30
+  history_compaction_min_interval: 4
+  history_compaction_recent_turns: 3
+
+sandbox:
+  url: "http://localhost:8080/run_code"
+  port: 8080
+  sif_image: "sandbox-fusion_server-20250609.sif"
+  docker_uri: "docker://volcengine/sandbox-fusion:server-20250609"
+  sif_dir: "."
+
+traces:
+  dir: "deep_research_bench/traces/"
+
+prompts:
+  orchestrator: "configs/prompts/orchestrator.txt"
+  worker: "configs/prompts/worker.txt"
+  verifier: "configs/prompts/verifier.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
+  spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
+  chain_analysis: "configs/prompts/chain_analysis.txt"
+
+model_profiles:
+  "Qwen/Qwen3-8B":
+    context_window: 32768
+    supports_reasoning_effort: false
+    default_temperature: 0.7
+
+  "openai/gpt-oss-20b":
+    context_window: 131072
+    supports_reasoning_effort: true
+    default_reasoning_effort: "high"
+    default_temperature: 1.0
+
+default_profile:
+  context_window: 32768
+  supports_reasoning_effort: false
+  default_temperature: 0.7
+
+dataset:
+  name: "deep_research_bench"
+  query_file: "deep_research_bench/data/prompt_data/query.jsonl"
+  lang: "en"                             # uncomment to restrict: "en" or "zh"
+  limit: 5                              # uncomment to cap prompts (for testing)
+
+eval:
+  turn_length: null
+  reasoning_effort: "high"
+  verbose: true
+  output_dir: "deep_research_bench/traces"
+  workers: 8
+
+judge:
+  enabled: true
+  model: "gpt-4.1-mini"
+  threads: 5
+
+ntfy:
+  enabled: true
+  url: "https://ntfy.sh"
+  topic: "trajectorykit-eval"
+  interval_pct: 10
+
+deep_research_bench:
+  bench_dir: "deep_research_bench"
+  raw_data_dir: "deep_research_bench/data/test_data/raw_data"
+  output_dir: "deep_research_bench/results"
+  model_alias: "trajectorykit"
+  max_workers: 10
+  skip_cleaning: false

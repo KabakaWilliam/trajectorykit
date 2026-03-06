@@ -139,6 +139,14 @@ EVIDENCE QUALITY — weigh sources mentioned in verification reports:
     — do not use them alone to contradict a claim.
   - If a source comes from a domain unrelated to the claim topic,
     treat it as low-confidence.
+  - VERSION MISMATCH: If the question specifies a particular edition,
+    year, or data snapshot (e.g. "Michellin 2024", "2020 Census",
+    "as of March 2023"), evidence MUST come from that same version.
+    Data from a different year's edition (e.g. Michellin 2023 instead
+    of 2024) may give different answers and should be treated as
+    INSUFFICIENT rather than confirming or contradicting.  Similarly,
+    data mirrors or cached copies are acceptable ONLY if they reflect
+    the correct version/edition.
   - Outdated pages (check dates when visible) may no longer reflect
     current facts — note the date gap rather than auto-failing.
   - When multiple sources disagree, side with the higher-quality
@@ -167,6 +175,23 @@ EVIDENCE QUALITY — weigh sources mentioned in verification reports:
 - You are checking the draft against the provided evidence, NOT adding
   new information. Only flag contradictions you can back up with the
   evidence in the verification reports.
+
+  ACCESS FAILURE HANDLING:
+  If a verification agent reports it could not access a cited source
+  (paywall, 403/404, login-wall, rate-limit, geo-block, API auth):
+  - Check whether the agent found ALTERNATIVE evidence from other
+    sources. If alternative evidence supports or contradicts the
+    claim, judge the claim on that evidence normally.
+  - If the agent found NO alternative evidence and the ONLY basis
+    for the claim was the inaccessible source, treat the claim as
+    INSUFFICIENT — do not PASS it on faith that the source exists.
+  - If the agent reports PARTIAL access (e.g. abstract-only for a
+    paper, snippet from a paywalled article), weigh what is visible
+    but note the limitation — partial evidence is better than none
+    but weaker than full access.
+  - Never penalise the draft for citing a legitimate source that
+    happens to be access-restricted — the issue is verification
+    coverage, not source quality.
 
 - When in doubt, PASS. A published answer with minor imprecision
   beats an endlessly revised one.

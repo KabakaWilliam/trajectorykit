@@ -3980,6 +3980,42 @@ ROOT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "read_draft",
+            "description": (
+                "Read a previous draft version, list all versions, or view "
+                "verifier feedback on a rejected draft.\n\n"
+                "USE CASES:\n"
+                "  - read_draft(list_versions=true): see all versions with status\n"
+                "  - read_draft(version=2): read draft v2 in full\n"
+                "  - read_draft(version=2, include_feedback=true): read v2 + "
+                "the verifier's rejection feedback\n"
+                "  - read_draft(include_feedback=true): latest draft + feedback\n\n"
+                "Your current draft is already shown to you each turn — use this "
+                "tool to review PREVIOUS versions or verifier feedback."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "version": {
+                        "type": "integer",
+                        "description": "Draft version number to read (1-based). Omit for latest."
+                    },
+                    "list_versions": {
+                        "type": "boolean",
+                        "description": "If true, return a compact list of all draft versions instead of content."
+                    },
+                    "include_feedback": {
+                        "type": "boolean",
+                        "description": "If true, append the verifier's rejection feedback (if any) for the requested version."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "research_complete",
             "description": (
                 "Signal that your research is done and publish your draft as the "
