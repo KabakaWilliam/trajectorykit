@@ -30,6 +30,8 @@ agent:
   # Stage 2 spot-check: after consistency passes, search-verify key claims.
   spot_check_enabled: true
   spot_check_claims: 3            # max claims to verify per spot-check
+  # Chain analysis: pre-dispatch causal chain decomposition for multi-hop questions.
+  chain_analysis_enabled: false
 
 # ── Sandbox ────────────────────────────────────────────────────────────
 sandbox:
@@ -46,6 +48,8 @@ prompts:
   verifier: "configs/prompts/verifier.txt"
   spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
   spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
+  spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
+  chain_analysis: "configs/prompts/chain_analysis.txt"
 
 # ── Model profiles ─────────────────────────────────────────────────────
 # Each model's capabilities and defaults. Add new models here.

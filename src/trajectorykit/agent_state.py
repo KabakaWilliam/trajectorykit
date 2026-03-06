@@ -14,21 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from .config import (
-    MODEL_NAME,
-    SYSTEM_PROMPT,
-    WORKER_PROMPT,
-    SYNTHESIZER_PROMPT,
-    TOKEN_SAFETY_MARGIN,
-    TRACES_DIR,
-    get_model_profile,
-    SYMBOLIC_REFERENCES,
-    SYMBOLIC_THRESHOLD,
-    PLAN_STATE,
-    PLAN_INJECT_INTERVAL,
-    MAX_VERIFICATION_REJECTIONS,
-    MAX_SPOT_CHECK_REJECTIONS,
-)
+from . import config as _cfg
+from .config import get_model_profile
 from .memory import MemoryStore
 from .plan import ResearchPlan
 from .chain import ChainPlan
@@ -112,8 +99,8 @@ class AgentState:
     MAX_CONSECUTIVE_ERRORS: int = 3
     MAX_CONSECUTIVE_SEARCHES: int = 6
     CONSECUTIVE_SEARCH_WARNING: int = 5
-    MAX_VERIFICATION_REJECTIONS: int = MAX_VERIFICATION_REJECTIONS
-    MAX_SPOT_CHECK_REJECTIONS: int = MAX_SPOT_CHECK_REJECTIONS
+    MAX_VERIFICATION_REJECTIONS: int = field(default_factory=lambda: _cfg.MAX_VERIFICATION_REJECTIONS)
+    MAX_SPOT_CHECK_REJECTIONS: int = field(default_factory=lambda: _cfg.MAX_SPOT_CHECK_REJECTIONS)
 
 
 def create_state(
@@ -137,7 +124,7 @@ def create_state(
     """
 
     # ── Resolve model and its profile ─────────────────────────────────
-    model = model or MODEL_NAME
+    model = model or _cfg.MODEL_NAME
     profile = get_model_profile(model)
     context_window = profile["context_window"]
 
@@ -166,16 +153,16 @@ def create_state(
 
     # ── Depth-aware prompt & tool selection ────────────────────────────
     if _is_synthesizer:
-        system_prompt = SYNTHESIZER_PROMPT
+        system_prompt = _cfg.SYNTHESIZER_PROMPT
         available_tools = [
             t for t in TOOLS
             if t["function"]["name"] in ("execute_code", "final_answer", "search_available_tools")
         ]
     elif _depth == 0:
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = _cfg.SYSTEM_PROMPT
         available_tools = ROOT_TOOLS
     else:
-        system_prompt = WORKER_PROMPT
+        system_prompt = _cfg.WORKER_PROMPT
         available_tools = [
             t for t in TOOLS
             if t["function"]["name"] not in ("spawn_agent", "recall_memory", "update_draft")
@@ -196,17 +183,17 @@ def create_state(
     # ── Draft file path (root only) ──────────────────────────────────
     draft_path: Optional[str] = None
     if _depth == 0:
-        os.makedirs(TRACES_DIR, exist_ok=True)
-        draft_path = os.path.join(TRACES_DIR, f"draft_{episode.trace_id}.md")
+        os.makedirs(_cfg.TRACES_DIR, exist_ok=True)
+        draft_path = os.path.join(_cfg.TRACES_DIR, f"draft_{episode.trace_id}.md")
         with open(draft_path, "w", encoding="utf-8") as f:
             f.write("")
 
     # ── Research plan (root only) ─────────────────────────────────────
     plan: Optional[ResearchPlan] = None
-    if PLAN_STATE and _depth == 0:
+    if _cfg.PLAN_STATE and _depth == 0:
         q_plan = user_input[:300] + ("\u2026" if len(user_input) > 300 else "")
         plan = ResearchPlan(question=q_plan)
-        plan.INJECT_EVERY_N_TURNS = PLAN_INJECT_INTERVAL
+        plan.INJECT_EVERY_N_TURNS = _cfg.PLAN_INJECT_INTERVAL
 
     return AgentState(
         user_input=user_input,

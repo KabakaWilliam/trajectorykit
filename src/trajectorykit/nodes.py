@@ -28,17 +28,7 @@ if TYPE_CHECKING:
     from .chain import ChainPlan, ChainStep
 
 from .agent_state import AgentState
-from .config import (
-    VLLM_API_URL,
-    SYMBOLIC_REFERENCES,
-    SYMBOLIC_THRESHOLD,
-    VERIFY_BEFORE_PUBLISH,
-    VERIFIER_PROMPT,
-    SPOT_CHECK_ENABLED,
-    SPOTCHECK_EXTRACT_PROMPT,
-    SPOTCHECK_COMPARE_PROMPT,
-    SPOTCHECK_REFUSAL_PROMPT,
-)
+from . import config as _cfg
 from .symbolic import make_symbolic
 from .tool_store import dispatch_tool_call, fetch_url
 from .tracing import ToolCallRecord, TurnRecord
@@ -391,8 +381,8 @@ _extract_summary_tags = lambda text: _extract_xml_tag(text, "summary")
 def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str, str]:
     """Run Stage-1 LLM verifier.  Returns (should_publish, feedback, raw_text)."""
     if (
-        not VERIFY_BEFORE_PUBLISH
-        or not VERIFIER_PROMPT
+        not _cfg.VERIFY_BEFORE_PUBLISH
+        or not _cfg.VERIFIER_PROMPT
         or state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS
     ):
         if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS and state.verbose:
@@ -417,7 +407,7 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
                 + "\n".join(lines)
             )
         verify_messages = [
-            {"role": "system", "content": VERIFIER_PROMPT},
+            {"role": "system", "content": _cfg.VERIFIER_PROMPT},
             {
                 "role": "user",
                 "content": (
@@ -435,7 +425,7 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         }
         if state.verbose:
             print(f"       \U0001f50d Verifier: auditing draft (attempt {state.verification_rejections + 1})...")
-        resp = requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
+        resp = requests.post(f"{_cfg.VLLM_API_URL}/chat/completions", json=payload)
         if resp.status_code == 200:
             result = resp.json()
             raw_text = (
@@ -478,9 +468,9 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
     """
     meta: dict = {}
     if (
-        not SPOT_CHECK_ENABLED
-        or not SPOTCHECK_EXTRACT_PROMPT
-        or not SPOTCHECK_COMPARE_PROMPT
+        not _cfg.SPOT_CHECK_ENABLED
+        or not _cfg.SPOTCHECK_EXTRACT_PROMPT
+        or not _cfg.SPOTCHECK_COMPARE_PROMPT
         or state.spot_check_rejections >= state.MAX_SPOT_CHECK_REJECTIONS
     ):
         if state.spot_check_rejections >= state.MAX_SPOT_CHECK_REJECTIONS and state.verbose:
@@ -498,7 +488,7 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
         if state.chain_plan and state.chain_plan.has_chain:
             _chain_hint = f"\n\nPRE-COMPUTED CHAIN ANALYSIS:\n{state.chain_plan.render()}\n"
         sc_extract_msgs = [
-            {"role": "system", "content": SPOTCHECK_EXTRACT_PROMPT},
+            {"role": "system", "content": _cfg.SPOTCHECK_EXTRACT_PROMPT},
             {"role": "user", "content": (
                 f"QUESTION:\n{state.user_input}"
                 f"{_chain_hint}\n\n"
@@ -512,7 +502,7 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
             "max_tokens": state.max_tokens,
         }
         sc_extract_resp = requests.post(
-            f"{VLLM_API_URL}/chat/completions",
+            f"{_cfg.VLLM_API_URL}/chat/completions",
             json=sc_extract_payload,
         )
         sc_claims = []
@@ -558,6 +548,13 @@ def _spot_check_claims(
     if state.verbose:
         print(f"       \U0001f50e Spot-check: verifying {len(sc_claims)} claim(s)...")
 
+    # ── Verification sub-agent budget ───────────────────────────────
+    # 3 turns is enough: search → think+fetch → final_answer.
+    # Sub-agents can search, fetch pages, read PDFs, use Wikipedia,
+    # and think about what they find — far more expressive than the
+    # old mechanical pipeline, and they don’t pollute the main context.
+    _VERIFY_TURN_BUDGET = 3
+
     def _verify_one_claim(claim_obj):
         _q = claim_obj.get("search_query", "")
         _c = claim_obj.get("claim", "")
@@ -565,134 +562,72 @@ def _spot_check_claims(
         _depends_on = claim_obj.get("depends_on")  # chain dependency (int or None)
         if not _q and not _source_url:
             return None
+
+        # ── Build a focused verification task for a sub-agent ─────────
+        # The sub-agent gets the full tool suite (search, fetch, read_pdf,
+        # wikipedia_lookup, etc.) and can reason about what to check.
+        task_parts = [
+            "VERIFY this claim by gathering evidence from the web.\n",
+            f"CLAIM: {_c}\n",
+        ]
+        if _source_url:
+            task_parts.append(
+                f"The draft CITES this source: {_source_url}\n"
+                f"Fetch this page FIRST to check whether the claim actually appears there.\n"
+            )
+        if _q:
+            task_parts.append(f"SUGGESTED SEARCH: {_q}\n")
+        task_parts.append(
+            "\nINSTRUCTIONS:\n"
+            "1. Search for evidence about this claim\n"
+            "2. Prioritise primary sources: PDFs, .gov/.edu sites, Wikipedia\n"
+            "3. If initial search results are weak, try different queries\n"
+            "4. Fetch and READ the most relevant pages — don’t rely on snippets alone\n"
+            "5. Use read_pdf for PDF documents, wikipedia_lookup for encyclopedic facts\n"
+            "\nIn your final_answer, report:\n"
+            "  • SOURCES CHECKED: [url] — [what it says about the claim]\n"
+            "  • ASSESSMENT: SUPPORTED / CONTRADICTED / INSUFFICIENT\n"
+            "  • If CONTRADICTED, state what the evidence says instead\n"
+            "Be concise but include the key data points from each source."
+        )
+        task_prompt = "".join(task_parts)
+
         try:
-            _sr = ""
-            _ps = ""
-            _supplementary: list[dict] = []  # additional raw page excerpts
+            output, _child = dispatch_tool_call(
+                "spawn_agent",
+                {"task": task_prompt, "turn_length": _VERIFY_TURN_BUDGET},
+                _depth=state.depth,
+                model=state.model,
+                reasoning_effort=state.reasoning_effort,
+            )
 
-            # ── Strategy 1: If the extract provided a source URL, fetch ──
-            # it directly — the best evidence is the page the draft cited.
-            if _source_url:
-                try:
-                    _ps = _focused_page_summary(
-                        url=_source_url,
-                        focus=f"Verify this claim: {_c}",
-                        model=state.model,
-                        vllm_url=VLLM_API_URL,
-                        temperature=state.temperature,
-                        max_tokens=state.max_tokens,
-                    )
-                    if _ps.startswith(("Failed to fetch", "Page fetched but", "Summarization error")):
-                        if state.verbose:
-                            print(f"       ⚠️  Spot-check: cited source {_source_url[:60]} failed, falling back to search")
-                        _ps = ""
-                    elif state.verbose:
-                        print(f"       📄 Spot-check: verified cited source {_source_url[:60]} ({len(_ps)} chars)")
-                except Exception:
-                    _ps = ""
+            # Parse sub-agent JSON response to get the evidence report
+            evidence_report = output
+            try:
+                parsed = json.loads(output)
+                evidence_report = parsed.get("response", output)
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-            # ── Strategy 2: Search for independent corroboration ─────────
-            if _q:
-                _sr, _ = dispatch_tool_call("search_web", {"q": _q, "num_results": 5}, _depth=0)
-
-                # Extract ALL URLs from search results for multi-source verification.
-                _all_urls = re.findall(r'URL:\s*(https?://\S+)', _sr)
-
-                # Rank URLs: PDFs first (primary sources), then authoritative
-                # domains (.gov, .edu, .org, Wikipedia), then everything else.
-                # This counters the bias toward finding all info in search
-                # snippets — PDFs, government data, and academic papers often
-                # hold the definitive answer that snippets merely summarise.
-                _cited_domain = ""
-                if _source_url:
-                    _dm = re.search(r'https?://([^/]+)', _source_url)
-                    _cited_domain = _dm.group(1) if _dm else ""
-
-                _pdf_urls: list[str] = []
-                _primary_urls: list[str] = []
-                _other_urls: list[str] = []
-                for _u in _all_urls:
-                    if _u == _source_url:
-                        continue  # already fetched as cited source
-                    if _cited_domain:
-                        _um_domain = re.search(r'https?://([^/]+)', _u)
-                        if _um_domain and _um_domain.group(1) == _cited_domain:
-                            continue  # skip same-domain as cited source
-                    if _u.lower().rstrip('/').endswith('.pdf') or '/pdf/' in _u.lower():
-                        _pdf_urls.append(_u)
-                    elif any(d in _u for d in ('.gov/', '.edu/', '.org/', '.int/', 'wikipedia.org')):
-                        _primary_urls.append(_u)
-                    else:
-                        _other_urls.append(_u)
-                _ranked_urls = _pdf_urls + _primary_urls + _other_urls
-
-                # ── Primary page summary: LLM-summarised, from best URL ──
-                if not _ps and _ranked_urls:
-                    _top_url = _ranked_urls[0]
-                    try:
-                        _ps = _focused_page_summary(
-                            url=_top_url,
-                            focus=f"Verify this claim: {_c}",
-                            model=state.model,
-                            vllm_url=VLLM_API_URL,
-                            temperature=state.temperature,
-                            max_tokens=state.max_tokens,
-                        )
-                        if _ps.startswith(("Failed to fetch", "Page fetched but", "Summarization error")):
-                            _ps = ""
-                        elif state.verbose:
-                            print(f"       📄 Spot-check: summarized {_top_url[:60]} ({len(_ps)} chars)")
-                    except Exception:
-                        pass
-                    _ranked_urls = _ranked_urls[1:]
-
-                # ── Supplementary evidence: raw fetch (no LLM), cheap ────
-                # Fetch 1-2 additional sources for cross-verification.
-                # Chain claims get the full budget (2); regular claims get 1.
-                _supp_budget = 2 if _depends_on is not None else 1
-                for _supp_url in _ranked_urls[:_supp_budget]:
-                    try:
-                        _result = fetch_url(_supp_url, max_chars=50_000)
-                        if _result.get("ok"):
-                            _is_pdf = (
-                                _supp_url.lower().rstrip('/').endswith('.pdf')
-                                or '[PDF detected' in _result.get("content", "")
-                                or _result.get("source") == "read_pdf"
-                            )
-                            _supp_text = _result["content"][:3000 if _is_pdf else 2000]
-                            if len(_supp_text.strip()) > 100:
-                                _supplementary.append({
-                                    "url": _supp_url,
-                                    "content": _supp_text,
-                                    "is_pdf": _is_pdf,
-                                })
-                                if state.verbose:
-                                    _tag = "📑" if _is_pdf else "📄"
-                                    print(f"       {_tag} Spot-check: supplementary {_supp_url[:50]} "
-                                          f"({len(_supp_text)} chars{', PDF' if _is_pdf else ''})")
-                    except Exception:
-                        pass
+            if state.verbose:
+                print(f"       🔍 Spot-check sub-agent: claim verified ({len(evidence_report)} chars)")
 
             return {
                 "claim": _c,
                 "search_query": _q,
                 "source_url": _source_url,
                 "depends_on": _depends_on,
-                "search_results": _sr[:3000] if _sr else "",
-                "page_content": _ps,
-                "supplementary_pages": _supplementary,
+                "evidence_report": evidence_report,
             }
         except Exception as e:
             if state.verbose:
-                print(f"       ⚠️  Spot-check search error: {e}")
+                print(f"       ⚠️  Spot-check sub-agent error: {e}")
             return {
                 "claim": _c,
                 "search_query": _q,
                 "source_url": _source_url,
                 "depends_on": _depends_on,
-                "search_results": f"(search failed: {e})",
-                "page_content": "",
-                "supplementary_pages": [],
+                "evidence_report": f"(verification failed: {e})",
             }
 
     max_workers = min(len(sc_claims), 4)
@@ -707,15 +642,12 @@ def _spot_check_claims(
     meta["claims_checked"] = len(sc_evidence)
 
     # Short-circuit: if >50% degraded evidence, auto-PASS.
-    # A claim is degraded only if search failed AND it has no page content
-    # AND no supplementary pages (PDFs, gov docs, etc.).
+    # A claim is degraded if the sub-agent failed or returned very little.
     if sc_evidence:
         degraded = sum(
             1 for ev in sc_evidence
-            if (
-                ev["search_results"].startswith("(search failed")
-                or (not ev["page_content"] and len(ev["search_results"]) < 200)
-            ) and not ev.get("supplementary_pages")
+            if ev.get("evidence_report", "").startswith("(verification failed")
+            or len(ev.get("evidence_report", "").strip()) < 100
         )
         if degraded > len(sc_evidence) / 2:
             meta["spot_check_verdict"] = "PASSED"
@@ -743,19 +675,8 @@ def _spot_check_claims(
         part = f"CLAIM {i}: {ev['claim']}\n"
         if ev.get("depends_on") is not None:
             part += f"DEPENDS ON: Claim {ev['depends_on']}\n"
-        if ev.get("source_url"):
-            part += f"CITED SOURCE URL: {ev['source_url']}\n"
-        if ev.get("search_query"):
-            part += f"SEARCH QUERY: {ev['search_query']}\n"
-        if ev.get("search_results"):
-            part += f"SEARCH RESULTS:\n{ev['search_results']}"
-        if ev.get("page_content"):
-            source_label = "CITED SOURCE CONTENT" if ev.get("source_url") else "SUMMARY OF TOP RESULT"
-            part += f"\n\n{source_label}:\n{ev['page_content']}"
-        # ── Supplementary pages (raw fetches — PDFs, gov sites, etc.) ─
-        for sp in (ev.get("supplementary_pages") or []):
-            sp_label = "PDF DOCUMENT" if sp.get("is_pdf") else "ADDITIONAL SOURCE"
-            part += f"\n\n{sp_label} ({sp['url'][:80]}):\n{sp['content']}"
+        report = ev.get("evidence_report", "(no evidence gathered)")
+        part += f"\nVERIFICATION EVIDENCE:\n{report}"
         evidence_parts.append(part)
     evidence_text = "\n\n".join(evidence_parts)
 
@@ -768,7 +689,7 @@ def _spot_check_claims(
         )
 
     compare_msgs = [
-        {"role": "system", "content": SPOTCHECK_COMPARE_PROMPT},
+        {"role": "system", "content": _cfg.SPOTCHECK_COMPARE_PROMPT},
         {"role": "user", "content": (
             f"QUESTION:\n{state.user_input}\n\n"
             f"DRAFT ANSWER (excerpt of checked claims):\n\n"
@@ -777,7 +698,7 @@ def _spot_check_claims(
         )},
     ]
     compare_resp = requests.post(
-        f"{VLLM_API_URL}/chat/completions",
+        f"{_cfg.VLLM_API_URL}/chat/completions",
         json={
             "model": state.model,
             "messages": compare_msgs,
@@ -833,7 +754,7 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
     draft_lower = draft_content.lower()
     is_refusal = any(re.search(p, draft_lower) for p in refusal_patterns)
 
-    if not is_refusal or not SPOTCHECK_REFUSAL_PROMPT:
+    if not is_refusal or not _cfg.SPOTCHECK_REFUSAL_PROMPT:
         if state.verbose and not is_refusal:
             print(f"       \u2139\ufe0f  Spot-check: no checkable claims extracted, skipping")
         return True, "", "", meta
@@ -848,32 +769,38 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
     if state.chain_plan and state.chain_plan.has_chain and state.chain_plan.chain_steps:
         _step1 = state.chain_plan.chain_steps[0]
         rc_query = _step1.lookup[:200]
-    try:
-        rc_search_result, _ = dispatch_tool_call("search_web", {"q": rc_query, "num_results": 5}, _depth=0)
-        rc_page_summary = ""
-        rc_url_match = re.search(r'URL:\s*(https?://\S+)', rc_search_result)
-        if rc_url_match:
-            rc_top_url = rc_url_match.group(1)
-            try:
-                rc_page_summary = _focused_page_summary(
-                    url=rc_top_url,
-                    focus=f"Find information relevant to: {state.user_input[:300]}",
-                    model=state.model,
-                    vllm_url=VLLM_API_URL,
-                    temperature=state.temperature,
-                    max_tokens=state.max_tokens,
-                )
-                if rc_page_summary.startswith(("Failed to fetch", "Page fetched but", "Summarization error")):
-                    rc_page_summary = ""
-            except Exception:
-                pass
 
-        rc_evidence_text = f"SEARCH RESULTS:\n{rc_search_result[:4000]}"
-        if rc_page_summary:
-            rc_evidence_text += f"\n\nSUMMARY OF TOP RESULT:\n{rc_page_summary}"
+    # ── Spawn a sub-agent to independently investigate the question ──
+    # This is more expressive than the old search+fetch pipeline — the
+    # sub-agent can try multiple queries, read PDFs, use Wikipedia, etc.
+    try:
+        rc_task = (
+            f"Find evidence that answers this question:\n"
+            f"QUESTION: {state.user_input[:500]}\n\n"
+            f"SUGGESTED SEARCH: {rc_query}\n\n"
+            f"Search the web, fetch relevant pages, read PDFs, try Wikipedia. "
+            f"If initial results are weak, try different search queries. "
+            f"Report what you find — even partial information is valuable."
+        )
+        rc_output, _ = dispatch_tool_call(
+            "spawn_agent",
+            {"task": rc_task, "turn_length": 3},
+            _depth=state.depth,
+            model=state.model,
+            reasoning_effort=state.reasoning_effort,
+        )
+        rc_evidence_text = rc_output
+        try:
+            rc_parsed = json.loads(rc_output)
+            rc_evidence_text = rc_parsed.get("response", rc_output)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if state.verbose:
+            print(f"       \U0001f50d Refusal challenge sub-agent: gathered {len(rc_evidence_text)} chars of evidence")
 
         rc_msgs = [
-            {"role": "system", "content": SPOTCHECK_REFUSAL_PROMPT},
+            {"role": "system", "content": _cfg.SPOTCHECK_REFUSAL_PROMPT},
             {"role": "user", "content": (
                 f"QUESTION:\n{state.user_input}\n\n"
                 f"DRAFT ANSWER (REFUSAL):\n{draft_content[:2000]}\n\n"
@@ -881,7 +808,7 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
             )},
         ]
         rc_resp = requests.post(
-            f"{VLLM_API_URL}/chat/completions",
+            f"{_cfg.VLLM_API_URL}/chat/completions",
             json={
                 "model": state.model,
                 "messages": rc_msgs,
@@ -1339,7 +1266,7 @@ def handle_conduct_research(
         r"\1[file content saved to trace]\2",
         output, flags=re.DOTALL,
     )
-    if SYMBOLIC_REFERENCES and mem_key is not None and len(msg_output) > SYMBOLIC_THRESHOLD:
+    if _cfg.SYMBOLIC_REFERENCES and mem_key is not None and len(msg_output) > _cfg.SYMBOLIC_THRESHOLD:
         msg_output = make_symbolic(
             tool_name="conduct_research", tool_args=tool_args,
             output=msg_output, memory_key=mem_key,
@@ -1379,7 +1306,7 @@ def handle_summarize_webpage(
         try:
             sw_output = _focused_page_summary(
                 url=sw_url, focus=sw_focus, model=state.model,
-                vllm_url=VLLM_API_URL,
+                vllm_url=_cfg.VLLM_API_URL,
                 temperature=state.temperature,
                 max_tokens=state.max_tokens,
             )
@@ -1424,7 +1351,7 @@ def handle_summarize_webpage(
 
     # Symbolic compression
     msg_output = sw_output
-    if SYMBOLIC_REFERENCES and mem_key is not None and len(msg_output) > SYMBOLIC_THRESHOLD:
+    if _cfg.SYMBOLIC_REFERENCES and mem_key is not None and len(msg_output) > _cfg.SYMBOLIC_THRESHOLD:
         msg_output = make_symbolic(
             tool_name="summarize_webpage", tool_args=tool_args,
             output=msg_output, memory_key=mem_key,
@@ -1533,7 +1460,7 @@ def handle_compress_findings(
                 "temperature": state.temperature,
                 "max_tokens": state.max_tokens,
             }
-            cf_resp = requests.post(f"{VLLM_API_URL}/chat/completions", json=cf_payload)
+            cf_resp = requests.post(f"{_cfg.VLLM_API_URL}/chat/completions", json=cf_payload)
             if cf_resp.status_code == 200:
                 cf_result = cf_resp.json()
                 cf_choices = cf_result.get("choices", [])
@@ -1600,49 +1527,29 @@ def handle_final_answer(
     args_were_malformed: bool = False,
     **kw,
 ) -> NodeResult:
-    """Handle final_answer — terminal for sub-agents, redirect for root."""
+    """Handle final_answer — terminal for sub-agents only.
 
-    # ── Root: redirect to refine_draft + research_complete flow ──
+    Root calls should be blocked by runner.py before reaching here.
+    If one slips through, hard-block it (no draft saving, no redirect).
+    """
+
+    # ── Root: hard block (safety net — runner.py should catch first) ──
     if state.depth == 0:
-        fa_content = tool_args.get("answer", "").strip()
-        if fa_content and len(fa_content) >= 20:
-            state.draft_versions.append((state.turn, fa_content))
-            ver = len(state.draft_versions)
-            if state.draft_path:
-                try:
-                    with open(state.draft_path, "w", encoding="utf-8") as f:
-                        f.write(f"<!-- Draft v{ver} | turn {state.turn} -->\n")
-                        f.write(fa_content)
-                except Exception:
-                    pass
-            state.memory.upsert(
-                key="draft_latest", tool_name="refine_draft",
-                turn=state.turn, content=fa_content,
-                description="latest draft answer",
-            )
-            redirect_msg = (
-                f"\u2705 Draft v{ver} saved ({len(fa_content):,} chars).\n\n"
-                "NOTE: You called final_answer, but you should use "
-                "research_complete() to publish. This runs a quality "
-                "review before publishing. Call research_complete() now."
-            )
-        else:
-            redirect_msg = (
-                "ERROR: final_answer is not available at root level. "
-                "Use refine_draft(content='...') to write your answer, "
-                "then research_complete() to publish it."
-            )
+        error_msg = (
+            "⛔ final_answer is NOT available at root level. "
+            "Use refine_draft(content='...') then research_complete()."
+        )
         tc_record = ToolCallRecord(
             tool_name="final_answer", tool_args=tool_args,
-            tool_call_id=tool_call["id"], output=redirect_msg,
+            tool_call_id=tool_call["id"], output=error_msg,
             duration_s=0, child_trace=None,
         )
         turn_record.tool_calls.append(tc_record)
         state.messages.append({
-            "role": "tool", "tool_call_id": tool_call["id"], "content": redirect_msg,
+            "role": "tool", "tool_call_id": tool_call["id"], "content": error_msg,
         })
         if state.verbose:
-            print(f"   \u21a9\ufe0f  Root called final_answer \u2014 redirected to draft v{len(state.draft_versions)}")
+            print(f"   ⛔ Root called final_answer — hard-blocked")
         return _CONTINUE
 
     # ── Sub-agent / synthesizer path ──────────────────────────────────
@@ -1776,6 +1683,13 @@ def handle_generic_tool(
         state.consecutive_error_count = 0
         state.last_error_signature = None
 
+    # ── Snapshot raw tool output before any nudge annotations ─────────
+    # All detection gates below must classify _raw_output (the tool's
+    # actual return value), not `output` which accumulates nudge text
+    # from earlier gates and can false-trigger later ones (e.g. the word
+    # "blocked" in the consecutive-search warning triggering is_blocked).
+    _raw_output = output
+
     # ── Consecutive search enforcement (sub-agents only) ──────────────
     _SEARCH_TOOLS = ("search_web", "fetch_url", "read_pdf", "extract_tables", "fetch_cached", "wikipedia_lookup")
     if state.depth > 0 and tool_name in _SEARCH_TOOLS:
@@ -1804,8 +1718,8 @@ def handle_generic_tool(
     if state.depth > 0 and not output.startswith(("ERROR:", "\u26d4")):
         empty_nudge = ""
         if tool_name == "search_web":
-            has_urls = bool(re.search(r'URL:\s*https?://', output))
-            if not has_urls or len(output.strip()) < 100:
+            has_urls = bool(re.search(r'URL:\s*https?://', _raw_output))
+            if not has_urls or len(_raw_output.strip()) < 100:
                 empty_nudge = (
                     "\n\n\u26a0\ufe0f EMPTY/POOR RESULTS: This search returned little or no useful data. "
                     "Before retrying, try:\n"
@@ -1816,8 +1730,8 @@ def handle_generic_tool(
                     "Do NOT repeat the same query. Call think() to plan a different approach."
                 )
         elif tool_name in ("fetch_url", "extract_tables", "wikipedia_lookup"):
-            content_len = len(output.strip())
-            is_blocked = any(p in output.lower() for p in [
+            content_len = len(_raw_output.strip())
+            is_blocked = any(p in _raw_output.lower() for p in [
                 "blocked", "access denied", "403", "captcha",
                 "cloudflare", "do not retry this url",
             ])
@@ -1846,6 +1760,22 @@ def handle_generic_tool(
             output += empty_nudge
             if state.verbose:
                 print(f"       \u26a0\ufe0f  Empty/low-quality result detected \u2014 nudge injected")
+
+    # ── Structured data nudge (sub-agents): use code, not eyeballing ──
+    if (
+        state.depth > 0
+        and tool_name == "fetch_url"
+        and "[STRUCTURED DATA:" in _raw_output
+    ):
+        output += (
+            "\n\n\u26a0\ufe0f STRUCTURED DATA: The response is machine-readable data (JSON/CSV/XML). "
+            "Do NOT try to read it manually. Instead:\n"
+            "  1. Use execute_code() to load and filter with pandas/json\n"
+            "  2. read_page(url=..., offset=0, max_chars=100000) can retrieve the full raw data\n"
+            "  3. Parse, filter, and extract only the values you need"
+        )
+        if state.verbose:
+            print(f"       \U0001f4ca  Structured data detected \u2014 code nudge injected")
 
     # ── Record in trace ───────────────────────────────────────────────
     tc_record = ToolCallRecord(
@@ -1901,10 +1831,10 @@ def handle_generic_tool(
         output, flags=re.DOTALL,
     )
     if (
-        SYMBOLIC_REFERENCES
+        _cfg.SYMBOLIC_REFERENCES
         and state.depth == 0
         and mem_key is not None
-        and len(msg_output) > SYMBOLIC_THRESHOLD
+        and len(msg_output) > _cfg.SYMBOLIC_THRESHOLD
     ):
         msg_output = make_symbolic(
             tool_name=tool_name, tool_args=tool_args,

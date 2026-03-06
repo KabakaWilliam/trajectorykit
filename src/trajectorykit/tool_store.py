@@ -1,7 +1,8 @@
 import requests
 from typing import Any, Callable, Dict, List, Optional,Tuple, Union
 from .utils import SUPPORTED_LANGUAGES, API_TIMEOUT, MAX_RETRIES, INITIAL_RETRY_DELAY
-from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW
+from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, CONTEXT_WINDOW  # noqa: F811 — re-import ensures fresh values
+from . import config as _cfg
 from .tracing import EpisodeTrace  # adjust import path to wherever EpisodeTrace lives
 import logging
 import os
@@ -467,7 +468,7 @@ _blocked_domains_lock = _threading.Lock()
 # Stores raw HTML keyed by URL. Parsing (extract, css_selector, max_chars)
 # still happens per-call so different callers all benefit from one fetch.
 _URL_CACHE_TTL = 600  # seconds (10 min)
-_url_cache: dict[str, tuple[str, str, int, float]] = {}  # url → (html, final_url, status, ts)
+_url_cache: dict[str, tuple[str, str, int, float, str]] = {}  # url → (html, final_url, status, ts, content_type)
 _url_cache_lock = _threading.Lock()
 
 # ── URL fetch counter + content fingerprint ───────────────────────────
@@ -567,6 +568,230 @@ def _get_cached_full_length(url: str) -> int:
         cached = _page_text_cache.get(url)
     return len(cached[0]) if cached else 0
 
+
+def _extract_api_error_label(body) -> str | None:
+    """Try to extract a human-readable error message from a JSON API error body.
+
+    Handles common patterns from APIs like Eurostat, REST frameworks, etc.:
+      {"error": [{"status": 400, "label": "Invalid value for ..."}]}
+      {"error": "some message"}
+      {"message": "some message"}
+      {"detail": "some message"}
+      {"errors": [{"message": "..."}]}
+    Returns None if no recognisable error structure is found.
+    """
+    if not isinstance(body, dict):
+        return None
+    # {"error": [{"label": "..."}]}  (Eurostat style)
+    err = body.get("error")
+    if isinstance(err, list):
+        labels = [e.get("label") or e.get("message") or e.get("detail") or ""
+                  for e in err if isinstance(e, dict)]
+        labels = [l for l in labels if l]
+        if labels:
+            return "; ".join(labels)
+    # {"error": "string message"}
+    if isinstance(err, str) and err:
+        return err
+    # {"message": "..."}
+    msg = body.get("message")
+    if isinstance(msg, str) and msg:
+        return msg
+    # {"detail": "..."}
+    detail = body.get("detail")
+    if isinstance(detail, str) and detail:
+        return detail
+    # {"errors": [{"message": "..."}]}
+    errs = body.get("errors")
+    if isinstance(errs, list):
+        msgs = [e.get("message") or "" for e in errs if isinstance(e, dict)]
+        msgs = [m for m in msgs if m]
+        if msgs:
+            return "; ".join(msgs)
+    return None
+
+
+def _status_code_hint(status_code: int, api_label: str | None = None) -> str:
+    """Return a status-code-appropriate hint for the model.
+
+    Critical: distinguishes between 'blocked' (403/CF) and
+    'bad request' (400) / 'not found' (404) which are API-level
+    errors where retrying a different renderer (Jina/Wayback) won't help.
+    """
+    if api_label:
+        _label = api_label.rstrip(". ")
+        return (
+            f"The remote API rejected this request (HTTP {status_code}): {_label}. "
+            "Fix the query parameters and retry with corrected values. "
+            "Do NOT retry the exact same URL."
+        )
+    if status_code == 400:
+        return (
+            "Bad Request (HTTP 400): the server understood the URL but the query "
+            "parameters are invalid. Check the API documentation for correct "
+            "parameter names/values and retry with a fixed URL."
+        )
+    if status_code == 404:
+        return (
+            "Not Found (HTTP 404): the resource does not exist at this URL. "
+            "The path, dataset ID, or endpoint name may be wrong. "
+            "Search for the correct URL or try a different data source."
+        )
+    if status_code == 403:
+        return (
+            "Forbidden (HTTP 403): the site blocked automated access. "
+            "Do NOT retry this URL. Search for the same information from a "
+            "different source, or try wikipedia_lookup() if applicable."
+        )
+    if status_code == 429:
+        return (
+            "Rate Limited (HTTP 429): too many requests. "
+            "Wait before retrying, or search for the data from a different source."
+        )
+    if status_code >= 500:
+        return (
+            f"Server Error (HTTP {status_code}): the remote server had an internal "
+            "error. This may be transient — you can retry once, or try a different source."
+        )
+    return (
+        f"HTTP {status_code} error. Do NOT retry the exact same URL. "
+        "Search for the same information from a different source."
+    )
+
+
+def _generate_structured_preview(raw_text: str, content_type: str) -> str:
+    """Generate a smart preview of structured data (JSON/CSV/XML).
+
+    Instead of blind truncation that breaks records mid-field, this
+    produces a human-readable summary: schema, record count, and
+    a few sample records.  The full data remains in _page_text_cache
+    for read_page() and in memory for sub-agent consumption.
+    """
+    lines: list[str] = []
+    total = len(raw_text)
+
+    # ── JSON ──────────────────────────────────────────────────────
+    if "json" in content_type or raw_text.lstrip()[:1] in ("{" , "["):
+        try:
+            data = json.loads(raw_text)
+        except (json.JSONDecodeError, ValueError):
+            lines.append(f"[⚠ PREVIEW — Malformed JSON, {total:,} chars total, showing first 3,000]")
+            lines.append(raw_text[:3000])
+            return "\n".join(lines)
+
+        if isinstance(data, list):
+            lines.append(f"[⚠ PREVIEW — JSON Array, {len(data):,} records, {total:,} chars total. Full data is in memory.]")
+            if data and isinstance(data[0], dict):
+                lines.append(f"Record keys: {', '.join(data[0].keys())}")
+            for i, rec in enumerate(data[:3]):
+                lines.append(f"  [{i}] {json.dumps(rec, ensure_ascii=False)[:600]}")
+            if len(data) > 3:
+                lines.append(f"  ... ({len(data) - 3:,} more records)")
+        elif isinstance(data, dict):
+            lines.append(f"[⚠ PREVIEW — JSON Object, {len(data)} top-level keys, {total:,} chars total. Full data is in memory.]")
+            for k, v in data.items():
+                if isinstance(v, list):
+                    lines.append(f"  '{k}': array[{len(v)}]")
+                    if v and isinstance(v[0], dict):
+                        lines.append(f"    item keys: {', '.join(v[0].keys())}")
+                        lines.append(f"    sample: {json.dumps(v[0], ensure_ascii=False)[:400]}")
+                    elif v:
+                        lines.append(f"    sample: {json.dumps(v[:5], ensure_ascii=False)[:400]}")
+                elif isinstance(v, dict):
+                    sub_keys = list(v.keys())
+                    lines.append(f"  '{k}': object({len(sub_keys)} keys)")
+                    if len(sub_keys) <= 8:
+                        lines.append(f"    keys: {', '.join(str(sk) for sk in sub_keys)}")
+                    else:
+                        lines.append(f"    keys (first 8): {', '.join(str(sk) for sk in sub_keys[:8])} ...")
+                else:
+                    lines.append(f"  '{k}': {json.dumps(v, ensure_ascii=False)[:200]}")
+        else:
+            lines.append(f"[⚠ PREVIEW — JSON primitive, {total:,} chars total]")
+            lines.append(json.dumps(data, ensure_ascii=False)[:2000])
+        return "\n".join(lines)
+
+    # ── CSV ───────────────────────────────────────────────────────
+    if "csv" in content_type:
+        text_lines = raw_text.split("\n")
+        non_empty = [l for l in text_lines if l.strip()]
+        lines.append(f"[⚠ PREVIEW — CSV Data, {len(non_empty):,} rows, {total:,} chars total. Full data is in memory.]")
+        for i, line in enumerate(non_empty[:5]):
+            prefix = "  HEADER: " if i == 0 else f"  [{i}] "
+            lines.append(f"{prefix}{line[:500]}")
+        if len(non_empty) > 5:
+            lines.append(f"  ... ({len(non_empty) - 5:,} more rows)")
+        return "\n".join(lines)
+
+    # ── XML ───────────────────────────────────────────────────────
+    if "xml" in content_type:
+        import re as _re_xml
+        tags = _re_xml.findall(r"<(\w+)[\s>]", raw_text[:10000])
+        unique_tags = list(dict.fromkeys(tags))[:20]
+        lines.append(f"[⚠ PREVIEW — XML Data, {total:,} chars total. Full data is in memory.]")
+        if unique_tags:
+            lines.append(f"Elements: {', '.join(unique_tags)}")
+        lines.append(raw_text[:3000])
+        return "\n".join(lines)
+
+    # Fallback
+    lines.append(f"[⚠ PREVIEW — Structured data, {total:,} chars total. Full data is in memory.]")
+    lines.append(raw_text[:3000])
+    return "\n".join(lines)
+
+
+def _detect_jina_api_error(jina_content: str) -> tuple[int, str] | None:
+    """Detect API errors rendered through Jina Reader.
+
+    Jina renders the target page even when it returns an HTTP error.
+    The output looks like:
+        Title: ...
+        URL Source: ...
+        Warning: Target URL returned error 400: Bad Request
+        Markdown Content:
+        { "error": [{"status": 400, "label": "Invalid value for ..."}]}
+
+    Returns (status_code, error_label) if an API error is found, else None.
+    Does NOT trigger on generic HTML error pages (only structured JSON bodies).
+    """
+    import re as _re
+
+    # 1. Check for Jina's "Warning: Target URL returned error NNN" header
+    warn_match = _re.search(
+        r'Warning:\s*Target URL returned error (\d{3})', jina_content
+    )
+    if not warn_match:
+        return None
+
+    err_code = int(warn_match.group(1))
+    # Only intercept client errors that indicate bad parameters, not blocks
+    if err_code not in (400, 404, 422):
+        return None
+
+    # 2. Try to extract a JSON error body from the content after "Markdown Content:"
+    mc_idx = jina_content.find("Markdown Content:")
+    if mc_idx < 0:
+        mc_idx = 0
+    remainder = jina_content[mc_idx:]
+
+    # Look for JSON object in the remainder
+    json_match = _re.search(r'\{[^{}]*"error"[^{}]*\}', remainder)
+    if not json_match:
+        # Try to find a nested JSON structure
+        json_match = _re.search(r'\{.*\}', remainder, _re.DOTALL)
+
+    if json_match:
+        try:
+            err_body = json.loads(json_match.group())
+            label = _extract_api_error_label(err_body)
+            if label:
+                return err_code, label
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Even without a parseable JSON body, the Jina warning itself tells us
+    # the API returned an error — surface a generic message
+    return err_code, f"HTTP {err_code} error from the target API"
 
 def _is_blocked(text: str, status_code: int) -> tuple[bool, str, bool]:
     """Check if a response looks like a bot-block page.
@@ -720,6 +945,35 @@ def _parse_html_content(resp_text: str, resp_url, resp_status_code: int,
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
 
+    # ── Inject CSS class metadata into table rows as visible text ─────
+    # Many data sites (FishBase, GBIF, etc.) encode row status
+    # (introduced, native, endemic, endangered) purely via CSS classes.
+    # Before text extraction strips the HTML, surface these as text.
+    # Only needed for text mode — table mode captures classes via _row_class.
+    if extract != "table":
+        _STYLE_NOISE_INJ = frozenset({
+            "odd", "even", "alt", "row", "tr", "td", "first", "last",
+            "active", "hover", "selected", "highlight", "striped",
+            "border", "padding", "center", "left", "right", "top",
+            "visible", "hidden", "collapsed", "expanded",
+        })
+        for tr_tag in soup.find_all("tr"):
+            tr_classes = set(tr_tag.get("class", []))
+            for td_tag in tr_tag.find_all(["td", "th"]):
+                tr_classes.update(td_tag.get("class", []))
+            semantic = [
+                c for c in tr_classes
+                if c and c.lower() not in _STYLE_NOISE_INJ
+                and not c.startswith("col-")
+            ]
+            if semantic:
+                last_cell = tr_tag.find_all(["td", "th"])
+                if last_cell:
+                    tag_text = soup.new_string(
+                        f" [{', '.join(sorted(semantic))}]"
+                    )
+                    last_cell[-1].append(tag_text)
+
     # Apply CSS selector if provided
     if css_selector:
         selected = soup.select(css_selector)
@@ -747,13 +1001,25 @@ def _parse_html_content(resp_text: str, resp_url, resp_status_code: int,
                     lines.append(f"=== Table {meta['table_index']} ===")
 
                 if tbl_data["rows"]:
+                    # Check if any rows carry CSS class metadata
+                    has_row_classes = any(
+                        "_row_class" in row for row in tbl_data["rows"]
+                    )
                     # Column headers
                     if meta["headers"]:
-                        lines.append(" | ".join(meta["headers"]))
-                        lines.append("-" * min(len(" | ".join(meta["headers"])), 80))
+                        hdr_line = " | ".join(meta["headers"])
+                        if has_row_classes:
+                            hdr_line += " | [status]"
+                        lines.append(hdr_line)
+                        lines.append("-" * min(len(hdr_line), 80))
                     # Data rows
                     for row in tbl_data["rows"]:
-                        lines.append(" | ".join(str(v) for v in row.values()))
+                        row_class = row.pop("_row_class", "")
+                        row.pop("_data", None)  # drop for text rendering
+                        vals = " | ".join(str(v) for v in row.values())
+                        if has_row_classes and row_class:
+                            vals += f" | {row_class}"
+                        lines.append(vals)
                 else:
                     # Truncated table — show preview only
                     lines.append(f"[TABLE TRUNCATED — {meta['total_rows']} rows. "
@@ -936,9 +1202,44 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
     with _url_cache_lock:
         _cached = _url_cache.get(url)
     if _cached:
-        _c_html, _c_final_url, _c_status, _c_ts = _cached
+        _c_html, _c_final_url, _c_status, _c_ts, _c_ct = _cached
         if time.time() - _c_ts < _URL_CACHE_TTL:
-            logger.debug(f"URL cache hit for {url} ({len(_c_html)} chars, age {time.time()-_c_ts:.0f}s)")
+            logger.debug(f"URL cache hit for {url} ({len(_c_html)} chars, age {time.time()-_c_ts:.0f}s, ct={_c_ct})")
+
+            # Structured data must go through the preview path, not HTML parser
+            _is_struct_cached = (
+                "application/json" in _c_ct
+                or "text/json" in _c_ct
+                or "text/csv" in _c_ct
+                or "text/xml" in _c_ct
+                or "application/xml" in _c_ct
+                or "application/vnd" in _c_ct
+            )
+            if _is_struct_cached:
+                full_length = len(_c_html)
+                _STRUCT_INLINE_LIMIT = 3_000
+                if full_length > _STRUCT_INLINE_LIMIT:
+                    preview = _generate_structured_preview(_c_html, _c_ct)
+                    return {
+                        "ok": True, "content": preview, "url": _c_final_url,
+                        "blocked": False, "reason": "",
+                        "status_code": _c_status, "retries": 0,
+                        "source": "cache",
+                        "_full_length": full_length,
+                        "_is_structured": True,
+                        "_content_type": _c_ct.split(";")[0].strip(),
+                    }
+                else:
+                    return {
+                        "ok": True, "content": _c_html, "url": _c_final_url,
+                        "blocked": False, "reason": "",
+                        "status_code": _c_status, "retries": 0,
+                        "source": "cache",
+                        "_full_length": full_length,
+                        "_is_structured": True,
+                        "_content_type": _c_ct.split(";")[0].strip(),
+                    }
+
             parsed = _parse_html_content(
                 _c_html, _c_final_url, _c_status,
                 extract, css_selector, max_chars, 0)
@@ -1019,6 +1320,34 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
                     _block_domain(domain)
                     logger.debug(f"Cloudflare detected on {domain} — blocklisted, going to Jina")
                     break
+
+                # ── Fix C: Detect structured JSON API errors ──────────
+                # APIs (Eurostat, REST services) return clear JSON error
+                # bodies on 400/404/422.  These are *not* access blocks —
+                # Jina/Wayback won't help.  Return immediately with a
+                # clear, actionable error message.
+                _ct = resp.headers.get("content-type", "")
+                if resp.status_code in (400, 404, 422) and (
+                    "json" in _ct or resp.text.lstrip()[:1] == "{"
+                ):
+                    try:
+                        _err_body = json.loads(resp.text)
+                        _api_label = _extract_api_error_label(_err_body)
+                        if _api_label:
+                            logger.info(
+                                f"[fetch_url] API error {resp.status_code} from {domain}: {_api_label}"
+                            )
+                            return {
+                                "ok": False, "content": "", "url": str(resp.url),
+                                "blocked": False,
+                                "reason": f"API error (HTTP {resp.status_code}): {_api_label}",
+                                "status_code": resp.status_code,
+                                "retries": attempt, "source": "direct",
+                                "hint": _status_code_hint(resp.status_code, _api_label),
+                            }
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
                 # Non-CF error: retry once for transient issues (500, 502, timeout)
                 if attempt < max_retries and resp.status_code in (500, 502, 503, 504):
                     time.sleep(1.5 * (attempt + 1))
@@ -1047,6 +1376,71 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
                     "status_code": resp.status_code, "retries": attempt,
                     "hint": "Try read_pdf(url=...) directly, or search for an HTML version.",
                 }
+
+            # ── Detect structured data (JSON / CSV / XML) ─────────
+            # APIs return machine-readable formats that should NOT be
+            # parsed through BeautifulSoup.  Cache the full raw text
+            # (for read_page + memory) and return a smart preview if
+            # the response exceeds max_chars.
+            _ct_lower = content_type.lower()
+            _is_structured_ct = (
+                "application/json" in _ct_lower
+                or "text/json" in _ct_lower
+                or "text/csv" in _ct_lower
+                or "text/xml" in _ct_lower
+                or "application/xml" in _ct_lower
+                or "application/vnd" in _ct_lower   # vendor APIs
+            )
+            if _is_structured_ct:
+                raw_text = resp.text
+                _url_str = str(resp.url)
+                full_length = len(raw_text)
+
+                # Cache full content for read_page + memory
+                # Cache under both final URL and original URL (may differ
+                # after redirects); nodes.py looks up by original URL.
+                with _page_text_cache_lock:
+                    _page_text_cache[_url_str] = (raw_text, time.time())
+                    if url != _url_str:
+                        _page_text_cache[url] = (raw_text, time.time())
+                with _url_cache_lock:
+                    _url_cache[url] = (raw_text, _url_str, resp.status_code, time.time(), _ct_lower)
+
+                # Structured data should be analyzed with code, not
+                # eyeballed in context.  Always return a preview unless
+                # the response is tiny (<3K).  The full raw data is in
+                # _page_text_cache (served by read_page) and will be
+                # stored in MemoryStore by nodes.py, so sub-agents can
+                # receive it via memory_keys → agent_data.json →
+                # execute_code(pandas/json).
+                _STRUCT_INLINE_LIMIT = 3_000  # ~1.2K tokens for JSON
+
+                if full_length > _STRUCT_INLINE_LIMIT:
+                    preview = _generate_structured_preview(raw_text, _ct_lower)
+                    logger.info(
+                        f"[fetch_url] Structured data ({_ct_lower.split(';')[0]}) "
+                        f"{full_length:,} chars from {domain} — returning preview"
+                    )
+                    return {
+                        "ok": True, "content": preview, "url": _url_str,
+                        "blocked": False, "reason": "",
+                        "status_code": resp.status_code,
+                        "retries": attempt, "source": "direct",
+                        "_full_length": full_length,
+                        "_is_structured": True,
+                        "_content_type": _ct_lower.split(";")[0].strip(),
+                    }
+                else:
+                    # Small enough — return raw content as-is
+                    return {
+                        "ok": True, "content": raw_text, "url": _url_str,
+                        "blocked": False, "reason": "",
+                        "status_code": resp.status_code,
+                        "retries": attempt, "source": "direct",
+                        "_full_length": full_length,
+                        "_is_structured": True,
+                        "_content_type": _ct_lower.split(";")[0].strip(),
+                    }
 
             # Check for soft blocks (200 but Cloudflare challenge page, etc.)
             blocked, reason, is_cf = _is_blocked(resp.text, resp.status_code)
@@ -1081,7 +1475,7 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
 
             # ── Cache the raw HTML for future calls to the same URL ────
             with _url_cache_lock:
-                _url_cache[url] = (resp.text, str(resp.url), resp.status_code, time.time())
+                _url_cache[url] = (resp.text, str(resp.url), resp.status_code, time.time(), content_type)
 
             return parsed
 
@@ -1116,14 +1510,14 @@ def fetch_url(url: str, max_chars: int = 12000, extract: str = "text",
         logger.debug(f"Wayback auto-fallback failed for {url}: {wb_err}")
 
     # ── Total failure ─────────────────────────────────────────────────
+    # Fix B: Generate status-code-appropriate hint instead of always
+    # saying "blocked".  A 404 means "not found", not "blocked".
+    _is_actually_blocked = last_status in (403, 429, 503) or "cloudflare" in last_error.lower()
     return {
         "ok": False, "content": "", "url": url,
-        "blocked": True, "reason": last_error, "status_code": last_status,
-        "retries": retries_done,
-        "hint": (
-            "This site blocked automated access and no Wayback Machine snapshot was found. "
-            "Do NOT retry this URL. Search for the same information from a different source."
-        ),
+        "blocked": _is_actually_blocked, "reason": last_error,
+        "status_code": last_status, "retries": retries_done,
+        "hint": _status_code_hint(last_status),
     }
 
 def read_pdf(url: str, max_chars: int = 12000) -> str:
@@ -1225,16 +1619,52 @@ def _parse_tables_from_soup(soup, max_chars: int = 12000,
             cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
             if not cells or all(c == "" for c in cells):
                 continue
+
+            # ── Capture CSS class metadata from <tr> and cells ────
+            # Many data sites encode row status (introduced, native,
+            # endemic, etc.) via CSS classes rather than visible text.
+            row_classes = " ".join(tr.get("class", []))
+            # Also check for semantic classes on individual <td> cells
+            cell_tags = tr.find_all(["td", "th"])
+            cell_classes = set()
+            cell_data_attrs: dict = {}
+            for td_tag in cell_tags:
+                for cls in td_tag.get("class", []):
+                    cell_classes.add(cls)
+                # data-* attributes often carry structured info
+                for attr_name, attr_val in td_tag.attrs.items():
+                    if attr_name.startswith("data-") and isinstance(attr_val, str):
+                        cell_data_attrs[attr_name] = attr_val
+
+            # Merge row + cell classes, filter out pure styling noise
+            _STYLE_NOISE = frozenset({
+                "odd", "even", "alt", "row", "tr", "td", "first", "last",
+                "active", "hover", "selected", "highlight", "striped",
+                "border", "padding", "center", "left", "right", "top",
+                "visible", "hidden", "collapsed", "expanded",
+            })
+            all_classes = set(row_classes.split()) | cell_classes
+            semantic_classes = sorted(
+                c for c in all_classes
+                if c and c.lower() not in _STYLE_NOISE and not c.startswith("col-")
+            )
+
             if headers:
                 row_dict = {}
                 for i, h in enumerate(headers):
                     row_dict[h or f"col_{i}"] = cells[i] if i < len(cells) else ""
                 for i in range(len(headers), len(cells)):
                     row_dict[f"col_{i}"] = cells[i]
-                rows_data.append(row_dict)
             else:
                 row_dict = {f"col_{i}": c for i, c in enumerate(cells)}
-                rows_data.append(row_dict)
+
+            # Attach semantic metadata if any was found
+            if semantic_classes:
+                row_dict["_row_class"] = " ".join(semantic_classes)
+            if cell_data_attrs:
+                row_dict["_data"] = cell_data_attrs
+
+            rows_data.append(row_dict)
 
         if not rows_data:
             continue
@@ -1664,7 +2094,7 @@ def spawn_agent(
     Returns the sub-agent's final response as a string.
     """
     from .agent import dispatch   # lazy import to avoid circular dependency
-    from .config import MAX_RECURSION_DEPTH, get_model_profile, MODEL_NAME
+    from .config import MAX_RECURSION_DEPTH, SUB_AGENT_TURN_BUDGET, get_model_profile, MODEL_NAME
 
     resolved_model = model or MODEL_NAME
     profile = get_model_profile(resolved_model)
@@ -2099,6 +2529,35 @@ def fetch_url_wrapper(**kwargs):
 
         if result["ok"]:
             output = result["content"]
+
+            # ── Fix A: Detect Jina-rendered API error pages ───────────
+            # Jina returns ok=True even when the target returned an HTTP
+            # error.  It embeds "Warning: Target URL returned error NNN"
+            # in the text.  If the actual content is a JSON API error,
+            # we should surface it as a clear failure, not success.
+            # Check both status_code (when inherited from direct) and
+            # the content text (Jina may report 200 but embed the warning).
+            _may_be_api_err = (
+                result.get("source") == "jina_reader"
+                and (
+                    result.get("status_code", 200) >= 400
+                    or "Target URL returned error" in output[:500]
+                )
+            )
+            if _may_be_api_err:
+                _api_err = _detect_jina_api_error(output)
+                if _api_err:
+                    _err_code, _err_label = _api_err
+                    err_result = {
+                        "ok": False, "content": "", "url": url,
+                        "blocked": False,
+                        "reason": f"API error (HTTP {_err_code}): {_err_label}",
+                        "status_code": _err_code, "retries": result.get("retries", 0),
+                        "source": "jina_reader",
+                        "hint": _status_code_hint(_err_code, _err_label),
+                    }
+                    return json.dumps(err_result, indent=2), None
+
             if result["retries"] > 0:
                 output = f"[Succeeded after {result['retries']} retry(ies), final URL: {result['url']}]\n\n{output}"
             if result.get("source") == "jina_reader":
@@ -2122,10 +2581,36 @@ def fetch_url_wrapper(**kwargs):
                 )
                 output += _rep_note
 
+            # ── Structured data hint ─────────────────────────────────
+            if result.get("_is_structured"):
+                full_len = result.get("_full_length", 0)
+                shown_len = len(result["content"])
+                ct = result.get("_content_type", "structured data")
+                _was_previewed = "⚠ PREVIEW" in result["content"][:80]
+                if _was_previewed:
+                    # Data was too large — model sees only a preview
+                    output += (
+                        f"\n\n[STRUCTURED DATA: {ct}, {full_len:,} chars total "
+                        f"(only a preview is shown above). Full data is cached in memory. "
+                        f"To analyze, use:\n"
+                        f"  conduct_research(task='Analyze the {ct} data from {url[:80]}... "
+                        f"Extract <what you need>.', memory_keys=['<key from [Stored → ...]>'])\n"
+                        f"The sub-agent can load the full dataset and use pandas/json to filter it.\n"
+                        f"Do NOT eyeball-parse large structured data — delegate to a sub-agent.]"
+                    )
+                else:
+                    # Full data returned inline — just tag it
+                    output += (
+                        f"\n\n[STRUCTURED DATA: {ct}, {shown_len:,} chars. "
+                        f"This is the complete response. You can pass it to a sub-agent via "
+                        f"conduct_research(memory_keys=['<key from [Stored → ...]>']) "
+                        f"for programmatic analysis if needed.]"
+                    )
+
             # ── Truncation hint: tell the agent full page is cached ───
             full_len = result.get("_full_length", 0)
             shown_len = len(result["content"])
-            if full_len > shown_len + 200:
+            if full_len > shown_len + 200 and not result.get("_is_structured"):
                 output += (
                     f"\n\n[PAGE TRUNCATED: showing {shown_len:,} of {full_len:,} chars. "
                     f"Full page is cached — call read_page(url=\"{url}\", offset={shown_len}) "

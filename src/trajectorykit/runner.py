@@ -17,11 +17,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .agent_state import AgentState
-from .config import (
-    VLLM_API_URL,
-    TOKEN_SAFETY_MARGIN,
-    SUB_AGENT_TURN_BUDGET,
-)
+from . import config as _cfg
 from .nodes import (
     TOOL_HANDLERS,
     handle_generic_tool,
@@ -188,7 +184,7 @@ def call_api(
     chat_template_kwargs = state.profile.get("chat_template_kwargs")
     if chat_template_kwargs:
         payload["chat_template_kwargs"] = chat_template_kwargs
-    return requests.post(f"{VLLM_API_URL}/chat/completions", json=payload)
+    return requests.post(f"{_cfg.VLLM_API_URL}/chat/completions", json=payload)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -598,7 +594,7 @@ def _run_synthesis(state: AgentState) -> Dict[str, Any]:
         })
 
         approx_input_tokens = sum(len(str(m.get("content", ""))) for m in state.messages) // 4
-        synth_max_tokens = max(state.context_window - approx_input_tokens - TOKEN_SAFETY_MARGIN, 256)
+        synth_max_tokens = max(state.context_window - approx_input_tokens - _cfg.TOKEN_SAFETY_MARGIN, 256)
         synth_max_tokens = min(synth_max_tokens, state.max_tokens)
     else:
         synth_max_tokens = state.max_tokens  # won't be used; loop range is 0
@@ -644,7 +640,7 @@ def _run_synthesis(state: AgentState) -> Dict[str, Any]:
                     if match:
                         input_tokens = int(match.group(1))
                         synth_max_tokens = max(
-                            state.context_window - input_tokens - TOKEN_SAFETY_MARGIN, 256
+                            state.context_window - input_tokens - _cfg.TOKEN_SAFETY_MARGIN, 256
                         )
                         if state.verbose:
                             print(f"\u26a0\ufe0f  Synthesis context overflow, retrying with {synth_max_tokens} max_tokens")
@@ -672,7 +668,7 @@ def _run_synthesis(state: AgentState) -> Dict[str, Any]:
         sandbox_files = {"research_data.json": memory_b64}
 
         try:
-            synth_turn_budget = min(SUB_AGENT_TURN_BUDGET, 10)
+            synth_turn_budget = min(_cfg.SUB_AGENT_TURN_BUDGET, 10)
 
             if state.verbose:
                 print(f"\U0001f504 Spawning synthesis sub-agent ({synth_turn_budget} turn budget, "
@@ -772,7 +768,7 @@ def run_agent_loop(state: AgentState) -> Dict[str, Any]:
 
         # ── Token budget estimation ───────────────────────────────────
         approx_input_tokens = sum(len(str(m.get("content", ""))) for m in state.messages) // 4
-        effective_max_tokens = max(state.context_window - approx_input_tokens - TOKEN_SAFETY_MARGIN, 256)
+        effective_max_tokens = max(state.context_window - approx_input_tokens - _cfg.TOKEN_SAFETY_MARGIN, 256)
         effective_max_tokens = min(effective_max_tokens, state.max_tokens)
         max_completion = state.profile.get("max_completion_tokens")
         if max_completion:
@@ -794,7 +790,7 @@ def run_agent_loop(state: AgentState) -> Dict[str, Any]:
                 match = re.search(r'has (\d+) input tokens', error_msg)
                 if match:
                     input_tokens = int(match.group(1))
-                    effective_max_tokens = state.context_window - input_tokens - TOKEN_SAFETY_MARGIN
+                    effective_max_tokens = state.context_window - input_tokens - _cfg.TOKEN_SAFETY_MARGIN
                     if effective_max_tokens >= 1:
                         if state.verbose:
                             print(f"\u26a0\ufe0f  max_tokens too large, retrying with {effective_max_tokens}")
@@ -959,6 +955,31 @@ def run_agent_loop(state: AgentState) -> Dict[str, Any]:
                 print(f"   [{i}/{len(tool_calls_in_msg)}] {tool_name}({args_preview})")
 
             # ── Root tool scope enforcement ───────────────────────────
+            # Block final_answer at root — must use research_complete.
+            if state.depth == 0 and tool_name == "final_answer":
+                error_msg = (
+                    "⛔ final_answer is NOT available at root level.\n\n"
+                    "You are the orchestrator. To publish your answer:\n"
+                    "  1. refine_draft(content='<your complete answer>')\n"
+                    "  2. research_complete()\n\n"
+                    "research_complete() publishes your latest draft after "
+                    "quality review. Do NOT call final_answer again."
+                )
+                state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": error_msg,
+                })
+                tc_record = ToolCallRecord(
+                    tool_name=tool_name, tool_args=tool_args,
+                    tool_call_id=tool_call["id"], output=error_msg,
+                    duration_s=0.0,
+                )
+                turn_record.tool_calls.append(tc_record)
+                if state.verbose:
+                    print(f"       🚫 Blocked final_answer at root (must use research_complete)")
+                continue
+
             # The orchestrator (depth==0) may only use tools in
             # TOOL_HANDLERS. Block any worker-only tool and nudge the
             # model toward conduct_research instead.
@@ -1004,6 +1025,18 @@ def run_agent_loop(state: AgentState) -> Dict[str, Any]:
 
         # ── Finalize turn ─────────────────────────────────────────────
         turn_record.duration_s = round(time.time() - turn_start, 3)
+        # Snapshot chain plan state so the HTML trace shows per-turn progress
+        if (state.depth == 0 and state.chain_plan is not None
+                and state.chain_plan.has_chain):
+            turn_record.chain_snapshot = [
+                {
+                    "step": s.step,
+                    "lookup": s.lookup,
+                    "placeholder": s.placeholder,
+                    "resolved_value": s.resolved_value,
+                }
+                for s in state.chain_plan.chain_steps
+            ]
         state.episode.turns.append(turn_record)
 
         # ── Post-turn processing ──────────────────────────────────────

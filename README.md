@@ -77,19 +77,24 @@ result["trace"].save()  # → traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
 │  → runs eval.py → runs LLM judge                        │
 └──────────────┬───────────────────────────────────────────┘
                │
-┌──────────────▼───────────────────────────────────────────┐
-│  agent.py  (dispatch loop)                               │
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│  agent.py → agent_state.py → runner.py → nodes.py       │
 │                                                          │
-│  system prompt → LLM → tool_calls → dispatch_tool_call   │
-│       ▲                                    │             │
-│       └────────── tool results ◄───────────┘             │
+│  agent.py:       dispatch() entry, pre-dispatch chain    │
+│                  analysis via chain.py                    │
+│  agent_state.py: AgentState dataclass + create_state()   │
+│  runner.py:      turn loop, 4 cycle gates, plan inject   │
+│  nodes.py:       tool handlers, verification pipeline    │
+│  plan.py:        ResearchPlan + PlanTask tracking         │
 │                                                          │
 │  Depth 0 (root):  orchestrator prompt, full tools        │
 │  Depth 1+ (sub):  worker prompt, no spawn_agent          │
 │  Synthesis:       synthesizer prompt, code + final_answer│
-└──────────────────────────────────────────────────────────┘
+└──────────────┬───────────────────────────────────────────┘
                │
-┌──────────────▼───────────────────────────────────────────┐
+               ▼
+┌──────────────────────────────────────────────────────────┐
 │  tool_store.py                                           │
 │                                                          │
 │  search_web        Serper → auto-fallback to DuckDuckGo │
@@ -105,10 +110,144 @@ result["trace"].save()  # → traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
 └──────────────────────────────────────────────────────────┘
 ```
 
+### Agent Flow
+
+The full lifecycle of a `dispatch()` call, from question to verified answer:
+
+```
+                        User Question
+                             │
+                             ▼
+              ┌──────────────────────────────┐
+              │     ⛓ CHAIN ANALYSIS         │
+              │     (pre-dispatch, root only) │
+              │                              │
+              │  LLM detects causal chains:  │
+              │    Step 1: find X → {step_1} │
+              │    Step 2: Y of {step_1}     │
+              │         → {step_2}           │
+              │    Step 3: Z of {step_2}     │
+              │         → final answer       │
+              │                              │
+              │  → ChainPlan on state        │
+              │  → Seeds ResearchPlan        │
+              └──────────┬───────────────────┘
+                         │
+                         ▼
+     ┌───────────────────────────────────────────────┐
+     │            🔄 RESEARCH LOOP                   │
+     │            (runner.py)                         │
+     │                                               │
+     │  ┌─────────────────────────────────────────┐  │
+     │  │ Each turn:                              │  │
+     │  │   LLM → tool calls → execute → results │  │
+     │  │         ▲                     │         │  │
+     │  │         └─────────────────────┘         │  │
+     │  └─────────────────────────────────────────┘  │
+     │                                               │
+     │  Cycle enforcement (4 gates):                 │
+     │    G1: can't publish without a draft          │
+     │    G2: can't re-publish without revising      │
+     │    G3: can't draft without researching        │
+     │    G4: must follow plan when active            │
+     │                                               │
+     │  Chain enforcement:                           │
+     │    • Chain plan injected at turns 0–2         │
+     │    • Tasks with unresolved placeholders       │
+     │      are hard-blocked                         │
+     │    • Sub-agent results matched to chain       │
+     │      steps → placeholders resolved            │
+     │                                               │
+     │  ┌─────────────────────────────────────────┐  │
+     │  │ Sub-agents (depth 1+)                   │  │
+     │  │  • Fresh context, worker prompt         │  │
+     │  │  • Full tools: search, fetch, read_pdf, │  │
+     │  │    wikipedia, extract_tables, code      │  │
+     │  │  • Return findings via final_answer     │  │
+     │  └─────────────────────────────────────────┘  │
+     │                                               │
+     │  Tools: conduct_research, refine_draft,       │
+     │         think, research_complete              │
+     └──────────────────┬────────────────────────────┘
+                        │
+               research_complete()
+                        │
+                        ▼
+     ┌───────────────────────────────────────────────┐
+     │       🛡️ VERIFICATION PIPELINE                │
+     │                                               │
+     │  Stage 0 ── Format Gate                       │
+     │  │  Must have **Final Answer:** + **Sources:**│
+     │  │  Fail → back to research loop              │
+     │  ▼                                            │
+     │  Stage 1 ── Verifier LLM                      │
+     │  │  8 criteria (adequacy as hard-stop,        │
+     │  │  completeness, specificity, citations,     │
+     │  │  coherence, conflicts, gaps, fidelity)     │
+     │  │  Fail → back to loop with feedback         │
+     │  ▼                                            │
+     │  Stage 2 ── Spot-Check (sub-agent powered)    │
+     │                                               │
+     │  ┌─────────────────────────────────────────┐  │
+     │  │ Step 1: EXTRACT                         │  │
+     │  │  LLM extracts checkable claims from     │  │
+     │  │  draft. Chain plan injected as hint.     │  │
+     │  │  Claim #1 = core answer (mandatory).    │  │
+     │  └────────────────┬────────────────────────┘  │
+     │                   ▼                           │
+     │  ┌─────────────────────────────────────────┐  │
+     │  │ Step 2: VERIFY (parallel sub-agents)    │  │
+     │  │                                         │  │
+     │  │  Each claim → 1 verification sub-agent  │  │
+     │  │  (3 turns, fresh context, full tools)   │  │
+     │  │                                         │  │
+     │  │  The sub-agent can:                     │  │
+     │  │    • Search the web                     │  │
+     │  │    • Fetch & read cited source URLs     │  │
+     │  │    • Open PDFs, gov sites, .edu pages   │  │
+     │  │    • Use wikipedia_lookup               │  │
+     │  │    • Think & try different queries       │  │
+     │  │    • Report: sources, assessment,       │  │
+     │  │      corrections                        │  │
+     │  │                                         │  │
+     │  │  Up to 4 sub-agents run in parallel     │  │
+     │  └────────────────┬────────────────────────┘  │
+     │                   ▼                           │
+     │  ┌─────────────────────────────────────────┐  │
+     │  │ Step 3: COMPARE (LLM judge)             │  │
+     │  │  Claims + sub-agent evidence reports    │  │
+     │  │  → 4-point core answer check            │  │
+     │  │  → Chain coherence verification         │  │
+     │  │  → SPOT_CHECK_PASSED / FAILED           │  │
+     │  └─────────────────────────────────────────┘  │
+     │                                               │
+     │  Refusal path:                                │
+     │    No claims → refusal detected →             │
+     │    sub-agent investigates independently →      │
+     │    REFUSAL_JUSTIFIED / REFUSAL_CHALLENGED     │
+     │                                               │
+     │  Fail → back to research loop with feedback   │
+     │  Pass → publish                               │
+     └──────────────────┬────────────────────────────┘
+                        │
+                        ▼
+              ┌──────────────────────────────┐
+              │     ✅ PUBLISHED ANSWER      │
+              │                              │
+              │  Final response returned     │
+              │  Trace: JSON + HTML          │
+              │  Chain panel shows step      │
+              │  resolution in HTML viewer   │
+              └──────────────────────────────┘
+```
+
 ### Key design decisions
 
 | Concern | Approach |
 |---------|----------|
+| Causal chains | Pre-dispatch LLM detects dependency chains → `ChainPlan` enforces sequential resolution with placeholder blocking |
+| Verification | 3-stage pipeline: format gate → verifier LLM → sub-agent spot-check (each claim gets its own agent that can search, fetch, read PDFs) |
+| Cycle prevention | 4 runner gates prevent the agent from gaming verification (must revise draft before re-publishing) |
 | Long context | `MemoryStore` captures full tool outputs externally; synthesis sub-agent queries them via `execute_code` |
 | Search resilience | Primary backend (Serper) with automatic DuckDuckGo fallback on credit/auth errors |
 | Empty `final_answer` | Smarter nudge echoes the model's own text back; structured backfill scans prior responses |
@@ -197,15 +336,26 @@ trajectorykit/
 │   └── prompts/
 │       ├── orchestrator.txt          # Root agent system prompt
 │       ├── worker.txt                # Sub-agent system prompt
-│       └── synthesizer.txt           # Synthesis sub-agent prompt
+│       ├── synthesizer.txt           # Synthesis sub-agent prompt
+│       ├── chain_analysis.txt        # Chain detection prompt
+│       ├── verifier.txt              # Stage 1 verification prompt
+│       ├── spotcheck_extract.txt     # Claim extraction prompt
+│       ├── spotcheck_compare.txt     # Evidence comparison prompt
+│       └── spotcheck_refusal.txt     # Refusal challenge prompt
 │
 ├── src/trajectorykit/
 │   ├── __init__.py                   # Public API
-│   ├── agent.py                      # Agentic loop + dispatch
-│   ├── config.py                     # YAML config loader
+│   ├── agent.py                      # Entry point: dispatch() + chain analysis
+│   ├── agent_state.py                # AgentState dataclass + create_state()
+│   ├── runner.py                     # Turn loop, cycle gates, plan injection
+│   ├── nodes.py                      # Tool handlers + verification pipeline
+│   ├── chain.py                      # Causal chain analysis (ChainPlan/ChainStep)
+│   ├── plan.py                       # ResearchPlan + PlanTask tracking
+│   ├── config.py                     # YAML config loader + prompt loading
 │   ├── tool_store.py                 # Tool definitions + wrappers
 │   ├── tracing.py                    # Trace dataclasses + HTML renderer
 │   ├── memory.py                     # MemoryStore (compressed tool output storage)
+│   ├── symbolic.py                   # Symbolic reference compression
 │   ├── utils.py                      # Shared utilities
 │   └── apptainer.sh                  # Sandbox container pull + run
 │

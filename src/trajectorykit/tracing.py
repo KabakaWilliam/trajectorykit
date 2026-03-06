@@ -45,6 +45,10 @@ class TurnRecord:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Chain analysis snapshot: captures chain step states after this turn
+    # Only populated for root (depth==0) turns when a chain plan is active.
+    # List of dicts: [{step, placeholder, resolved_value}, ...]
+    chain_snapshot: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -660,6 +664,96 @@ body {
 }
 .chain-badge.has-chain { background: #e8f0fe; color: var(--accent); }
 .chain-badge.no-chain { background: #f0f0ee; color: var(--text-mid); }
+
+/* ── Inline chain progress tracker (per root turn) ── */
+.chain-progress {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 10px 16px; margin: 0 -16px 8px;
+  background: var(--off); border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+.chain-progress-label {
+  font-family: var(--mono); font-size: 10px; color: var(--text-light);
+  letter-spacing: 0.05em; text-transform: uppercase; margin-right: 4px;
+}
+.chain-pill {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 8px; border-radius: 12px;
+  font-family: var(--mono); font-size: 10px; font-weight: 500;
+  border: 1px solid var(--border); background: var(--white);
+  transition: all 0.3s ease;
+}
+.chain-pill.locked { color: var(--text-light); opacity: 0.6; }
+.chain-pill.unlocked { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
+.chain-pill.resolved { color: var(--success); border-color: var(--success); background: #f0faf0; }
+.chain-pill.just-resolved {
+  color: var(--success); border-color: var(--success); background: #d4edda;
+  font-weight: 600; box-shadow: 0 0 0 2px rgba(45,138,86,0.2);
+  animation: chain-resolve-pulse 0.6s ease-out;
+}
+@keyframes chain-resolve-pulse {
+  0% { transform: scale(1.15); box-shadow: 0 0 0 4px rgba(45,138,86,0.3); }
+  100% { transform: scale(1); box-shadow: 0 0 0 2px rgba(45,138,86,0.2); }
+}
+
+/* ── Collapsible sub-agent groups ── */
+.sub-agent-group {
+  margin: -4px 0 16px 28px; border-left: 3px solid var(--depth-1);
+  border-radius: 0 4px 4px 0;
+  position: relative;
+}
+/* Connecting line from root card down to the sub-agent toggle */
+.sub-agent-group::before {
+  content: "";
+  position: absolute; left: -17px; top: -12px;
+  width: 14px; height: 24px;
+  border-left: 2px solid var(--depth-1);
+  border-bottom: 2px solid var(--depth-1);
+  border-radius: 0 0 0 6px;
+}
+.sub-agent-group-summary {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 16px; cursor: pointer; user-select: none;
+  font-family: var(--mono); font-size: 11px; color: var(--text-mid);
+  background: var(--white); border: 1px solid var(--border);
+  border-left: none; border-radius: 0 4px 4px 0;
+  transition: background 0.15s;
+}
+.sub-agent-group-summary:hover { background: var(--off); }
+.sub-agent-group-summary::-webkit-details-marker { display: none; }
+.sub-agent-group-summary::marker { display: none; content: ""; }
+.sub-agent-group-icon {
+  display: inline-block; transition: transform 0.2s ease;
+  font-size: 9px; color: var(--text-light);
+}
+.sub-agent-group[open] .sub-agent-group-icon { transform: rotate(90deg); }
+.sub-agent-group-body {
+  padding: 8px 0 8px 8px;
+  background: linear-gradient(90deg, rgba(196,200,240,0.08) 0%, transparent 50%);
+}
+.sub-agent-group-body .turn-card {
+  margin-bottom: 8px; border-left: 2px solid var(--depth-1);
+  font-size: 14px;
+}
+
+/* ── Timeline sidebar enhancements ── */
+.tl-tool {
+  font-size: 9px; color: var(--text-light); display: block;
+  margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 140px;
+}
+.tl-sub-count {
+  display: inline-block; padding: 0 4px; border-radius: 8px;
+  background: var(--depth-1); color: var(--text-mid);
+  font-size: 9px; font-weight: 600; margin-left: 4px;
+  vertical-align: middle;
+}
+.tl-chain-dots {
+  display: inline-flex; gap: 2px; margin-left: 4px; vertical-align: middle;
+}
+.tl-chain-dot { font-size: 8px; line-height: 1; }
+.tl-chain-dot.resolved { color: var(--success); }
+.tl-chain-dot.pending { color: var(--text-light); }
 """
 
 _JS = """\
@@ -777,6 +871,173 @@ def _flatten_trace(trace_dict: dict, depth: int = 0, counter: list | None = None
                 cards.extend(_flatten_trace(tc["child_trace"], depth + 1, counter))
 
     return cards
+
+
+def _group_by_root_turn(flat_cards: list) -> list:
+    """Group flat cards into root-turn groups.
+
+    Returns a list of groups, where each group is:
+        {"root": card_dict, "children": [card_dict, ...]}
+    A root card has depth==0; children are all subsequent cards until
+    the next root card.  If there are orphan sub-agent cards before any
+    root (shouldn't happen), they get a synthetic root.
+    """
+    groups: list[dict] = []
+    current_group: Optional[dict] = None
+
+    for card in flat_cards:
+        if card["depth"] == 0:
+            if current_group is not None:
+                groups.append(current_group)
+            current_group = {"root": card, "children": []}
+        else:
+            if current_group is None:
+                # Orphan — shouldn't happen but handle gracefully
+                current_group = {"root": card, "children": []}
+            else:
+                current_group["children"].append(card)
+
+    if current_group is not None:
+        groups.append(current_group)
+
+    return groups
+
+
+def _jaccard_words(a: str, b: str) -> float:
+    """Compute Jaccard word-overlap similarity between two strings.
+
+    Normalises by lowercasing and stripping common punctuation so that
+    JSON artefacts and parenthesised text don't prevent matches.
+    """
+    import re as _re
+    _punct = _re.compile(r'[^a-z0-9\s]')
+    wa = set(_punct.sub('', a.lower()).split())
+    wb = set(_punct.sub('', b.lower()).split())
+    wa.discard('')
+    wb.discard('')
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / len(wa | wb)
+
+
+def _containment_ratio(query: str, target: str) -> float:
+    """Fraction of *query* words found in *target*.
+
+    Better than Jaccard when query is short and target is long (e.g.
+    matching a chain step lookup against a full tool call output).
+    """
+    import re as _re
+    _punct = _re.compile(r'[^a-z0-9\s]')
+    wq = set(_punct.sub('', query.lower()).split())
+    wt = set(_punct.sub('', target.lower()).split())
+    wq -= {'', 'the', 'a', 'an', 'of', 'or', 'and', 'in', 'for', 'to', 'is',
+            'eg', 'that', 'this', 'with', 'from', 'by', 'on', 'at', 'as'}
+    if not wq:
+        return 0.0
+    return len(wq & wt) / len(wq)
+
+
+def _extract_tool_text(tc: dict) -> str:
+    """Extract meaningful text from a tool call for chain matching.
+
+    Combines the task text with the output response content, parsing
+    JSON outputs to extract the 'response' field when possible.
+    """
+    task = tc.get("tool_args", {}).get("task", "") if isinstance(tc.get("tool_args"), dict) else ""
+    raw_output = tc.get("output", "")
+
+    output_text = raw_output
+    if isinstance(raw_output, str) and raw_output.startswith("{"):
+        try:
+            parsed = json.loads(raw_output)
+            if isinstance(parsed, dict):
+                output_text = parsed.get("response", raw_output)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    elif isinstance(raw_output, dict):
+        output_text = raw_output.get("response", str(raw_output))
+
+    return f"{task} {output_text}"
+
+
+def _synthesize_chain_snapshots(groups: list, chain_plan: dict) -> None:
+    """Retroactively inject chain_snapshot into root turns for legacy traces.
+
+    When a trace has chain_plan but was recorded before per-turn snapshot
+    capture was added, this function reconstructs approximate chain progress
+    by examining tool call tasks/outputs and comparing them against chain step
+    lookup text using Jaccard word overlap.
+
+    Mutates group root turn dicts in place.
+    """
+    chain_steps = chain_plan.get("chain_steps", [])
+    if not chain_steps:
+        return
+
+    # Build ordered list of step metadata
+    steps_meta = []
+    for cs in chain_steps:
+        steps_meta.append({
+            "step": cs.get("step", 0),
+            "lookup": cs.get("lookup", ""),
+            "depends_on": cs.get("depends_on"),
+            "placeholder": cs.get("placeholder", ""),
+            "resolved_value": cs.get("resolved_value"),  # final state from chain_plan
+        })
+
+    # Track which steps have been "addressed" as we walk through turns.
+    # A step is considered addressed when a root turn's conduct_research task
+    # or output has significant word overlap with the step's lookup text.
+    MATCH_THRESHOLD = 0.50  # containment: ≥50% of lookup words in tool text
+    addressed: dict[int, Optional[str]] = {}  # step_num -> summary or None
+
+    for group in groups:
+        root_turn = group["root"]["turn"]
+
+        # Check tool calls in this root turn for chain step matches
+        for tc in root_turn.get("tool_calls", []):
+            tool_name = tc.get("tool_name", "")
+            if tool_name != "conduct_research":
+                continue
+            combined = _extract_tool_text(tc)
+
+            for sm in steps_meta:
+                step_num = sm["step"]
+                if step_num in addressed:
+                    continue
+                # Check if dependencies are met
+                dep = sm.get("depends_on")
+                if dep is not None and dep not in addressed:
+                    continue
+                similarity = _containment_ratio(sm["lookup"], combined)
+                if similarity >= MATCH_THRESHOLD:
+                    # Extract brief summary from parsed output
+                    raw_out = tc.get("output", "")
+                    if isinstance(raw_out, str) and raw_out.startswith("{"):
+                        try:
+                            summary = json.loads(raw_out).get("response", raw_out)[:120]
+                        except (json.JSONDecodeError, ValueError):
+                            summary = raw_out[:120]
+                    else:
+                        summary = str(raw_out)[:120]
+                    if len(summary) >= 120:
+                        summary += "…"
+                    addressed[step_num] = summary or "(addressed)"
+
+        # Build snapshot reflecting current state at this turn
+        snapshot = []
+        for sm in steps_meta:
+            step_num = sm["step"]
+            snapshot.append({
+                "step": sm["step"],
+                "lookup": sm["lookup"],
+                "depends_on": sm["depends_on"],
+                "placeholder": sm["placeholder"],
+                "resolved_value": addressed.get(step_num),
+            })
+
+        # Inject into the turn dict so downstream renderers pick it up
+        root_turn["chain_snapshot"] = snapshot
 
 
 _CHEVRON_SVG = (
@@ -1106,25 +1367,179 @@ def _render_turn_card(card: dict) -> str:
     return "\n".join(parts)
 
 
-def _build_timeline(flat_cards: list) -> str:
-    """Generate the sidebar timeline HTML from the flat card list."""
-    parts = ['<ul class="timeline">']
-    current_label = None
-    for card in flat_cards:
-        depth = card["depth"]
-        agent_label = card["agent_label"]
-        turn_num = card["turn_num"]
-        card_id = card["id"]
+def _render_chain_progress(chain_snapshot: Optional[list], prev_snapshot: Optional[list] = None) -> str:
+    """Render a compact inline chain progress tracker for a root turn card.
 
-        # Section label when agent changes
-        if agent_label != current_label:
-            current_label = agent_label
-            parts.append(f'<li class="tl-label">{_esc(agent_label)}</li>')
+    Shows each step as a small pill: 🔒 locked, 🔓 unlocked, ✅ resolved.
+    If a step just resolved this turn (wasn't resolved in prev_snapshot), highlight it.
+    Returns empty string if no chain data.
+    """
+    if not chain_snapshot:
+        return ""
 
-        depth_cls = "" if depth == 0 else ("sub" if depth == 1 else "sub2")
-        parts.append(
-            f'<li class="tl-item {depth_cls}" data-target="{card_id}">Turn {turn_num}</li>'
+    # Build previous resolution state for diff detection
+    prev_resolved = set()
+    if prev_snapshot:
+        for s in prev_snapshot:
+            if s.get("resolved_value"):
+                prev_resolved.add(s.get("step"))
+
+    pills = []
+    for s in chain_snapshot:
+        step_num = s.get("step", "?")
+        resolved = s.get("resolved_value")
+        lookup = s.get("lookup", "")[:60]
+
+        if resolved:
+            just_resolved = step_num not in prev_resolved
+            cls = "chain-pill resolved" + (" just-resolved" if just_resolved else "")
+            icon = "✅"
+            tooltip = f"Step {step_num}: {lookup} → {_esc(str(resolved)[:80])}"
+        else:
+            # Check if dependencies are met (simplified: step 1 always unlocked,
+            # step N unlocked if step N-1 resolved)
+            dep_met = True
+            for dep in chain_snapshot:
+                if dep.get("step", 0) < step_num and not dep.get("resolved_value"):
+                    dep_met = False
+                    break
+            if dep_met:
+                cls = "chain-pill unlocked"
+                icon = "🔓"
+            else:
+                cls = "chain-pill locked"
+                icon = "🔒"
+            tooltip = f"Step {step_num}: {lookup}"
+
+        pills.append(
+            f'<span class="{cls}" title="{_esc(tooltip)}">'
+            f'{icon} Step {step_num}'
+            f'</span>'
         )
+
+    return (
+        '<div class="chain-progress">'
+        '<span class="chain-progress-label">⛓ Chain:</span>'
+        + "".join(pills)
+        + '</div>'
+    )
+
+
+def _render_turn_group(group: dict, prev_chain_snapshot: Optional[list] = None) -> str:
+    """Render a root turn and its sub-agent children as a collapsible group.
+
+    group = {"root": card_dict, "children": [card_dict, ...]}
+    """
+    root_card = group["root"]
+    children = group["children"]
+
+    parts = []
+
+    # Render the root turn card (always visible)
+    root_html = _render_turn_card(root_card)
+
+    # Inject chain progress into root card (before closing .turn-body)
+    chain_snapshot = root_card["turn"].get("chain_snapshot")
+    if chain_snapshot:
+        chain_progress_html = _render_chain_progress(chain_snapshot, prev_chain_snapshot)
+        # Insert the chain progress after turn-header, before turn-body content
+        # We inject it inside .turn-body at the top
+        inject_marker = '<div class="turn-body">'
+        root_html = root_html.replace(
+            inject_marker,
+            inject_marker + '\n' + chain_progress_html,
+            1
+        )
+
+    parts.append(root_html)
+
+    # Render collapsible sub-agent section
+    if children:
+        # Count unique sub-agents and total turns
+        sub_agents = set()
+        for c in children:
+            sub_agents.add(c["agent_label"])
+        n_agents = len(sub_agents)
+        n_turns = len(children)
+
+        parts.append(
+            f'<details class="sub-agent-group" id="{root_card["id"]}-subs">'
+            f'<summary class="sub-agent-group-summary">'
+            f'<span class="sub-agent-group-icon">▶</span>'
+            f' {n_agents} sub-agent{"s" if n_agents != 1 else ""}'
+            f' · {n_turns} turn{"s" if n_turns != 1 else ""}'
+            f'</summary>'
+            f'<div class="sub-agent-group-body">'
+        )
+        for child_card in children:
+            parts.append(_render_turn_card(child_card))
+        parts.append('</div>')  # .sub-agent-group-body
+        parts.append('</details>')  # .sub-agent-group
+
+    return "\n".join(parts)
+
+
+def _build_timeline(flat_cards: list, groups: Optional[list] = None) -> str:
+    """Generate the sidebar timeline HTML.
+
+    If groups are provided, show root turns as primary items with sub-agent
+    counts. Otherwise fall back to the flat card list.
+    """
+    parts = ['<ul class="timeline">']
+
+    if groups:
+        for group in groups:
+            root = group["root"]
+            children = group["children"]
+            card_id = root["id"]
+            turn_num = root["turn_num"]
+            tool_names = [tc.get("tool_name", "?") for tc in root["turn"].get("tool_calls", [])]
+            primary_tool = tool_names[0] if tool_names else ""
+            # Compact tool label
+            tool_label = ""
+            if primary_tool:
+                short = primary_tool.replace("_", " ").replace("conduct research", "research")
+                tool_label = f' <span class="tl-tool">{_esc(short)}</span>'
+
+            sub_info = ""
+            if children:
+                n_subs = len(set(c["agent_label"] for c in children))
+                sub_info = f' <span class="tl-sub-count">{n_subs}↓</span>'
+
+            # Chain progress indicator
+            chain_snap = root["turn"].get("chain_snapshot")
+            chain_dots = ""
+            if chain_snap:
+                dots = []
+                for s in chain_snap:
+                    if s.get("resolved_value"):
+                        dots.append('<span class="tl-chain-dot resolved">●</span>')
+                    else:
+                        dots.append('<span class="tl-chain-dot pending">○</span>')
+                chain_dots = f' <span class="tl-chain-dots">{"".join(dots)}</span>'
+
+            parts.append(
+                f'<li class="tl-item" data-target="{card_id}">'
+                f'Turn {turn_num}{tool_label}{sub_info}{chain_dots}'
+                f'</li>'
+            )
+    else:
+        current_label = None
+        for card in flat_cards:
+            depth = card["depth"]
+            agent_label = card["agent_label"]
+            turn_num = card["turn_num"]
+            card_id = card["id"]
+
+            if agent_label != current_label:
+                current_label = agent_label
+                parts.append(f'<li class="tl-label">{_esc(agent_label)}</li>')
+
+            depth_cls = "" if depth == 0 else ("sub" if depth == 1 else "sub2")
+            parts.append(
+                f'<li class="tl-item {depth_cls}" data-target="{card_id}">Turn {turn_num}</li>'
+            )
+
     parts.append('</ul>')
     return "\n".join(parts)
 
@@ -1283,14 +1698,34 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
     in_pct = (total_prompt_tok / total_tok * 100) if total_tok else 50
     out_pct = 100 - in_pct
 
-    # Flatten trace into sequential cards
+    # Flatten trace into sequential cards, then group by root turn
     flat_cards = _flatten_trace(d)
+    groups = _group_by_root_turn(flat_cards)
 
-    # Build sidebar timeline
-    timeline_html = _build_timeline(flat_cards)
+    # ── Synthesize chain snapshots for traces that predate per-turn recording ──
+    # If the trace has a chain_plan but root turns lack chain_snapshot, we
+    # reconstruct approximate snapshots so the inline pills and sidebar dots
+    # render even for legacy traces.
+    chain_plan = d.get("chain_plan")
+    if chain_plan and chain_plan.get("has_chain") and chain_plan.get("chain_steps"):
+        any_has_snapshot = any(
+            g["root"]["turn"].get("chain_snapshot") is not None for g in groups
+        )
+        if not any_has_snapshot:
+            _synthesize_chain_snapshots(groups, chain_plan)
 
-    # Build turn cards
-    cards_html = "\n".join(_render_turn_card(card) for card in flat_cards)
+    # Build sidebar timeline (root-focused with sub-agent counts)
+    timeline_html = _build_timeline(flat_cards, groups=groups)
+
+    # Build turn cards (grouped: root + collapsible sub-agents)
+    cards_parts = []
+    prev_chain_snapshot = None
+    for group in groups:
+        cards_parts.append(_render_turn_group(group, prev_chain_snapshot))
+        # Track chain snapshot for diff detection
+        root_snap = group["root"]["turn"].get("chain_snapshot")
+        if root_snap is not None:
+            prev_chain_snapshot = root_snap
 
     # Build chain analysis panel
     chain_html = _render_chain_panel(d.get("chain_plan"))
@@ -1368,7 +1803,7 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
     </div>
 
     <!-- Turn cards -->
-    {cards_html}
+    {"".join(cards_parts)}
 
     <!-- Final response -->
     <div class="final-card" id="final">

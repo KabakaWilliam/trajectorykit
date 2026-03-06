@@ -17,11 +17,7 @@ from typing import Optional, Dict, Any
 
 from .agent_state import create_state
 from .chain import analyze_chain
-from .config import (
-    CHAIN_ANALYSIS_ENABLED,
-    CHAIN_ANALYSIS_PROMPT,
-    VLLM_API_URL,
-)
+from . import config as _cfg
 from .runner import run_agent_loop
 
 import logging
@@ -84,12 +80,12 @@ def dispatch(
     )
 
     # ── Pre-dispatch chain analysis (root only) ──────────────────────
-    if _depth == 0 and CHAIN_ANALYSIS_ENABLED and CHAIN_ANALYSIS_PROMPT:
+    if _depth == 0 and _cfg.CHAIN_ANALYSIS_ENABLED and _cfg.CHAIN_ANALYSIS_PROMPT:
         chain_plan = analyze_chain(
             question=user_input,
-            prompt_template=CHAIN_ANALYSIS_PROMPT,
+            prompt_template=_cfg.CHAIN_ANALYSIS_PROMPT,
             model=state.model,
-            vllm_url=VLLM_API_URL,
+            vllm_url=_cfg.VLLM_API_URL,
             temperature=state.temperature,
             max_tokens=state.max_tokens,
         )

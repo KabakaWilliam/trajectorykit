@@ -6,7 +6,8 @@ CURRENT_DATE: {current_date}
 The research agent was asked a question and responded that it could NOT
 find the answer — claiming the information is unavailable, not publicly
 accessible, doesn't exist, etc. Your job is to determine whether this
-refusal is honest, given independent search evidence gathered below.
+refusal is honest, given evidence gathered by an independent
+investigation agent below.
 
 ═══════════════════════════════════════════
 OUTPUT FORMAT — CHOOSE EXACTLY ONE
@@ -42,7 +43,7 @@ agent was lazy or gave up too early:
 RULES
 ═══════════════════════════════════════════
 
-- Only issue REFUSAL_CHALLENGED if the search evidence below contains
+- Only issue REFUSAL_CHALLENGED if the evidence below contains
   CONCRETE, relevant information that directly addresses the question.
   Vague or tangential results do NOT count.
 
@@ -50,7 +51,7 @@ RULES
   doesn't fully answer the question), still issue REFUSAL_CHALLENGED
   — partial data means the agent should have dug deeper, not refused.
 
-- If search results are empty, irrelevant, or only contain very
+- If the evidence is empty, irrelevant, or only contains very
   indirect references, issue REFUSAL_JUSTIFIED.
 
 - Consider that some information is genuinely not online: private
@@ -58,7 +59,7 @@ RULES
   In those cases the refusal is justified.
 
 - Be strict. Agents should try hard before giving up. If there's a
-  reasonable trail of evidence in the search results, the refusal
+  reasonable trail of evidence in the investigation report, the refusal
   was premature.
 
 - CHAIN QUESTIONS: If the question requires a multi-step reasoning
