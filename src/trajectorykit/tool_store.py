@@ -1619,13 +1619,17 @@ def read_pdf(url: str, max_chars: int = 12000) -> dict:
     import httpx, io
     import pypdf
     resp = httpx.get(url, timeout=30)
-    # Suppress noisy pypdf warnings ("Ignoring wrong pointing object")
+    # Suppress noisy pypdf warnings ("Ignoring wrong pointing object",
+    # "Advanced encoding ... not implemented yet")
     pdf_logger = logging.getLogger("pypdf")
     prev_level = pdf_logger.level
     try:
         pdf_logger.setLevel(logging.ERROR)
-        reader = pypdf.PdfReader(io.BytesIO(resp.content))
-        full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Advanced encoding")
+            reader = pypdf.PdfReader(io.BytesIO(resp.content))
+            full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
     finally:
         pdf_logger.setLevel(prev_level)
 

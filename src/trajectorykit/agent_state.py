@@ -187,8 +187,9 @@ def create_state(
     # ── Draft file path (root only) ──────────────────────────────────
     draft_path: Optional[str] = None
     if _depth == 0:
-        os.makedirs(_cfg.TRACES_DIR, exist_ok=True)
-        draft_path = os.path.join(_cfg.TRACES_DIR, f"draft_{episode.trace_id}.md")
+        drafts_dir = os.path.join(_cfg.TRACES_DIR, "drafts")
+        os.makedirs(drafts_dir, exist_ok=True)
+        draft_path = os.path.join(drafts_dir, f"draft_{episode.trace_id}.md")
         with open(draft_path, "w", encoding="utf-8") as f:
             f.write("")
 

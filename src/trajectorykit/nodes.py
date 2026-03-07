@@ -1220,25 +1220,55 @@ def handle_research_complete(
 
     # ── Format compliance check ──────────────────────────────────────
     format_issues = []
-    if "**Final Answer:**" not in draft_content and "**Final Answer**" not in draft_content:
-        format_issues.append(
-            "Missing '**Final Answer:**' section. Your draft MUST start with "
-            "'**Final Answer:**' followed by the direct answer."
-        )
-    if "**Sources:**" not in draft_content and "**Sources**" not in draft_content:
-        format_issues.append(
-            "Missing '**Sources:**' section. Include at least one source URL."
-        )
+    if _cfg.DRAFT_FORMAT == "report":
+        # Bench / research-report format: # Title → ## Executive Summary → ## Sections → ## Sources
+        has_exec_summary = ("## Executive Summary" in draft_content
+                            or "## executive summary" in draft_content.lower())
+        if not has_exec_summary:
+            format_issues.append(
+                "Missing '## Executive Summary' section. Your report MUST include "
+                "an Executive Summary that directly answers the question."
+            )
+        has_sources = ("## Sources" in draft_content or "## sources" in draft_content.lower()
+                       or "## 参考" in draft_content or "## 来源" in draft_content
+                       or "## 引用" in draft_content)
+        if not has_sources:
+            format_issues.append(
+                "Missing '## Sources' section. Include source URLs at the end of the report."
+            )
+    else:
+        # Default QA format: **Final Answer:** → **Sources:** → **Details:**
+        if "**Final Answer:**" not in draft_content and "**Final Answer**" not in draft_content:
+            format_issues.append(
+                "Missing '**Final Answer:**' section. Your draft MUST start with "
+                "'**Final Answer:**' followed by the direct answer."
+            )
+        if "**Sources:**" not in draft_content and "**Sources**" not in draft_content:
+            format_issues.append(
+                "Missing '**Sources:**' section. Include at least one source URL."
+            )
     if format_issues:
-        fmt_msg = (
-            "Cannot publish \u2014 your draft does not follow the required format.\n\n"
-            "ISSUES:\n- " + "\n- ".join(format_issues) + "\n\n"
-            "Required structure:\n"
-            "  **Final Answer:**\n  [direct answer]\n\n"
-            "  **Sources:**\n  - [Source](URL)\n\n"
-            "  **Details:** (optional)\n  [supporting context]\n\n"
-            "Fix with refine_draft(), then call research_complete() again."
-        )
+        if _cfg.DRAFT_FORMAT == "report":
+            fmt_msg = (
+                "Cannot publish \u2014 your report does not follow the required format.\n\n"
+                "ISSUES:\n- " + "\n- ".join(format_issues) + "\n\n"
+                "Required structure:\n"
+                "  # [Report Title]\n\n"
+                "  ## Executive Summary\n  [direct answer to the question]\n\n"
+                "  ## [Section Title]\n  [analytical content]\n\n"
+                "  ## Sources\n  - [Source](URL)\n\n"
+                "Fix with refine_draft(), then call research_complete() again."
+            )
+        else:
+            fmt_msg = (
+                "Cannot publish \u2014 your draft does not follow the required format.\n\n"
+                "ISSUES:\n- " + "\n- ".join(format_issues) + "\n\n"
+                "Required structure:\n"
+                "  **Final Answer:**\n  [direct answer]\n\n"
+                "  **Sources:**\n  - [Source](URL)\n\n"
+                "  **Details:** (optional)\n  [supporting context]\n\n"
+                "Fix with refine_draft(), then call research_complete() again."
+            )
         tc_record = ToolCallRecord(
             tool_name="research_complete", tool_args=tool_args,
             tool_call_id=tool_call["id"], output=fmt_msg,

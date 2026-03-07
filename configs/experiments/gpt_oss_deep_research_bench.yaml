@@ -24,6 +24,7 @@ agent:
   plan_state: true
   plan_inject_interval: 3
   draft_report: true
+  draft_format: "report"          # "report" = Title/Executive Summary/Sections/Sources (bench)
   verify_before_publish: true
   spot_check_enabled: true
   spot_check_claims: 5
@@ -46,9 +47,9 @@ traces:
   dir: "deep_research_bench/traces/"
 
 prompts:
-  orchestrator: "configs/prompts/orchestrator.txt"
+  orchestrator: "configs/prompts/orchestrator_bench.txt"
   worker: "configs/prompts/worker.txt"
-  verifier: "configs/prompts/verifier.txt"
+  verifier: "configs/prompts/verifier_bench.txt"
   spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
   spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
   spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
@@ -75,7 +76,9 @@ dataset:
   name: "deep_research_bench"
   query_file: "deep_research_bench/data/prompt_data/query.jsonl"
   lang: "en"                             # uncomment to restrict: "en" or "zh"
-  limit: 5                              # uncomment to cap prompts (for testing)
+  limit: 10                              # uncomment to cap prompts (for testing)
+  shuffle: true                           # random sampling (stratified by language when no lang filter)
+  seed: 42                                # reproducible shuffle seed
 
 eval:
   turn_length: null

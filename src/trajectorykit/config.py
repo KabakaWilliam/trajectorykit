@@ -178,7 +178,7 @@ def _update_module_constants():
     global MODEL_PROFILES, _DEFAULT_PROFILE
     global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
-    global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT
+    global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT, DRAFT_FORMAT
     global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT
     global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
     global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
@@ -236,6 +236,7 @@ def _update_module_constants():
     PLAN_STATE = agent_cfg.get("plan_state", True)
     PLAN_INJECT_INTERVAL = agent_cfg.get("plan_inject_interval", 3)
     DRAFT_REPORT = agent_cfg.get("draft_report", True)
+    DRAFT_FORMAT = agent_cfg.get("draft_format", "qa")  # "qa" (Final Answer/Sources/Details) or "report" (Title/Executive Summary/Sections/Sources)
     VERIFY_BEFORE_PUBLISH = agent_cfg.get("verify_before_publish", True)
 
     # Verifier prompt
