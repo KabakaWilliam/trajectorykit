@@ -7,7 +7,7 @@ model:
 
 vllm:
   port: 3030
-  gpu_devices: [2]
+  gpu_devices: [2,3]
   gpu_memory_utilization: 0.9
   tool_call_parser: "openai"
   reasoning_parser: null
@@ -76,7 +76,7 @@ dataset:
   name: "deep_research_bench"
   query_file: "deep_research_bench/data/prompt_data/query.jsonl"
   # lang: "en"                             # uncomment to restrict: "en" or "zh"
-  limit: 50                              # uncomment to cap prompts (for testing)
+  # limit: 50                              # uncomment to cap prompts (for testing)
   shuffle: true                           # random sampling (stratified by language when no lang filter)
   seed: 42                                # reproducible shuffle seed
 

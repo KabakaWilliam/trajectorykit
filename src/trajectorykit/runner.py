@@ -488,13 +488,27 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
                 "before you can call research_complete again."
             )
 
-        # Gate 3: refine_draft hidden until at least one conduct_research
-        if state.conduct_research_count == 0:
+        # Gate 3: refine_draft hidden until sufficient research
+        _min_research = 2 if _cfg.DRAFT_FORMAT == "report" else 1
+        if state.conduct_research_count < _min_research:
             _hidden_tools.add("refine_draft")
             _hidden_reasons.append(
-                "refine_draft is not available yet — you must do at least "
-                "one round of research first. Call conduct_research(task='...') "
-                "to gather information, then refine_draft to write your answer."
+                f"refine_draft is not available yet — you must do at least "
+                f"{_min_research} round(s) of research first. Call conduct_research(task='...') "
+                f"to gather information, then refine_draft to write your answer. "
+                f"({state.conduct_research_count}/{_min_research} done)"
+            )
+
+        # Gate 5: research_complete hidden until post-draft research done (report mode)
+        if (_cfg.DRAFT_FORMAT == "report"
+                and state.draft_versions
+                and state.research_after_first_draft == 0):
+            _hidden_tools.add("research_complete")
+            _hidden_reasons.append(
+                "research_complete is locked — you must do at least one "
+                "round of deepening research (conduct_research or "
+                "summarize_webpage) AFTER your first draft before publishing. "
+                "Review your draft for gaps and shallow sections, then research."
             )
 
         # Gate 4: think hidden at root when plan is active

@@ -1402,8 +1402,8 @@ def handle_research_complete(
                 f"Draft review found issues that should be addressed before publishing:\n\n"
                 f"{verify_feedback}\n\n"
                 f"Please fix these issues with refine_draft(), then call research_complete() again. "
-                f"(Attempt {state.verification_rejections}/{state.MAX_VERIFICATION_REJECTIONS} \u2014 "
-                f"{'next attempt will force-publish' if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS else f'{state.MAX_VERIFICATION_REJECTIONS - state.verification_rejections} revision(s) remaining'})"
+                # f"(Attempt {state.verification_rejections}/{state.MAX_VERIFICATION_REJECTIONS} \u2014 "
+                # f"{'next attempt will force-publish' if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS else f'{state.MAX_VERIFICATION_REJECTIONS - state.verification_rejections} revision(s) remaining'})"
             )
         reject_meta = {
             "verification_verdict": "SPOT_CHECK_FAILED" if is_spot_check_reject else "REVISION_NEEDED",
@@ -1734,6 +1734,8 @@ def handle_conduct_research(
     mem_key = None
     if not output.startswith("ERROR:"):
         state.conduct_research_count += 1
+        if state.draft_versions:
+            state.research_after_first_draft += 1
         state.findings.append(f"[conduct_research] {output.strip()}")
         desc = str(tool_args.get("task", ""))[:60]
         mem_key = state.memory.add(
@@ -1840,6 +1842,8 @@ def handle_summarize_webpage(
     # Track in findings and memory
     mem_key = None
     if not sw_output.startswith("ERROR:"):
+        if state.draft_versions:
+            state.research_after_first_draft += 1
         state.findings.append(f"[summarize_webpage] {sw_output[:1500].strip()}")
         sw_desc = f"summary of {sw_url[:50]}"
         if sw_focus:

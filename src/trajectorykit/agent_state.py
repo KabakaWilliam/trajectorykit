@@ -91,6 +91,7 @@ class AgentState:
 
     # ── Cycle-enforcement tracking (root only) ────────────────────────
     conduct_research_count: int = 0
+    research_after_first_draft: int = 0  # research calls since first draft
     draft_revised_since_rejection: bool = True  # starts True (no rejection yet)
 
     # ── Degeneration flag ─────────────────────────────────────────────
