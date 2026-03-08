@@ -59,6 +59,73 @@ the evidence actually *supports* this answer to this question.
        wrong answer.
 
 ═══════════════════════════════════════════
+NUMERICAL RE-DERIVATION
+═══════════════════════════════════════════
+
+For ANY claim that contains a derived or calculated number (ratio,
+percentage, multiple, sum, average, difference, ranking position,
+compound growth, etc.):
+
+  1. IDENTIFY THE SOURCE VALUES
+     The claim text or evidence should contain the underlying raw
+     values from which the number was derived.
+
+     Example claim: "a 4× sample-efficiency gain"
+     → Look for two sample-efficiency figures in the evidence
+       (e.g. baseline = 2M steps, method = 500K steps → 4×).
+
+  2. RE-DERIVE THE CALCULATION
+     Perform the arithmetic yourself using the source values from
+     the evidence. Show your work briefly:
+       "Evidence: baseline 2M, method 500K → 2M / 500K = 4.0×  ✓"
+
+  3. COMPARE WITH THE CLAIM
+     - If your re-derived value matches the claim (within reasonable
+       rounding): PASS for this aspect.
+     - If they diverge meaningfully (e.g. claim says "4×" but
+       evidence yields 3.2×): FAIL — include BOTH the claimed value
+       and the re-derived value in your CORRECTION.
+     - If the evidence provides the derived number directly (e.g.
+       a source says "4× improvement") without raw values to
+       re-derive: verify the source is credible and treat it as
+       supporting evidence, but note you could not independently
+       re-derive.
+
+  4. UNIT & SCALE CONSISTENCY
+     Watch for mismatched units (millions vs. billions, percentage
+     points vs. percent change, nominal vs. real/adjusted figures,
+     fiscal year vs. calendar year). A claim may quote a correct
+     number from the wrong unit context.
+
+  5. TABLE / LIST ARITHMETIC
+     If the draft summarizes or totals data from a table:
+     - Spot-check that individual entries match the evidence.
+     - Verify that any stated totals, averages, or rankings are
+       arithmetically consistent with the entries presented.
+     Example: Draft lists 4 countries' GDP shares summing to "≈78%"
+       → evidence shows values 22%, 18%, 15%, 12% → sum = 67%, not
+       78%. Flag the discrepancy.
+
+═══════════════════════════════════════════
+SECTION-AWARE EVALUATION
+═══════════════════════════════════════════
+
+Claims from research reports span multiple sections with distinct
+purposes. Consider the SECTION each claim appears in:
+
+  - Executive Summary claims are high-stakes — errors here are the
+    first thing a reader sees and shape the entire impression.
+  - Body section claims should be consistent with their Executive
+    Summary counterpart (if any). If a body section says "35%" but
+    the Executive Summary says "40%" for the same metric, flag the
+    internal inconsistency even if one of them matches the evidence.
+  - Sources / References section: if a claim is about bibliographic
+    accuracy (right author, right year), check that too.
+
+When flagging issues, ALWAYS include the section name so the agent
+knows exactly where in the report the problem is.
+
+═══════════════════════════════════════════
 CHAIN COHERENCE (if chain claims present)
 ═══════════════════════════════════════════
 
@@ -112,15 +179,18 @@ If any claim is contradicted by the evidence:
   VERDICT: SPOT_CHECK_FAILED
 
   ISSUES:
-  - SECTION: "[section where the claim appears, if provided]"
+  - SECTION: "[section where the claim appears]"
     CLAIM: "[the specific claim from the draft]"
     EVIDENCE: "[what the verification agent found]"
+    RE-DERIVATION: "[your arithmetic, if this is a numerical claim]"
     CORRECTION: "[what the draft should say instead]"
   ...
   </verdict>
 
   Including the SECTION helps the agent know exactly WHERE to fix
   the issue in a long multi-section report.
+  Including RE-DERIVATION shows your work for numerical claims so
+  the agent can see the correct calculation.
 
 ═══════════════════════════════════════════
 RULES
@@ -174,7 +244,9 @@ EVIDENCE QUALITY — weigh sources mentioned in verification reports:
   reports X=37" is actionable. "This seems wrong" is not.
 
 - Minor discrepancies (rounding differences, date format variations,
-  approximate vs. exact figures) are a PASS.
+  approximate vs. exact figures) are a PASS — but only if the
+  deviation is genuinely minor. "≈80%" when the real value is 67%
+  is NOT minor rounding — flag it.
 
 - You are checking the draft against the provided evidence, NOT adding
   new information. Only flag contradictions you can back up with the

@@ -545,6 +545,67 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         return True, "", ""
 
 
+def _resolve_numbered_citations(draft: str) -> Tuple[str, dict]:
+    """Parse ## Sources section and inline-expand [N] → [N](URL) throughout the draft.
+
+    Returns (expanded_draft, citation_map) where citation_map is {int: url_string}.
+    This lets the extraction LLM see the URL right next to each claim instead of
+    having to cross-reference against a Sources section 50+ lines away.
+    """
+    citation_map: dict[int, str] = {}
+
+    # Find the ## Sources section (case-insensitive, also handles Chinese variants)
+    sources_match = re.search(
+        r'^##\s+(?:Sources|来源|参考|引用)\s*\n(.*)',
+        draft, re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    if not sources_match:
+        return draft, citation_map
+
+    sources_block = sources_match.group(1)
+    # Parse lines like: [1] Source Title: https://... or [1] Source Title — https://...
+    for line in sources_block.splitlines():
+        m = re.match(r'\s*\[(\d+)\]\s*(.+)', line.strip())
+        if m:
+            num = int(m.group(1))
+            rest = m.group(2)
+            # Extract URL from the rest of the line
+            url_m = re.search(r'(https?://\S+)', rest)
+            if url_m:
+                citation_map[num] = url_m.group(1).rstrip('.,;)')
+            else:
+                # No URL found — still record the source name for context
+                citation_map[num] = rest.strip()
+
+    if not citation_map:
+        return draft, citation_map
+
+    # Inline-expand [N] references in the body (everything BEFORE ## Sources)
+    body = draft[:sources_match.start()]
+
+    def _expand_citation(match):
+        num = int(match.group(1))
+        url = citation_map.get(num)
+        if url and url.startswith("http"):
+            return f"[{num}]({url})"
+        return match.group(0)  # leave unchanged if no URL
+
+    # Match [N] but not already expanded [N](url) — negative lookahead for '('
+    expanded_body = re.sub(r'\[(\d+)\](?!\()', _expand_citation, body)
+
+    # Also handle 【N】 (fullwidth brackets sometimes used in CJK text)
+    def _expand_fullwidth(match):
+        num = int(match.group(1))
+        url = citation_map.get(num)
+        if url and url.startswith("http"):
+            return f"[{num}]({url})"
+        return match.group(0)
+
+    expanded_body = re.sub(r'【(\d+)】', _expand_fullwidth, expanded_body)
+
+    return expanded_body + draft[sources_match.start():], citation_map
+
+
 def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, str, dict]:
     """Run Stage-2 spot-check (search-verify key claims).
 
@@ -565,6 +626,13 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
         if state.verbose:
             print(f"       \U0001f50e Spot-check: extracting checkable claims...")
 
+        # Pre-resolve numbered citations [1] → [1](URL) so the extraction
+        # LLM can see URLs inline next to each claim.
+        expanded_draft, citation_map = _resolve_numbered_citations(draft_content)
+        if citation_map and state.verbose:
+            print(f"       \U0001f50e Spot-check: resolved {len(citation_map)} numbered citation(s)")
+        meta["citation_map"] = {str(k): v for k, v in citation_map.items()}
+
         # Step 1: Extract claims from draft
         # Inject chain plan as a hint so the extract LLM confirms the
         # pre-computed chain structure rather than re-discovering it.
@@ -576,7 +644,7 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
             {"role": "user", "content": (
                 f"QUESTION:\n{state.user_input}"
                 f"{_chain_hint}\n\n"
-                f"DRAFT ANSWER:\n{draft_content}"
+                f"DRAFT ANSWER:\n{expanded_draft}"
             )},
         ]
         sc_extract_payload: dict = {
@@ -687,6 +755,7 @@ def _spot_check_claims(
         _c = claim_obj.get("claim", "")
         _source_url = claim_obj.get("source_url", "")
         _depends_on = claim_obj.get("depends_on")  # chain dependency (int or None)
+        _section = claim_obj.get("section", "")    # section attribution
         if not _q and not _source_url:
             return None
 
@@ -776,6 +845,7 @@ def _spot_check_claims(
 
             return {
                 "claim": _c,
+                "section": _section,
                 "search_query": _q,
                 "source_url": _source_url,
                 "depends_on": _depends_on,
@@ -786,6 +856,7 @@ def _spot_check_claims(
                 print(f"       ⚠️  Spot-check sub-agent error: {e}")
             return {
                 "claim": _c,
+                "section": _section,
                 "search_query": _q,
                 "source_url": _source_url,
                 "depends_on": _depends_on,
@@ -895,6 +966,8 @@ def _spot_check_claims(
     evidence_parts = []
     for i, ev in enumerate(sc_evidence, 1):
         part = f"CLAIM {i}: {ev['claim']}\n"
+        if ev.get("section"):
+            part += f"SECTION: {ev['section']}\n"
         if ev.get("depends_on") is not None:
             part += f"DEPENDS ON: Claim {ev['depends_on']}\n"
         report = ev.get("evidence_report", "(no evidence gathered)")

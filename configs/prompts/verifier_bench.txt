@@ -53,11 +53,24 @@ EVALUATION CRITERIA (in priority order)
    - Is there synthesis — connecting findings into a coherent
      narrative — rather than just stacking disconnected facts?
 
+   NUMERICAL ACCURACY:
+   - When the report states calculated values (percentages, ratios,
+     multiples like "4× improvement", growth rates), check whether
+     the underlying numbers are internally consistent.
+     Example: if the text says "28.7% of total" and gives figures
+     of 36.2M out of 126M, verify: 36.2/126 ≈ 28.7%. If it
+     doesn't add up, FLAG it.
+   - When a table contains numbers that should sum to a total,
+     check the arithmetic.
+   - Do NOT reject for minor rounding differences (37.6% vs 37.7%)
+     but DO flag significant mismatches (28% vs 35%).
+
    REJECT if:
    - The report is superficial — surface-level bullet points
      without analysis or reasoning
    - Major sections lack any supporting evidence
    - The report is just a list of facts without interpretation
+   - Calculations or derived numbers are clearly wrong
 
    DO NOT REJECT if:
    - Some sections are deeper than others (this is normal —

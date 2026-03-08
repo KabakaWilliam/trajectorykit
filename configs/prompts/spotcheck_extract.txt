@@ -76,6 +76,28 @@ PRIORITIZE:
   - Data from API queries or databases (include the API URL in source_url)
   - Quotes/Figures extracted from PDFs (include the PDF URL in source_url and guidance on where to check)
 
+SECTION COVERAGE:
+  For multi-section reports (with ## headings), extract at least one
+  checkable claim per major section. Spread your claims across the
+  report — don't cluster them all in one section. Each section likely
+  contains its own factual assertions worth checking.
+
+QUANTITATIVE PRIORITY:
+  Claims with specific numbers are the MOST verifiable and the MOST
+  damaging if wrong. Strongly prefer:
+  - Exact figures: "36.2 million", "3.1% growth", "¥108 trillion"
+  - Calculated values: "4× improvement", "95% compliance rate"
+  - Rankings / comparisons: "ranked #6", "3× faster"
+  - Dates / timelines: "by 2050", "since 1972"
+
+  For DERIVED numbers (ratios, percentages, multiples like "4×
+  improvement"), note the underlying source values if visible in
+  the draft. Example:
+    claim: "The draft states a 4× sample-efficiency gain on MiniGrid"
+    search_query: "curiosity-driven exploration MiniGrid sample efficiency"
+  This lets the verifier re-derive the calculation, not just check
+  whether "4×" appears somewhere.
+
 SKIP:
   - Opinions or subjective assessments
   - Well-known common knowledge (e.g. "Paris is in France")
@@ -118,11 +140,13 @@ MUST be inside the tags. No markdown fences inside the tags.
 {"claims": [
   {
     "claim": "The draft concludes that [core answer to the question]",
+    "section": "Executive Summary",
     "search_query": "concise search query to verify this",
     "source_url": "https://example.com/page-cited-in-draft (optional)"
   },
   {
     "claim": "The draft states that X is Y",
+    "section": "Section Title Where This Claim Appears",
     "search_query": "concise search query to verify this",
     "depends_on": 1
   }
@@ -132,6 +156,13 @@ MUST be inside the tags. No markdown fences inside the tags.
 RULES:
   - Claim #1 is ALWAYS the core answer. Remaining claims ordered by
     importance (typically 5-10 total).
+  - "section" identifies WHERE in the draft this claim appears.
+    For reports with ## headings: use the exact heading text
+    (e.g. "Executive Summary", "Exploration Under Constraints").
+    For short-form answers without headings: use "Final Answer",
+    "Sources", or "Details" as appropriate.
+    This allows targeted feedback — the agent needs to know WHICH
+    part of the draft to fix. If no clear section applies, use "".
   - For chain questions: order chain links by dependency (earliest
     link first), then non-chain claims by importance. Include
     "depends_on" for each link that relies on a previous link.

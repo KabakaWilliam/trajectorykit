@@ -51,7 +51,7 @@ prompts:
   worker: "configs/prompts/worker.txt"
   verifier: "configs/prompts/verifier_bench.txt"
   spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
-  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare_bench.txt"
   spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
   chain_analysis: "configs/prompts/chain_analysis.txt"
 
@@ -75,8 +75,8 @@ default_profile:
 dataset:
   name: "deep_research_bench"
   query_file: "deep_research_bench/data/prompt_data/query.jsonl"
-  lang: "en"                             # uncomment to restrict: "en" or "zh"
-  limit: 10                              # uncomment to cap prompts (for testing)
+  # lang: "en"                             # uncomment to restrict: "en" or "zh"
+  limit: 50                              # uncomment to cap prompts (for testing)
   shuffle: true                           # random sampling (stratified by language when no lang filter)
   seed: 42                                # reproducible shuffle seed
 
