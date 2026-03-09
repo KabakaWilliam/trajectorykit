@@ -30,6 +30,7 @@ agent:
   spot_check_claims: 5
   max_verification_rejections: 4
   max_spot_check_rejections: 4
+  citation_audit_enabled: true
   chain_analysis_enabled: true
   history_compaction_enabled: true
   history_compaction_msg_threshold: 30
@@ -54,6 +55,7 @@ prompts:
   spotcheck_compare: "configs/prompts/spotcheck_compare_bench.txt"
   spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
   chain_analysis: "configs/prompts/chain_analysis.txt"
+  citation_audit: "configs/prompts/citation_audit.txt"
 
 model_profiles:
   "Qwen/Qwen3-8B":

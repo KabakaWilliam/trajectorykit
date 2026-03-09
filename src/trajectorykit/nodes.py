@@ -606,6 +606,53 @@ def _resolve_numbered_citations(draft: str) -> Tuple[str, dict]:
     return expanded_body + draft[sources_match.start():], citation_map
 
 
+def _linkify_citations(draft: str) -> str:
+    """Post-process: convert [N] → [[N]](url) in the body using Sources map.
+
+    Only applied for report format.  Leaves the Sources section itself
+    untouched.  Already-linked citations [N](url) are skipped.
+    """
+    if _cfg.DRAFT_FORMAT != "report":
+        return draft
+
+    _, citation_map = _resolve_numbered_citations(draft)
+    if not citation_map:
+        return draft
+
+    # Split at ## Sources so we only transform the body
+    sources_match = re.search(
+        r'^##\s+(?:Sources|来源|参考|引用)\s*\n',
+        draft, re.MULTILINE | re.IGNORECASE,
+    )
+    if not sources_match:
+        return draft
+
+    body = draft[:sources_match.start()]
+    sources_section = draft[sources_match.start():]
+
+    def _linkify(match):
+        num = int(match.group(1))
+        url = citation_map.get(num)
+        if url and url.startswith("http"):
+            return f"[[{num}]]({url})"
+        return match.group(0)  # leave unchanged if no URL
+
+    # Match [N] but NOT already-linked [N](url) — negative lookahead for '('
+    linked_body = re.sub(r'\[(\d+)\](?!\()', _linkify, body)
+
+    # Also handle fullwidth brackets 【N】
+    def _linkify_fw(match):
+        num = int(match.group(1))
+        url = citation_map.get(num)
+        if url and url.startswith("http"):
+            return f"[[{num}]]({url})"
+        return match.group(0)
+
+    linked_body = re.sub(r'【(\d+)】', _linkify_fw, linked_body)
+
+    return linked_body + sources_section
+
+
 def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, str, dict]:
     """Run Stage-2 spot-check (search-verify key claims).
 
@@ -1250,6 +1297,206 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
     return True, "", "", meta
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# CITATION AUDIT  (Stage 3 — citation faithfulness)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _extract_citation_pairs(draft_content: str) -> Tuple[dict, list]:
+    """Parse draft to extract (citation_map, citation_pairs).
+
+    citation_map: {int: url_string}
+    citation_pairs: list of dicts with keys:
+        citation_num, url, attributed_fact (the sentence/clause where [N] appears)
+    """
+    # Re-use the citation map parser from _resolve_numbered_citations
+    _, citation_map = _resolve_numbered_citations(draft_content)
+    if not citation_map:
+        return {}, []
+
+    # Split draft into body (before ## Sources) and find each [N] in context
+    sources_match = re.search(
+        r'^##\s+(?:Sources|来源|参考|引用)\s*\n',
+        draft_content, re.MULTILINE | re.IGNORECASE,
+    )
+    body = draft_content[:sources_match.start()] if sources_match else draft_content
+
+    # Split body into sentences (rough heuristic — period/newline boundaries)
+    # We want the sentence containing each [N] reference.
+    pairs: list[dict] = []
+    seen: set[tuple] = set()  # (citation_num, sentence_hash) dedup
+
+    for m in re.finditer(r'\[(\d+)\]', body):
+        num = int(m.group(1))
+        if num not in citation_map:
+            continue
+        url = citation_map[num]
+        if not url.startswith("http"):
+            continue
+
+        # Extract ~200 chars of surrounding context
+        start = max(0, m.start() - 150)
+        end = min(len(body), m.end() + 150)
+        # Expand to sentence boundaries (nearest period/newline)
+        while start > 0 and body[start] not in '.!?\n':
+            start -= 1
+            if m.start() - start > 300:
+                break
+        if start > 0:
+            start += 1  # skip the boundary char itself
+        while end < len(body) and body[end] not in '.!?\n':
+            end += 1
+            if end - m.end() > 300:
+                break
+
+        context = body[start:end].strip()
+        dedup_key = (num, hash(context))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        pairs.append({
+            "citation_num": num,
+            "url": url,
+            "attributed_fact": context,
+        })
+
+    return citation_map, pairs
+
+
+def _run_citation_audit(
+    state: AgentState,
+    draft_content: str,
+) -> Tuple[bool, str, str, dict]:
+    """Run Stage-3 citation audit — verify each [N] URL supports its attributed fact.
+
+    Returns (should_publish, feedback, raw_text, metadata_dict).
+    """
+    meta: dict = {}
+
+    if (
+        not _cfg.CITATION_AUDIT_ENABLED
+        or not _cfg.CITATION_AUDIT_PROMPT
+    ):
+        return True, "", "", meta
+
+    if state.verbose:
+        print(f"       📑 Citation audit: extracting citation pairs...")
+
+    citation_map, pairs = _extract_citation_pairs(draft_content)
+    meta["citation_map"] = {str(k): v for k, v in citation_map.items()}
+    meta["pairs_found"] = len(pairs)
+
+    if not pairs:
+        if state.verbose:
+            print(f"       ℹ️  Citation audit: no verifiable citation pairs found, skipping")
+        return True, "", "", meta
+
+    if state.verbose:
+        print(f"       📑 Citation audit: {len(pairs)} citation-claim pair(s) to check, fetching URLs...")
+
+    # ── Fetch each cited URL (cache-first via fetch_url) ─────────
+    # Group by URL to avoid duplicate fetches
+    urls_to_fetch: dict[str, str] = {}  # url → content
+    unique_urls = {p["url"] for p in pairs}
+
+    def _fetch_one(url: str) -> Tuple[str, str]:
+        result = fetch_url(url, max_chars=100_000)
+        if result.get("ok"):
+            content = result["content"]
+            if len(content.strip()) < 50:
+                return url, "(page fetched but content too short — possibly paywalled)"
+            # Truncate to keep LLM context manageable
+            return url, content[:8000]
+        return url, f"(fetch failed: {result.get('reason', 'unknown')})"
+
+    with ThreadPoolExecutor(max_workers=min(len(unique_urls), 6)) as pool:
+        futures = {pool.submit(_fetch_one, u): u for u in unique_urls}
+        for fut in as_completed(futures):
+            url, content = fut.result()
+            urls_to_fetch[url] = content
+
+    # ── Build the LLM audit prompt ───────────────────────────────
+    audit_parts = []
+    for i, pair in enumerate(pairs, 1):
+        url_content = urls_to_fetch.get(pair["url"], "(not fetched)")
+        audit_parts.append(
+            f"─── Citation [{pair['citation_num']}] (pair {i}) ───\n"
+            f"URL: {pair['url']}\n"
+            f"ATTRIBUTED FACT (text around this citation):\n"
+            f"  \"{pair['attributed_fact']}\"\n\n"
+            f"PAGE CONTENT (first 8000 chars):\n"
+            f"{url_content}\n"
+        )
+    audit_text = "\n\n".join(audit_parts)
+
+    audit_msgs = [
+        {"role": "system", "content": _cfg.CITATION_AUDIT_PROMPT},
+        {"role": "user", "content": (
+            f"QUESTION:\n{state.user_input}\n\n"
+            f"NUMBER OF CITATIONS TO CHECK: {len(pairs)}\n\n"
+            f"{audit_text}"
+        )},
+    ]
+
+    try:
+        if state.verbose:
+            print(f"       📑 Citation audit: sending {len(pairs)} pairs to LLM...")
+        audit_resp = requests.post(
+            f"{_cfg.VLLM_API_URL}/chat/completions",
+            json={
+                "model": state.model,
+                "messages": audit_msgs,
+                "temperature": state.temperature,
+                "max_tokens": state.max_tokens,
+            },
+        )
+        if audit_resp.status_code == 200:
+            audit_raw = (
+                audit_resp.json().get("choices", [{}])[0]
+                .get("message", {}).get("content", "")
+            ).strip()
+            meta["audit_response"] = audit_raw
+            audit_verdict_text = _extract_xml_tag(audit_raw, "audit")
+            clean = audit_verdict_text.replace("*", "").upper()
+
+            if "VERDICT: CITATION_FAIL" in clean or "VERDICT:CITATION_FAIL" in clean:
+                meta["citation_audit_verdict"] = "FAILED"
+                # Extract feedback: everything after the verdict line
+                feedback = re.sub(
+                    r'^.*?\*{0,2}Verdict\*{0,2}:\*{0,2}\s*CITATION_FAIL\s*',
+                    '', audit_verdict_text, count=1,
+                    flags=re.IGNORECASE | re.DOTALL,
+                ).strip()
+                if not feedback:
+                    # Fall back to full text
+                    feedback = audit_verdict_text
+                # Prepend the failing citations summary
+                feedback = (
+                    "Citation faithfulness check found issues:\n\n"
+                    + feedback + "\n\n"
+                    "Fix: for each UNSUPPORTED citation, either (a) find the "
+                    "correct source URL that supports the claim, (b) remove "
+                    "the citation, or (c) correct the attributed fact. Then "
+                    "call refine_draft() and research_complete() again."
+                )
+                raw_text = f"[CITATION-AUDIT] {audit_verdict_text}"
+                if state.verbose:
+                    print(f"       ❌ Citation audit: FAILED — unfaithful citations found")
+                return False, feedback, raw_text, meta
+            else:
+                meta["citation_audit_verdict"] = "PASSED"
+                if state.verbose:
+                    print(f"       ✅ Citation audit: PASSED")
+        else:
+            if state.verbose:
+                print(f"       ⚠️  Citation audit: API error ({audit_resp.status_code}), skipping")
+    except Exception as e:
+        if state.verbose:
+            print(f"       ⚠️  Citation audit error: {e}, skipping")
+
+    return True, "", "", meta
+
+
 def handle_research_complete(
     state: AgentState,
     tool_call: dict,
@@ -1257,7 +1504,7 @@ def handle_research_complete(
     turn_record: TurnRecord,
     **kw,
 ) -> NodeResult:
-    """Publish the draft — runs verification + spot-check pipeline."""
+    """Publish the draft — runs verification + spot-check + citation-audit pipeline."""
     if state.depth != 0:
         return _CONTINUE
 
@@ -1367,8 +1614,19 @@ def handle_research_complete(
             verify_feedback = sc_feedback
             verify_text_raw = sc_raw
 
+    # ── Stage 3: Citation audit (citation faithfulness) ──────────────
+    citation_audit_meta: dict = {}
+    if should_publish:
+        should_publish, ca_feedback, ca_raw, citation_audit_meta = _run_citation_audit(state, draft_content)
+        if not should_publish:
+            verify_feedback = ca_feedback
+            verify_text_raw = ca_raw
+
     # ── Publish or reject ────────────────────────────────────────────
     if should_publish:
+        # ── Inline URL linkification: [N] → [[N]](url) ──────────
+        published_content = _linkify_citations(draft_content)
+
         verify_meta: dict = {}
         if verify_text_raw:
             verify_meta["verification_verdict"] = "APPROVED"
@@ -1376,19 +1634,29 @@ def handle_research_complete(
         verify_meta["verification_attempt"] = state.verification_rejections + 1
         if spot_check_meta:
             verify_meta["spot_check"] = spot_check_meta
+        if citation_audit_meta:
+            verify_meta["citation_audit"] = citation_audit_meta
         tc_record = ToolCallRecord(
             tool_name="research_complete", tool_args=tool_args,
-            tool_call_id=tool_call["id"], output=draft_content,
+            tool_call_id=tool_call["id"], output=published_content,
             duration_s=0, child_trace=None,
             metadata=verify_meta if verify_meta else None,
         )
         turn_record.tool_calls.append(tc_record)
         if state.verbose:
-            print(f"   \u2705 research_complete \u2014 publishing draft ({len(draft_content):,} chars)")
-        return _finalize(draft_content)
+            print(f"   ✅ research_complete — publishing draft ({len(published_content):,} chars)")
+        return _finalize(published_content)
     else:
+        is_citation_reject = verify_text_raw.startswith("[CITATION-AUDIT]")
         is_spot_check_reject = verify_text_raw.startswith("[SPOT-CHECK]")
-        if is_spot_check_reject:
+        if is_citation_reject:
+            reject_msg = (
+                f"Citation faithfulness audit found issues in your draft:\n\n"
+                f"{verify_feedback}\n\n"
+                f"Please fix the cited sources with refine_draft(), then call "
+                f"research_complete() again."
+            )
+        elif is_spot_check_reject:
             reject_msg = (
                 f"Spot-check found factual issues in your draft that should be corrected:\n\n"
                 f"{verify_feedback}\n\n"
@@ -1406,13 +1674,19 @@ def handle_research_complete(
                 # f"{'next attempt will force-publish' if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS else f'{state.MAX_VERIFICATION_REJECTIONS - state.verification_rejections} revision(s) remaining'})"
             )
         reject_meta = {
-            "verification_verdict": "SPOT_CHECK_FAILED" if is_spot_check_reject else "REVISION_NEEDED",
+            "verification_verdict": (
+                "CITATION_AUDIT_FAILED" if is_citation_reject
+                else "SPOT_CHECK_FAILED" if is_spot_check_reject
+                else "REVISION_NEEDED"
+            ),
             "verification_response": verify_text_raw or verify_feedback,
             "verification_attempt": state.verification_rejections,
             "spot_check_attempt": state.spot_check_rejections,
         }
         if spot_check_meta:
             reject_meta["spot_check"] = spot_check_meta
+        if citation_audit_meta:
+            reject_meta["citation_audit"] = citation_audit_meta
         tc_record = ToolCallRecord(
             tool_name="research_complete", tool_args=tool_args,
             tool_call_id=tool_call["id"], output=reject_msg,

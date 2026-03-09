@@ -33,6 +33,7 @@ def dispatch(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     example_id: Optional[str] = None,
+    config_path: Optional[str] = None,
     _depth: int = 0,
     _sandbox_files: Optional[Dict[str, str]] = None,
     _is_synthesizer: bool = False,
@@ -49,6 +50,10 @@ def dispatch(
         model: Model name to use (default: config.MODEL_NAME)
         reasoning_effort: Reasoning effort for supported models — "low"/"medium"/"high"
                           (default: from model profile if supported, else None)
+        config_path: Path to a YAML config file. If None, uses the default config
+                     (configs/default.yaml). Use this to switch between modes, e.g.
+                     "configs/experiments/gpt_oss_deep_research_bench.yaml" for
+                     report/bench mode.
         _depth: Current recursion depth (internal — used by spawn_agent)
         _sandbox_files: Files to auto-inject into every execute_code sandbox call.
                         Dict of {filename: base64_content}. Used by synthesis sub-agent
@@ -65,6 +70,12 @@ def dispatch(
             - 'messages': Full conversation history
             - 'trace': EpisodeTrace capturing the full execution tree
     """
+    # Reload config if a custom path was provided (root dispatch only)
+    if config_path is not None and _depth == 0:
+        _cfg.load_config(config_path)
+        if verbose:
+            print(f"⚙️  Config loaded: {config_path} (draft_format={_cfg.DRAFT_FORMAT})")
+
     state = create_state(
         user_input=user_input,
         turn_length=turn_length,

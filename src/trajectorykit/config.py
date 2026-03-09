@@ -182,6 +182,7 @@ def _update_module_constants():
     global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT
     global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
     global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
+    global CITATION_AUDIT_ENABLED, CITATION_AUDIT_PROMPT
     global CHAIN_ANALYSIS_ENABLED, CHAIN_ANALYSIS_PROMPT
     global HISTORY_COMPACTION_ENABLED, HISTORY_COMPACTION_MSG_THRESHOLD
     global HISTORY_COMPACTION_MIN_INTERVAL, HISTORY_COMPACTION_RECENT_TURNS
@@ -266,6 +267,14 @@ def _update_module_constants():
         SPOTCHECK_REFUSAL_PROMPT = _load_prompt(spotcheck_refusal_path)
     except FileNotFoundError:
         SPOTCHECK_REFUSAL_PROMPT = ""
+
+    # Citation audit (Stage 3 verification — citation faithfulness)
+    CITATION_AUDIT_ENABLED = agent_cfg.get("citation_audit_enabled", False)
+    citation_audit_path = c.get("prompts", {}).get("citation_audit", "configs/prompts/citation_audit.txt")
+    try:
+        CITATION_AUDIT_PROMPT = _load_prompt(citation_audit_path)
+    except FileNotFoundError:
+        CITATION_AUDIT_PROMPT = ""
 
     # History compaction (root context window management)
     HISTORY_COMPACTION_ENABLED = agent_cfg.get("history_compaction_enabled", True)
