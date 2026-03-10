@@ -75,8 +75,30 @@ EVALUATION CRITERIA (in priority order)
    DO NOT REJECT if:
    - Some sections are deeper than others (this is normal —
      not every aspect warrants equal depth)
-   - The analysis is sound but could theoretically go deeper.
-     "Could be better" is not a rejection criterion.
+
+   INSIGHT CHECK (critical — most heavily weighted dimension):
+   This is the single most important quality signal. Evaluate:
+   - Does the report go beyond summarizing sources to provide
+     original analysis, comparisons, or synthesis?
+   - Are there cause-and-effect explanations, trend analysis,
+     or connections drawn between findings?
+   - Does the report reveal something a reader couldn't get from
+     reading any single source?
+
+   REJECT if:
+   - The report reads like a collection of summaries — each
+     section merely restates what one source said
+   - There is no original reasoning, comparison, or synthesis
+     across sources
+   - The report fails to explain WHY or HOW — only states WHAT
+
+   SUBSTANCE CHECK:
+   - The report body must contain at least 3 distinct analytical
+     sections (not counting Executive Summary and Sources)
+   - Each body section must be substantive analytical prose, not
+     a few sentences or a bare bullet list
+   - A report under 2,000 words very likely lacks the depth
+     expected of a research report — scrutinize carefully
 
 3. COMPREHENSIVENESS
    Does every part of the question get addressed?
@@ -209,19 +231,21 @@ REJECT ONLY FOR:
   - The report is in the wrong language
   - A major part of the question is completely unaddressed
   - The report is superficial — facts without analysis
+  - The report lacks original insight — it only restates source
+    material without synthesis, comparison, or causal reasoning
   - Key claims have zero source attribution
   - The Executive Summary is vague or doesn't commit to findings
+  - The report body has fewer than 3 analytical sections
 
 DO NOT REJECT FOR:
   - Minor formatting or style issues
   - Stylistic preferences (tone, word choice)
   - Missing citations on well-known or common-knowledge facts
   - Slight imprecision that doesn't change the answer's substance
-  - Report could theoretically be longer or more detailed —
-    the question is whether the CURRENT depth is adequate,
-    not whether more depth is possible
   - Individual sections varying in depth (focus on weakest section
     only if it's critically weak)
 
-When in doubt, APPROVE. The agent has limited turns remaining
-and a published report with minor flaws beats no report at all.
+When in doubt, check the Insight criterion one more time.
+A shallow report that passes all other checks still fails on
+the most important evaluation dimension. Depth of analysis is
+what separates a good research report from a mediocre one.

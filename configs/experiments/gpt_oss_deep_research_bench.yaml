@@ -33,9 +33,9 @@ agent:
   citation_audit_enabled: true
   chain_analysis_enabled: true
   history_compaction_enabled: true
-  history_compaction_msg_threshold: 30
-  history_compaction_min_interval: 4
-  history_compaction_recent_turns: 3
+  history_compaction_msg_threshold: 15
+  history_compaction_min_interval: 2
+  history_compaction_recent_turns: 2
 
 sandbox:
   url: "http://localhost:8080/run_code"
@@ -78,7 +78,7 @@ dataset:
   name: "deep_research_bench"
   query_file: "deep_research_bench/data/prompt_data/query.jsonl"
   # lang: "en"                             # uncomment to restrict: "en" or "zh"
-  # limit: 50                              # uncomment to cap prompts (for testing)
+  limit: 50                              # uncomment to cap prompts (for testing)
   shuffle: true                           # random sampling (stratified by language when no lang filter)
   seed: 42                                # reproducible shuffle seed
 

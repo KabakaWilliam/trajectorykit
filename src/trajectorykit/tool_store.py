@@ -310,8 +310,77 @@ def _search_ddg(q: str, num_results: int = 5) -> str:
                 evt.set()
 
 
+def _search_exa(q: str, num_results: int = 5) -> str:
+    """Neural search via Exa.ai API.
+
+    Exa combines keyword and neural search, making it good at finding
+    relevant pages even when the query is more conceptual than keyword-exact.
+    Requires EXA_API_KEY in the environment.
+    """
+    import httpx
+
+    api_key = os.getenv("EXA_API_KEY", "")
+    if not api_key:
+        return "Search error: Exa API key not configured. Set EXA_API_KEY environment variable."
+
+    payload = {
+        "query": q,
+        "numResults": min(num_results, 10),
+        "type": "auto",                  # let Exa pick keyword vs neural
+        "contents": {
+            "text": {"maxCharacters": 300},   # short snippet per result
+        },
+    }
+
+    last_error = None
+    for attempt in range(MAX_SEARCH_RETRIES + 1):
+        try:
+            logger.info(f"Exa search (attempt {attempt+1}): {q}")
+            resp = httpx.post(
+                "https://api.exa.ai/search",
+                headers={
+                    "x-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=SEARCH_TIMEOUT,
+            )
+            if resp.status_code == 401:
+                return "Search error: Invalid Exa API key. Check EXA_API_KEY."
+            if resp.status_code == 429:
+                return "Search error: Exa rate limit exceeded."
+            if resp.status_code != 200:
+                error_msg = f"Search HTTP error {resp.status_code}"
+                logger.error(f"Exa: {error_msg}")
+                return error_msg
+
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                return f"No results found for query: {q}"
+
+            formatted = f"Search Results for '{q}':\n\n"
+            for i, r in enumerate(results[:num_results], 1):
+                title = r.get("title") or "No title"
+                link = r.get("url") or "No link"
+                snippet = (r.get("text") or "").strip()[:250] or "No snippet"
+                formatted += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
+
+            logger.info(f"Successfully retrieved {len(results[:num_results])} search results via Exa")
+            return formatted
+
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Exa search error (attempt {attempt+1}/{MAX_SEARCH_RETRIES+1}): {e}")
+            if attempt < MAX_SEARCH_RETRIES:
+                time.sleep(1 * (attempt + 1))
+                continue
+
+    return f"Exa search error after retries: {type(last_error).__name__}: {last_error}"
+
+
 # Error patterns that indicate the primary search backend is exhausted/broken
-# and we should fall back to DDG for all remaining queries.
+# and we should fall back for all remaining queries.
 _SEARCH_FALLBACK_ERRORS = (
     "Search HTTP error",
     "Search error: Rate limit exceeded",
@@ -325,18 +394,18 @@ _SEARCH_FALLBACK_ERRORS = (
 def search_web(q: str, num_results: int = 5) -> str:
     """
     Execute a web search and return structured results.
-    
+
     Backend priority:
       1. Primary: serper (default) or serpapi (set SEARCH_BACKEND env var)
-      2. Fallback: DuckDuckGo (automatic if primary fails with credit/auth errors)
-    
+      2. Fallback 1: Exa.ai neural search (if EXA_API_KEY is set)
+      3. Fallback 2: DuckDuckGo (no key required)
+
     Args:
         q: Search query string
         num_results: Number of results to return (default: 5)
-    
+
     Returns:
         Formatted string with top search results or error message.
-        Results from the DDG fallback are prefixed with [DDG fallback].
     """
     backend = os.getenv("SEARCH_BACKEND", "serper").lower()
     if backend == "serpapi":
@@ -344,19 +413,30 @@ def search_web(q: str, num_results: int = 5) -> str:
     else:
         result = _search_serper(q, num_results)
 
-    # If primary backend failed with a credit/auth/rate error, fall back to DDG
-    if any(result.startswith(err) for err in _SEARCH_FALLBACK_ERRORS):
-        primary_error = result
-        logger.warning(f"Primary search failed ({primary_error}), falling back to DuckDuckGo")
-        ddg_result = _search_ddg(q, num_results)
-        if ddg_result.startswith("Search error:") or ddg_result.startswith("DDG search error:"):
-            # DDG also failed — return both errors
-            return f"{primary_error}\n[DDG fallback also failed: {ddg_result}]"
-        # Return clean results — the model doesn't need to know about the fallback.
-        # The switch is logged above for traceability.
+    # If primary succeeded, return immediately
+    if not any(result.startswith(err) for err in _SEARCH_FALLBACK_ERRORS):
+        return result
+
+    primary_error = result
+    logger.warning(f"Primary search failed ({primary_error}), trying Exa fallback")
+
+    # ── Fallback 1: Exa ──────────────────────────────────────────────
+    exa_result = _search_exa(q, num_results)
+    if not (exa_result.startswith("Search error:") or exa_result.startswith("Exa search error")):
+        return exa_result
+    logger.warning(f"Exa fallback failed ({exa_result}), trying DDG")
+
+    # ── Fallback 2: DuckDuckGo ───────────────────────────────────────
+    ddg_result = _search_ddg(q, num_results)
+    if not (ddg_result.startswith("Search error:") or ddg_result.startswith("DDG search error:")):
         return ddg_result
 
-    return result
+    # All three failed
+    return (
+        f"{primary_error}\n"
+        f"[Exa fallback also failed: {exa_result}]\n"
+        f"[DDG fallback also failed: {ddg_result}]"
+    )
 
 # ── Browser-grade HTTP infrastructure ─────────────────────────────────
 _BROWSER_HEADERS = {
