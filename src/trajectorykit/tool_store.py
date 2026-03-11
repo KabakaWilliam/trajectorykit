@@ -391,14 +391,36 @@ _SEARCH_FALLBACK_ERRORS = (
 )
 
 
+def _is_search_error(result: str) -> bool:
+    """Check if a search result string indicates failure."""
+    return (
+        any(result.startswith(err) for err in _SEARCH_FALLBACK_ERRORS)
+        or result.startswith("Search error:")
+        or result.startswith("Exa search error")
+        or result.startswith("DDG search error")
+    )
+
+
+# Maps backend name → (primary_fn, ordered fallback fns)
+_SEARCH_BACKENDS = {
+    "serper":  (_search_serper,  [_search_exa, _search_ddg]),
+    "serpapi": (_search_serpapi,  [_search_exa, _search_ddg]),
+    "exa":    (_search_exa,      [_search_serper, _search_ddg]),
+    "ddg":    (_search_ddg,      [_search_exa, _search_serper]),
+}
+
+
 def search_web(q: str, num_results: int = 5) -> str:
     """
     Execute a web search and return structured results.
 
-    Backend priority:
-      1. Primary: serper (default) or serpapi (set SEARCH_BACKEND env var)
-      2. Fallback 1: Exa.ai neural search (if EXA_API_KEY is set)
-      3. Fallback 2: DuckDuckGo (no key required)
+    Set SEARCH_BACKEND env var to choose the primary backend:
+      "serper"  (default) — Google via Serper.dev
+      "serpapi" — Google via SerpAPI.com
+      "exa"    — Exa.ai neural search
+      "ddg"    — DuckDuckGo (no key required)
+
+    On failure, remaining backends are tried in order automatically.
 
     Args:
         q: Search query string
@@ -408,35 +430,23 @@ def search_web(q: str, num_results: int = 5) -> str:
         Formatted string with top search results or error message.
     """
     backend = os.getenv("SEARCH_BACKEND", "serper").lower()
-    if backend == "serpapi":
-        result = _search_serpapi(q, num_results)
-    else:
-        result = _search_serper(q, num_results)
+    primary_fn, fallbacks = _SEARCH_BACKENDS.get(
+        backend, (_search_serper, [_search_exa, _search_ddg])
+    )
 
-    # If primary succeeded, return immediately
-    if not any(result.startswith(err) for err in _SEARCH_FALLBACK_ERRORS):
+    result = primary_fn(q, num_results)
+    if not _is_search_error(result):
         return result
 
     primary_error = result
-    logger.warning(f"Primary search failed ({primary_error}), trying Exa fallback")
+    for fb_fn in fallbacks:
+        logger.warning(f"Primary search ({backend}) failed, trying {fb_fn.__name__}")
+        fb_result = fb_fn(q, num_results)
+        if not _is_search_error(fb_result):
+            return fb_result
+        primary_error += f"\n[{fb_fn.__name__} also failed: {fb_result}]"
 
-    # ── Fallback 1: Exa ──────────────────────────────────────────────
-    exa_result = _search_exa(q, num_results)
-    if not (exa_result.startswith("Search error:") or exa_result.startswith("Exa search error")):
-        return exa_result
-    logger.warning(f"Exa fallback failed ({exa_result}), trying DDG")
-
-    # ── Fallback 2: DuckDuckGo ───────────────────────────────────────
-    ddg_result = _search_ddg(q, num_results)
-    if not (ddg_result.startswith("Search error:") or ddg_result.startswith("DDG search error:")):
-        return ddg_result
-
-    # All three failed
-    return (
-        f"{primary_error}\n"
-        f"[Exa fallback also failed: {exa_result}]\n"
-        f"[DDG fallback also failed: {ddg_result}]"
-    )
+    return primary_error
 
 # ── Browser-grade HTTP infrastructure ─────────────────────────────────
 _BROWSER_HEADERS = {
