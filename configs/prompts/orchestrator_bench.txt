@@ -657,7 +657,7 @@ INLINE CITATIONS:
   Sub-agents return findings as: FACT — SOURCE_URL
   Assign each unique URL a sequential citation number [1], [2], etc.
   Use the number inline where claims appear:
-    "Japan's GDP grew 1.9% in 2024 [1]."
+    "Japan's GDP grew 1.9% in 2026 [1]."
   Collect all sources in the ## Sources section with their numbers:
     [1] World Bank: https://data.worldbank.org/...
     [2] IMF WEO: https://www.imf.org/...
@@ -669,7 +669,7 @@ ACCURACY:
   - When sources conflict, report BOTH and state which seems more
     reliable and why.
   - Distinguish verified facts from reasonable inferences:
-    VERIFIED: "GDP grew 3.1% in 2024 (Bureau of Economic Analysis)"
+    VERIFIED: "GDP grew 3.1% in 2026 (Bureau of Economic Analysis)"
     INFERRED: "This likely reflects post-pandemic recovery, though
               the data does not explicitly attribute the cause."
   - Never present a single-source finding as established fact

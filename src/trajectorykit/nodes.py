@@ -490,6 +490,14 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
                 "\n\nRESEARCH FINDINGS (raw worker outputs for cross-checking):\n"
                 + "\n".join(lines)
             )
+        # Resolve verifier model + endpoint: "external" uses verifier.model, "self" uses the local model
+        use_external = (
+            getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
+            and _cfg.VERIFIER_MODEL
+        )
+        v_model = _cfg.VERIFIER_MODEL if use_external else state.model
+        v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL) if use_external else _cfg.VLLM_API_URL
+
         verify_messages = [
             {"role": "system", "content": _cfg.VERIFIER_PROMPT},
             {
@@ -502,14 +510,19 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
             },
         ]
         payload = {
-            "model": state.model,
+            "model": v_model,
             "messages": verify_messages,
-            "temperature": state.temperature,
+            "temperature": _cfg.VERIFIER_TEMPERATURE if _cfg.VERIFIER_TEMPERATURE is not None else state.temperature,
             "max_tokens": state.max_tokens,
         }
+        v_label = v_model if v_model != state.model else "same model"
         if state.verbose:
-            print(f"       \U0001f50d Verifier: auditing draft (attempt {state.verification_rejections + 1})...")
-        resp = requests.post(f"{_cfg.VLLM_API_URL}/chat/completions", json=payload)
+            print(f"       \U0001f50d Verifier ({v_label}): auditing draft (attempt {state.verification_rejections + 1})...")
+        headers = {"Content-Type": "application/json"}
+        v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+        if v_api_key and v_api_url != _cfg.VLLM_API_URL:
+            headers["Authorization"] = f"Bearer {v_api_key}"
+        resp = requests.post(f"{v_api_url}/chat/completions", json=payload, headers=headers, timeout=60)
         if resp.status_code == 200:
             result = resp.json()
             raw_text = (
@@ -1441,14 +1454,32 @@ def _run_citation_audit(
     try:
         if state.verbose:
             print(f"       📑 Citation audit: sending {len(pairs)} pairs to LLM...")
+        # Route through external verifier when configured for Stage 3
+        use_external_s3 = (
+            getattr(_cfg, "VERIFIER_STAGE3_PROVIDER", "self") == "external"
+            and _cfg.VERIFIER_MODEL
+        )
+        ca_model = _cfg.VERIFIER_MODEL if use_external_s3 else state.model
+        ca_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL) if use_external_s3 else _cfg.VLLM_API_URL
+        ca_temp = (_cfg.VERIFIER_TEMPERATURE if _cfg.VERIFIER_TEMPERATURE is not None else state.temperature)
+        ca_headers = {"Content-Type": "application/json"}
+        ca_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+        if ca_api_key and use_external_s3:
+            ca_headers["Authorization"] = f"Bearer {ca_api_key}"
+
+        if state.verbose and use_external_s3:
+            print(f"       📑 Citation audit: using external model ({ca_model})")
+
         audit_resp = requests.post(
-            f"{_cfg.VLLM_API_URL}/chat/completions",
+            f"{ca_api_url}/chat/completions",
             json={
-                "model": state.model,
+                "model": ca_model,
                 "messages": audit_msgs,
-                "temperature": state.temperature,
+                "temperature": ca_temp,
                 "max_tokens": state.max_tokens,
             },
+            headers=ca_headers,
+            timeout=90,
         )
         if audit_resp.status_code == 200:
             audit_raw = (

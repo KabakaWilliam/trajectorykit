@@ -144,10 +144,10 @@ EVIDENCE QUALITY — weigh sources mentioned in verification reports:
   - If a source comes from a domain unrelated to the claim topic,
     treat it as low-confidence.
   - VERSION MISMATCH: If the question specifies a particular edition,
-    year, or data snapshot (e.g. "Michellin 2024", "2020 Census",
+    year, or data snapshot (e.g. "Michellin 2026", "2020 Census",
     "as of March 2023"), evidence MUST come from that same version.
     Data from a different year's edition (e.g. Michellin 2023 instead
-    of 2024) may give different answers and should be treated as
+    of 2026) may give different answers and should be treated as
     INSUFFICIENT rather than confirming or contradicting.  Similarly,
     data mirrors or cached copies are acceptable ONLY if they reflect
     the correct version/edition.

@@ -179,7 +179,8 @@ def _update_module_constants():
     global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
     global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT, DRAFT_FORMAT
-    global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT
+    global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT, VERIFIER_MODEL, VERIFIER_API_URL, VERIFIER_API_KEY, VERIFIER_TEMPERATURE
+    global VERIFIER_STAGE1_PROVIDER, VERIFIER_STAGE3_PROVIDER
     global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
     global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
     global CITATION_AUDIT_ENABLED, CITATION_AUDIT_PROMPT
@@ -239,6 +240,17 @@ def _update_module_constants():
     DRAFT_REPORT = agent_cfg.get("draft_report", True)
     DRAFT_FORMAT = agent_cfg.get("draft_format", "qa")  # "qa" (Final Answer/Sources/Details) or "report" (Title/Executive Summary/Sections/Sources)
     VERIFY_BEFORE_PUBLISH = agent_cfg.get("verify_before_publish", True)
+
+    # Verifier model — defaults to the main model/endpoint if not set
+    verifier_cfg = c.get("verifier", {})
+    VERIFIER_MODEL = verifier_cfg.get("model", None)       # None → use state.model
+    VERIFIER_API_URL = verifier_cfg.get("api_url", None)   # None → use VLLM_API_URL
+    VERIFIER_API_KEY = verifier_cfg.get("api_key", None) or os.getenv("OPENAI_API_KEY", "")
+    VERIFIER_TEMPERATURE = verifier_cfg.get("temperature", None)  # None → use state.temperature
+
+    # Per-stage provider: "self" = local model, "external" = verifier.model
+    VERIFIER_STAGE1_PROVIDER = verifier_cfg.get("stage1_provider", "self")
+    VERIFIER_STAGE3_PROVIDER = verifier_cfg.get("stage3_provider", "self")
 
     # Verifier prompt
     verifier_path = c.get("prompts", {}).get("verifier", "configs/prompts/verifier.txt")

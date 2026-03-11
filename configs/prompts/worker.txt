@@ -98,8 +98,8 @@ WHEN SEARCH RETURNS POOR / EMPTY RESULTS:
        Good: FIFA World Cup 2022 attendance
 
   2. USE SYNONYMS — try alternate phrasing
-       Bad:  GDP per capita purchasing power parity 2024
-       Good: PPP GDP per capita 2024
+       Bad:  GDP per capita purchasing power parity 2026
+       Good: PPP GDP per capita 2026
 
   3. GO BROADER — widen the category, then narrow
        Bad:  "tallest building in Kuala Lumpur height meters"
@@ -183,9 +183,9 @@ STRATEGY 2 — Parse pre-loaded data (agent_data.json):
 STRATEGY 3 — Calculate derived values:
   execute_code(code="""```python
   gdp_2020 = 20936  # billion USD (from source A)
-  gdp_2024 = 28780  # billion USD (from source B)
-  growth = (gdp_2024 - gdp_2020) / gdp_2020 * 100
-  print(f"GDP growth 2020-2024: {growth:.1f}%")
+  gdp_2026 = 28780  # billion USD (from source B)
+  growth = (gdp_2026 - gdp_2020) / gdp_2020 * 100
+  print(f"GDP growth 2020-2026: {growth:.1f}%")
   ```""")
 
 STRATEGY 4 — Extract from PDF text:
@@ -228,8 +228,8 @@ FORMAT: Return bullet-point findings in your final_answer. Do NOT write
 
   REQUIRED FORMAT:  FACT — SOURCE_URL
   Example:
-  - Global EV sales reached 14M in 2023 — https://iea.org/reports/global-ev-outlook-2024
-  - China accounted for 60% of global EV sales — https://iea.org/reports/global-ev-outlook-2024
+  - Global EV sales reached 14M in 2023 — https://iea.org/reports/global-ev-outlook-2023
+  - China accounted for 60% of global EV sales — https://iea.org/reports/global-ev-outlook-2026
   - Tesla delivered 1.8M vehicles in 2023 — https://ir.tesla.com/press-release/...
 
   RULES:
@@ -251,7 +251,7 @@ In your final_answer, include a FAILURES section after your findings:
   FAILURES:
   - fetch_url(https://example.com/data) → 403 blocked, tried fetch_cached → also empty
   - extract_tables(https://stats.org/table) → returned 0 tables, used fetch_url(extract='table') instead
-  - read_pdf(https://report.org/2024.pdf) → timeout after 30s, could not extract
+  - read_pdf(https://report.org/2026.pdf) → timeout after 30s, could not extract
 
   RULES:
   - Report WHAT you tried, WHAT happened, and WHAT you did instead.
@@ -275,7 +275,7 @@ Include an ASSUMPTIONS section in your final_answer when you made
 a judgment call:
 
   ASSUMPTIONS:
-  - Interpreted "recent" as 2024-2025
+  - Interpreted "recent" as 2025-2026
   - Used GDP in nominal USD (not PPP) since unspecified
   - "Major cities" taken as population > 1M
 

@@ -37,6 +37,39 @@ agent:
   history_compaction_min_interval: 2
   history_compaction_recent_turns: 2
 
+# ── Verifier configuration ────────────────────────────────────────────
+# Controls which model runs Stage 1 (quality audit) and Stage 3 (citation audit).
+#
+# stage1_provider / stage3_provider can be:
+#   "self"     — use the same local model (model.name / model.api_url)
+#   "external" — use verifier.model / verifier.api_url (needs OPENAI_API_KEY in .env)
+#
+# Example A: Both stages use the LOCAL model (omit the block entirely, or):
+#   verifier:
+#     stage1_provider: "self"
+#     stage3_provider: "self"
+#
+# Example B: Both stages use an EXTERNAL model:
+#   verifier:
+#     model: "gpt-4.1-mini"
+#     api_url: "https://api.openai.com/v1"
+#     stage1_provider: "external"
+#     stage3_provider: "external"
+#
+# Example C: External judge for quality, local for citations:
+#   verifier:
+#     model: "gpt-4.1-mini"
+#     api_url: "https://api.openai.com/v1"
+#     stage1_provider: "external"
+#     stage3_provider: "self"
+#
+# If the verifier block is omitted entirely, both stages default to "self".
+verifier:
+  model: "gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
+  api_url: "https://api.openai.com/v1"  # external model endpoint
+  stage1_provider: "external"            # "self" = local model, "external" = verifier.model above
+  stage3_provider: "self"            # "self" = local model, "external" = verifier.model above
+
 sandbox:
   url: "http://localhost:8080/run_code"
   port: 8080

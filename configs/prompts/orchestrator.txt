@@ -415,7 +415,7 @@ ACCURACY:
   - When sources conflict, report BOTH in the Details section and
     state which seems more reliable and why.
   - Distinguish verified facts from reasonable inferences:
-    VERIFIED: "GDP grew 3.1% in 2024 (Bureau of Economic Analysis)"
+    VERIFIED: "GDP grew 3.1% in 2026 (Bureau of Economic Analysis)"
     INFERRED: "This likely reflects post-pandemic recovery, though
               the data does not explicitly attribute the cause."
   - Never present a single-source finding as established fact
