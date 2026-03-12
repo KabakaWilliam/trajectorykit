@@ -386,12 +386,18 @@ def _compact_history(state: AgentState) -> None:
             f"already incorporates findings from evicted history."
         )
 
+    # Research log digest (what was actually found, not just tool counts)
+    research_log_line = ""
+    if state.research_log:
+        research_log_line = "\n\n" + _render_research_log(state)
+
     summary = (
         f"[HISTORY COMPRESSED — earlier messages archived]\n"
         f"Tool calls in archived turns: {tool_line}\n"
         f"Memory keys available: {mem_line}"
         f"{chain_line}"
-        f"{draft_line}\n\n"
+        f"{draft_line}"
+        f"{research_log_line}\n\n"
         f"All research data remains accessible via memory_keys in "
         f"conduct_research(). Your draft is the canonical summary of "
         f"prior findings — focus on remaining gaps."
@@ -417,6 +423,32 @@ def _compact_history(state: AgentState) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 # PRE-TURN INJECTIONS  (plan, draft, reminders, budget warnings)
 # ═══════════════════════════════════════════════════════════════════════
+
+
+def _render_research_log(state: AgentState) -> str:
+    """Render the research log as a compact string for prompt injection."""
+    if not state.research_log:
+        return ""
+    lines = [f"📋 RESEARCH LOG ({len(state.research_log)} tasks completed):"]
+    for entry in state.research_log:
+        key_tag = f" → {entry['mem_key']}" if entry.get("mem_key") else ""
+        finding = entry.get("finding", "")
+        # First line of finding only, truncated
+        first_line = finding.split("\n")[0][:120]
+        lines.append(
+            f"  T{entry['turn']}  {entry['tool']} \"{entry['task']}\"{key_tag}"
+        )
+        if first_line:
+            lines.append(f"      → {first_line}")
+    # Append available memory keys summary
+    mem_keys = state.memory.keys()
+    if mem_keys:
+        keys_str = ", ".join(mem_keys[:15])
+        if len(mem_keys) > 15:
+            keys_str += f" … +{len(mem_keys) - 15} more"
+        lines.append(f"\nAvailable memory keys: {keys_str}")
+    return "\n".join(lines)
+
 
 def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
     """Inject periodic plan, draft, reminders, and budget warnings.
@@ -456,6 +488,20 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
         )})
         if state.verbose:
             print(f"\U0001f50e  Injected periodic question reminder (turn {state.turn})")
+
+    # ── Research log injection (root only, periodic) ──────────────────
+    # Inject a compact log of what research found so far, on the same
+    # cadence as plan injection.  Survives compaction via state object.
+    if (state.depth == 0
+            and state.research_log
+            and state.turn > 1
+            and (state.turn % _REMINDER_INTERVAL == 0
+                 or (state.plan is not None and state.plan.should_inject(state.turn)))):
+        _log_text = _render_research_log(state)
+        if _log_text:
+            state.messages.append({"role": "system", "content": _log_text})
+            if state.verbose:
+                print(f"📋  Injected research log ({len(state.research_log)} entries)")
 
     # ── Draft injection (root only, every turn after first draft) ────
     # Inject the FULL current draft.  Avg draft is ~1.6K chars (p95 ~3K),

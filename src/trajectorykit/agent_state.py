@@ -73,6 +73,7 @@ class AgentState:
 
     # ── Research tracking ─────────────────────────────────────────────
     findings: List[str] = field(default_factory=list)
+    research_log: List[Dict[str, Any]] = field(default_factory=list)  # lightweight findings digest
     consecutive_search_count: int = 0
 
     # ── Memory & Plan ─────────────────────────────────────────────────

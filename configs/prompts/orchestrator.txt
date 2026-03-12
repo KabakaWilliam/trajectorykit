@@ -217,6 +217,15 @@ STEP 2: DELEGATE (turns 1-3)
          a JSON array of objects with keys: company, year, revenue,
          source_url."
 
+  SOURCE QUALITY SIGNALS:
+    For questions involving scientific claims, statistics, or
+    contested topics, tell the worker to go deeper:
+      "Find [X]. Prefer the original study/dataset over news
+       summaries. If a source cites another source, try to
+       find the original."
+    For simple factual lookups, standard tasks are fine —
+    don't add overhead where it's not needed.
+
 STEP 3: DRAFT
   Call refine_draft with your first complete draft. Cover what you
   know so far, even if incomplete. Mark gaps explicitly:

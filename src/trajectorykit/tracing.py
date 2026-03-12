@@ -479,6 +479,54 @@ body {
   text-decoration: underline; margin-top: 4px; display: inline-block;
 }
 
+/* ── Verification pipeline overview ── */
+.verify-pipeline {
+  display: flex; align-items: center; gap: 0; margin: 10px 0 6px 0;
+  font-family: var(--mono); font-size: 10px;
+}
+.verify-stage {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border: 1px solid var(--border);
+  background: var(--bg); border-radius: 3px; white-space: nowrap;
+}
+.verify-stage.passed { background: #e8f5e9; border-color: var(--success); }
+.verify-stage.failed { background: #ffebee; border-color: var(--error); }
+.verify-stage.skipped { background: #fff8e1; border-color: #f1c40f; }
+.verify-stage.empty { background: #f5f5f5; border-color: #ccc; color: #999; }
+.verify-stage-icon { font-size: 12px; }
+.verify-arrow { color: var(--text-light); font-size: 14px; padding: 0 4px; }
+.claim-evidence-card {
+  margin: 4px 0; padding: 8px 10px; border-radius: 3px;
+  border: 1px solid var(--border); background: var(--white); font-size: 11px;
+}
+.claim-evidence-card.supported { border-left: 3px solid var(--success); }
+.claim-evidence-card.contradicted { border-left: 3px solid var(--error); }
+.claim-evidence-card.insufficient { border-left: 3px solid #f1c40f; }
+.claim-evidence-card.fabricated { border-left: 3px solid #9b59b6; }
+.claim-evidence-header {
+  display: flex; justify-content: space-between; align-items: center;
+  font-weight: 600; font-size: 10px; margin-bottom: 4px;
+}
+.claim-assess-badge {
+  display: inline-block; padding: 1px 6px; border-radius: 2px;
+  font-size: 9px; font-weight: 600; text-transform: uppercase;
+}
+.claim-assess-badge.supported { background: #e8f5e9; color: #2e7d32; }
+.claim-assess-badge.contradicted { background: #ffebee; color: #c62828; }
+.claim-assess-badge.insufficient { background: #fff8e1; color: #f57f17; }
+.claim-assess-badge.fabricated { background: #f3e5f5; color: #7b1fa2; }
+.claim-assess-badge.degraded { background: #f5f5f5; color: #999; }
+.claim-source-url {
+  font-size: 9px; color: var(--accent); word-break: break-all;
+  margin-bottom: 4px;
+}
+.citation-audit-block {
+  margin-top: 8px; padding: 10px 14px; border-radius: 3px;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px;
+}
+.citation-audit-block.passed { background: #f0faf0; border-color: var(--success); }
+.citation-audit-block.failed { background: #fdf0f0; border-color: var(--error); }
+
 /* ── Draft card ── */
 .draft-card {
   margin-top: 10px; padding: 14px 16px; border-radius: 4px;
@@ -1106,22 +1154,64 @@ def _render_verification_meta(meta: dict) -> list[str]:
     response = meta.get("verification_response", "")
     link_report = meta.get("link_check_report", "")
     attempt = meta.get("verification_attempt", "")
+    sc = meta.get("spot_check")
+    ca = meta.get("citation_audit")
 
-    if verdict == "APPROVED":
+    # ── Pipeline overview bar ─────────────────────────────────────
+    def _stage_cls(stage_verdict: str, empty: bool = False) -> str:
+        if empty:
+            return "empty"
+        v = stage_verdict.upper()
+        if v in ("APPROVED", "PASSED"):
+            return "passed"
+        if v in ("REVISION_NEEDED", "FAILED", "SPOT_CHECK_FAILED", "CITATION_FAIL"):
+            return "failed"
+        if "SKIP" in v:
+            return "skipped"
+        return "empty"
+
+    # Use per-stage verdicts when available (avoids Stage 2 verdict bleeding into Stage 1)
+    s1_v = meta.get("stage1_verdict", verdict or "")
+    s2_v = sc.get("spot_check_verdict", "") if sc else ""
+    s3_v = ""
+    if ca:
+        s3_v = ca.get("citation_audit_verdict", "")
+    if not s3_v:
+        s3_v = meta.get("citation_audit_verdict", "")
+
+    s1_response = meta.get("stage1_response", response)
+    s1_cls = _stage_cls(s1_v, empty=not s1_response)
+    s2_cls = _stage_cls(s2_v, empty=not sc)
+    s3_cls = _stage_cls(s3_v, empty=not ca and not s3_v)
+
+    attempt_str = f" #{attempt}" if attempt else ""
+    parts.append('<div class="verify-pipeline">')
+    parts.append(f'<div class="verify-stage {s1_cls}"><span class="verify-stage-icon">{"✅" if s1_cls == "passed" else "❌" if s1_cls == "failed" else "⬜"}</span> S1 Plausibility{_esc(attempt_str)}</div>')
+    parts.append('<span class="verify-arrow">→</span>')
+    parts.append(f'<div class="verify-stage {s2_cls}"><span class="verify-stage-icon">{"✅" if s2_cls == "passed" else "❌" if s2_cls == "failed" else "⬜"}</span> S2 Spot-Check</div>')
+    parts.append('<span class="verify-arrow">→</span>')
+    parts.append(f'<div class="verify-stage {s3_cls}"><span class="verify-stage-icon">{"✅" if s3_cls == "passed" else "❌" if s3_cls == "failed" else "⬜"}</span> S3 Citation Audit</div>')
+    parts.append('</div>')
+
+    # ── Stage 1: Verifier ─────────────────────────────────────────
+    if s1_v == "APPROVED":
         v_cls = "approved"
-    elif verdict in ("REVISION_NEEDED", "SPOT_CHECK_FAILED"):
+    elif s1_v in ("REVISION_NEEDED", "SPOT_CHECK_FAILED"):
         v_cls = "rejected"
     else:
         v_cls = ""
-    badge_label = verdict or "VERIFIED"
-    attempt_str = f" (attempt {attempt})" if attempt else ""
+    s1_badge = s1_v or "VERIFIED"
 
     parts.append(f'<div class="verifier-block {v_cls}">')
-    parts.append(f'<span class="verifier-badge {v_cls}">\U0001f50d {_esc(badge_label)}{_esc(attempt_str)}</span>')
+    parts.append(f'<span class="verifier-badge {v_cls}">🔍 Stage 1: {_esc(s1_badge)}</span>')
 
-    if response:
+    if s1_response:
+        _s1_id = f"s1-resp-{id(meta)}"
         parts.append(f'<div class="verifier-section-label">Verifier Response</div>')
-        parts.append(f'<div class="verifier-detail">{_esc(response)}</div>')
+        parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_s1_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+        parts.append(f'<div id="{_s1_id}" class="verifier-detail" style="display:none">{_esc(s1_response)}</div>')
+    else:
+        parts.append('<div class="verifier-detail" style="color:#999;font-style:italic">(no response — external verifier may have returned empty)</div>')
 
     if link_report:
         parts.append(f'<div class="verifier-section-label">Link Check</div>')
@@ -1129,8 +1219,7 @@ def _render_verification_meta(meta: dict) -> list[str]:
 
     parts.append('</div>')  # .verifier-block
 
-    # ── Spot-check metadata ───────────────────────────────────────
-    sc = meta.get("spot_check")
+    # ── Stage 2: Spot-check ───────────────────────────────────────
     if sc:
         sc_verdict = sc.get("spot_check_verdict", "")
         sc_skipped = sc.get("spot_check_skipped_reason", "")
@@ -1139,6 +1228,8 @@ def _render_verification_meta(meta: dict) -> list[str]:
         sc_compare = sc.get("compare_response", "")
         sc_refusal = sc.get("refusal_challenge_response", "")
         sc_degraded = sc.get("degraded_claims", 0)
+        sc_evidence = sc.get("claim_evidence", [])
+        sc_citation_map = sc.get("citation_map", {})
 
         if sc_verdict == "PASSED":
             sc_cls = "passed"
@@ -1155,12 +1246,74 @@ def _render_verification_meta(meta: dict) -> list[str]:
 
         sc_label = sc_verdict or (f"SKIPPED ({sc_skipped})" if sc_skipped else "RAN")
         parts.append(f'<div class="spotcheck-block {sc_cls}">')
-        parts.append(f'<span class="spotcheck-badge {sc_cls}">\U0001f9ea Spot-Check: {_esc(sc_label)}</span>')
+        parts.append(f'<span class="spotcheck-badge {sc_cls}">🧪 Stage 2 Spot-Check: {_esc(sc_label)}</span>')
 
+        # Summary stats
+        stats = []
         if sc_claims_n:
-            parts.append(f'<div class="verifier-section-label">Claims Checked: {sc_claims_n}</div>')
+            stats.append(f"Claims: {sc_claims_n}")
         if sc_degraded:
-            parts.append(f'<div class="verifier-section-label">Degraded Evidence: {sc_degraded}/{sc_claims_n}</div>')
+            stats.append(f"Degraded: {sc_degraded}")
+        cited_n = sc.get("cited_claims_extracted", 0)
+        if cited_n:
+            stats.append(f"Citations Extracted: {cited_n}")
+        s1_suspicious = sc.get("stage1_suspicious_claims", 0)
+        if s1_suspicious:
+            stats.append(f"S1 Suspicious: {s1_suspicious}")
+        if stats:
+            parts.append(f'<div class="verifier-section-label">{" · ".join(stats)}</div>')
+
+        # Citation map (collapsed)
+        if sc_citation_map:
+            _cm_id = f"sc-citmap-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Citation Map ({len(sc_citation_map)} URLs)</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_cm_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            cm_lines = []
+            for cnum, curl in sorted(sc_citation_map.items(), key=lambda x: str(x[0])):
+                cm_lines.append(f"[{_esc(str(cnum))}] {_esc(str(curl))}")
+            parts.append(f'<div id="{_cm_id}" class="verifier-detail" style="display:none">{chr(10).join(cm_lines)}</div>')
+
+        # Per-claim evidence cards
+        if sc_evidence:
+            _ev_id = f"sc-evidence-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Per-Claim Evidence ({len(sc_evidence)} claims)</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_ev_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_ev_id}" style="display:none">')
+            for i, ev in enumerate(sc_evidence, 1):
+                report = ev.get("evidence_report", "")
+                # Classify the assessment from the evidence report
+                report_upper = report.upper()
+                if "ASSESSMENT: SUPPORTED" in report_upper or "ASSESSMENT:SUPPORTED" in report_upper:
+                    ev_cls = "supported"
+                    ev_badge = "SUPPORTED"
+                elif "ASSESSMENT: CONTRADICTED" in report_upper or "ASSESSMENT:CONTRADICTED" in report_upper:
+                    if "FABRICAT" in report_upper or "DOI DOES NOT EXIST" in report_upper:
+                        ev_cls = "fabricated"
+                        ev_badge = "FABRICATED"
+                    else:
+                        ev_cls = "contradicted"
+                        ev_badge = "CONTRADICTED"
+                elif report.startswith("(verification failed"):
+                    ev_cls = "insufficient"
+                    ev_badge = "DEGRADED"
+                else:
+                    ev_cls = "insufficient"
+                    ev_badge = "INSUFFICIENT"
+                claim_text = _esc(ev.get("claim", "")[:200])
+                source_url = ev.get("source_url", "")
+                parts.append(f'<div class="claim-evidence-card {ev_cls}">')
+                parts.append(f'<div class="claim-evidence-header">'
+                             f'<span>Claim {i}: {claim_text}</span>'
+                             f'<span class="claim-assess-badge {ev_cls}">{ev_badge}</span>'
+                             f'</div>')
+                if source_url:
+                    parts.append(f'<div class="claim-source-url">📎 {_esc(source_url)}</div>')
+                # Expandable evidence report
+                _ev_detail_id = f"sc-ev-{id(sc)}-{i}"
+                parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_ev_detail_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">evidence</span>')
+                parts.append(f'<div id="{_ev_detail_id}" class="verifier-detail" style="display:none">{_esc(report)}</div>')
+                parts.append('</div>')  # .claim-evidence-card
+            parts.append('</div>')
 
         if sc_extract:
             _sc_ext_id = f"sc-extract-{id(sc)}"
@@ -1170,7 +1323,7 @@ def _render_verification_meta(meta: dict) -> list[str]:
 
         if sc_compare:
             _sc_cmp_id = f"sc-compare-{id(sc)}"
-            parts.append(f'<div class="verifier-section-label">Claim Comparison</div>')
+            parts.append(f'<div class="verifier-section-label">Compare LLM Verdict</div>')
             parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_sc_cmp_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
             parts.append(f'<div id="{_sc_cmp_id}" class="verifier-detail" style="display:none">{_esc(sc_compare)}</div>')
 
@@ -1197,6 +1350,24 @@ def _render_verification_meta(meta: dict) -> list[str]:
                 )
 
         parts.append('</div>')  # .spotcheck-block
+
+    # ── Stage 3: Citation Audit ───────────────────────────────────
+    ca_verdict = meta.get("citation_audit_verdict", "")
+    ca_response = ""
+    if ca and isinstance(ca, dict):
+        ca_verdict = ca_verdict or ca.get("citation_audit_verdict", "")
+        ca_response = ca.get("audit_response", "")
+    if ca_verdict or ca_response:
+        ca_cls = "passed" if ca_verdict == "PASSED" else ("failed" if ca_verdict == "FAILED" else "")
+        parts.append(f'<div class="citation-audit-block {ca_cls}">')
+        ca_icon = "✅" if ca_cls == "passed" else ("❌" if ca_cls == "failed" else "📑")
+        parts.append(f'<span class="verifier-badge {ca_cls.replace("passed","approved").replace("failed","rejected")}">'
+                     f'{ca_icon} Stage 3 Citation Audit: {_esc(ca_verdict or "RAN")}</span>')
+        if ca_response:
+            _ca_id = f"ca-resp-{id(meta)}"
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_ca_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_ca_id}" class="verifier-detail" style="display:none">{_esc(ca_response)}</div>')
+        parts.append('</div>')
 
     return parts
 

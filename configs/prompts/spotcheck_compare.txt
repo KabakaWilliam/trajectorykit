@@ -194,7 +194,7 @@ EVIDENCE QUALITY — weigh sources mentioned in verification reports:
 
   ACCESS FAILURE HANDLING:
   If a verification agent reports it could not access a cited source
-  (paywall, 403/404, login-wall, rate-limit, geo-block, API auth):
+  (paywall, 403, login-wall, rate-limit, geo-block, API auth):
   - Check whether the agent found ALTERNATIVE evidence from other
     sources. If alternative evidence supports or contradicts the
     claim, judge the claim on that evidence normally.
@@ -208,6 +208,25 @@ EVIDENCE QUALITY — weigh sources mentioned in verification reports:
   - Never penalise the draft for citing a legitimate source that
     happens to be access-restricted — the issue is verification
     coverage, not source quality.
+
+  FABRICATED CITATION DETECTION (CRITICAL):
+  This is fundamentally different from access restriction.
+  - If a verification agent reports a DOI URL returned HTTP 404 from
+    doi.org, the DOI DOES NOT EXIST. DOIs are permanent identifiers
+    registered with CrossRef/DataCite. A 404 means it was never
+    registered — the citation is FABRICATED. This is a HARD FAIL for
+    that claim. Do NOT treat it as an "access issue".
+  - If a DOI exists but the verification agent reports the ACTUAL
+    paper title does not match what the draft claims, the citation is
+    MISATTRIBUTED — the draft attached a real DOI to a fabricated or
+    wrong paper description. This is also a FAIL.
+  - If 3+ citations out of the total checked are fabricated or
+    misattributed, this indicates systematic hallucination of
+    references. Issue SPOT_CHECK_FAILED and list ALL affected
+    citations with their specific failure reason (404/misattributed).
+  - For non-DOI URLs: a 404 alone is weaker evidence (pages can be
+    moved/deleted). But if the page cannot be found anywhere AND no
+    alternative evidence supports the claim, flag it.
 
 - When in doubt, PASS. A published answer with minor imprecision
   beats an endlessly revised one.

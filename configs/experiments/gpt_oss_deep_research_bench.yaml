@@ -68,6 +68,7 @@ verifier:
   model: "gpt-5-mini-2025-08-07" #"gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
   api_url: "https://api.openai.com/v1"  # external model endpoint
   stage1_provider: "external"            # "self" = local model, "external" = verifier.model above
+  stage2_provider: "external"            # "self" = local model, "external" = verifier.model above (compare step only)
   stage3_provider: "self"            # "self" = local model, "external" = verifier.model above
 
 sandbox:
@@ -121,7 +122,7 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: "deep_research_bench/traces"
-  workers: 8
+  workers: 5
 
 judge:
   enabled: true

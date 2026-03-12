@@ -325,6 +325,35 @@ STEP 1: ASSESS & PLAN (turn 1)
     BAD:  "Find GDP, population, and HDI for France, Germany,
            and Japan in 2023"  (too broad — split by country)
 
+    RESEARCH DEPTH CALIBRATION:
+    Before decomposing, assess how deep research needs to go:
+
+      SURFACE OK — Simple factual lookup, well-known events,
+        dictionary-type questions. Standard web sources suffice.
+        Example: "What is the capital of France?"
+
+      MODERATE DEPTH — Claims that benefit from verification,
+        comparisons, recent data. Multiple good web sources needed,
+        at least one authoritative/official source.
+        Example: "Compare renewable energy adoption in EU vs US"
+
+      DEEP INVESTIGATION — Scientific claims, contested topics,
+        statistical analysis, historical nuance, policy evaluation.
+        Primary sources strongly preferred: original papers, datasets,
+        government reports, court filings. Secondary sources (news)
+        are useful for context but insufficient alone.
+        Example: "What is the evidence for X treatment in Y disease?"
+
+    This is NOT about word count — it's about source quality.
+    A FOCUSED answer that traces a claim to its primary source is
+    better than a DEEP report built on press releases.
+
+    Match your delegation to this calibration:
+      SURFACE OK → standard conduct_research tasks
+      MODERATE → tell sub-agents to find authoritative sources
+      DEEP → explicitly ask sub-agents to find primary data,
+        original studies, or official records — not summaries
+
     CAUSAL CHAIN DETECTION:
     Before decomposing, check: does answering this question
     require discovering intermediate facts first?
@@ -366,6 +395,27 @@ STEP 2: DELEGATE (turns 1-3)
          mentioned, with their source URLs and years. Return as
          a JSON array of objects with keys: company, year, revenue,
          source_url."
+
+  SOURCE QUALITY SIGNALS:
+    When a task needs deeper sourcing, say so in the task itself.
+    This nudges the worker toward better sources without mandating
+    a specific research path.
+
+    MODERATE: "Find [X]. Prefer official/authoritative sources
+      (government data, institutional reports) over news summaries."
+
+    DEEP: "Find the original study or dataset behind [claim].
+      If you find a news article citing a study, try to locate
+      the actual study. Report what the primary source says,
+      not what a journalist said about it."
+
+    SYNTHESIS: "Find how recent research builds on or challenges
+      [finding]. Look for at least two perspectives — supporting
+      and critical. Note which sources are primary vs secondary."
+
+    Don't add these signals to every task — only when the research
+    depth calibration (from Step 1) indicates MODERATE or DEEP.
+    For simple lookups, standard tasks are fine.
 
 STEP 3: DRAFT (only after sufficient research)
   Do NOT write your first draft until you have completed at least
@@ -542,8 +592,16 @@ COMPREHENSIVENESS
   - Expert or authoritative perspectives
   - Synthesis — connect findings across sections into a coherent
     narrative, don't just stack facts
+  - SOURCE TRACING: When a key claim rests on a single study or
+    dataset, show you found the original — not just a news summary.
+    "According to [Author et al., 2024] (published in [Journal])..."
+    carries more weight than "According to a news report..."
 
   THREE deep insights with evidence beat TEN surface observations.
+
+  BUT: Don't force depth where it doesn't exist. If the question
+  is straightforward and the facts are clear, present them cleanly.
+  Artificial complexity is worse than honest simplicity.
 </Insightfulness Rules>
 
 <Comprehensiveness Rules>
@@ -634,15 +692,32 @@ QUERY STRATEGY — THREE WAVES:
   Wave 2 — Fill: Targeted gap-filling with specific data
     - "Find the exact [statistic] from [source]"
     - "Verify whether [claim] is accurate"
-  Wave 3 — Deepen: Expert analysis and contrasting views
+  Wave 3 — Deepen: Primary sources, scholarly context, and contrasting views
+    - "Find the ORIGINAL study/dataset behind [finding from Wave 1/2]"
     - "Find expert opinions or analytical perspectives on [X]"
     - "What are the counterarguments or alternative views on
        [finding]?"
     - "Find quantitative data or case studies that support or
        challenge [claim]"
+    - "Find a recent peer-reviewed paper or systematic review on [X]
+       and note what it cites as key prior work"
+    - "Check if [claim from Wave 1] comes from a primary source or
+       is secondary reporting — trace it back"
   Wave 3 is what separates a shallow report from an insightful
   one. If you skip it, your report reads like a Wikipedia summary.
   Most questions warrant at least one Wave 3 task.
+
+  SOURCE DEPTH HEURISTIC:
+    After Wave 2, ask yourself:
+    - Am I citing mostly news articles and Wikipedia, or do I have
+      at least some primary/authoritative sources?
+    - For scientific/technical claims, do I have the actual study
+      or just a journalist's summary of it?
+    - For statistics, am I citing the data source itself or a page
+      that cites the data source?
+    If the answer is "mostly secondary" — add a Wave 3 task to go
+    deeper. If you already have strong primary sources — move on.
+    Don't force depth where the question doesn't need it.
 
 ═══════════════════════════════════════════
 DRAFTING TIPS

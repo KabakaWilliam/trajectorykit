@@ -403,7 +403,7 @@ def _focused_page_summary(
         if resp.status_code == 200:
             choices = resp.json().get("choices", [])
             if choices:
-                text = choices[0].get("message", {}).get("content", "")
+                text = choices[0].get("message", {}).get("content") or ""
                 if text and text.strip():
                     return _extract_summary_tags(text.strip())
                 return f"LLM returned empty summary. Raw page excerpt:\n{page_content[:3000]}"
@@ -538,14 +538,15 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
         if v_api_key and v_api_url != _cfg.VLLM_API_URL:
             headers["Authorization"] = f"Bearer {v_api_key}"
-        resp = requests.post(f"{v_api_url}/chat/completions", json=payload, headers=headers, timeout=60)
+        resp = requests.post(f"{v_api_url}/chat/completions", json=payload, headers=headers, timeout=360)
         if resp.status_code == 200:
             result = resp.json()
-            raw_text = (
-                result.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            ).strip()
+            msg = result.get("choices", [{}])[0].get("message", {})
+            # Reasoning models (gpt-5-*) may return content=null; fall back
+            # to reasoning_content or empty string.
+            raw_text = (msg.get("content")
+                        or msg.get("reasoning_content")
+                        or "").strip()
 
             # Parse suspicious claims flagged by the external model
             suspicious_claims = []
@@ -577,7 +578,7 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
             else:
                 if state.verbose:
                     print(f"       \u2705 Verifier: APPROVED")
-                return True, "", text, suspicious_claims
+                return True, "", raw_text, suspicious_claims
         else:
             if state.verbose:
                 err_body = ""
@@ -590,7 +591,7 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
     except Exception as e:
         if state.verbose:
             print(f"       \u26a0\ufe0f  Verifier error: {e}, skipping verification")
-        return True, "", "", []
+        return True, "", f"[VERIFIER ERROR: {type(e).__name__}: {e}]", []
 
 
 def _resolve_numbered_citations(draft: str) -> Tuple[str, dict]:
@@ -896,7 +897,7 @@ def _spot_check_claims(
             "snapshot (e.g. 'Guardian 2024 rankings', '2020 Census'), verify against THAT "
             "exact version — not a different year's edition. If you can only find a different "
             "version, note the mismatch explicitly in your assessment.\n"
-            "8. ACCESS FAILURES: If you cannot access a source (paywall, 403/404, login-wall, "
+            "8. ACCESS FAILURES: If you cannot access a source (paywall, 403, login-wall, "
             "rate-limit, geo-block, API auth error):\n"
             "   a) ALWAYS try the original URL first — paywalls aren't always enforced and "
             "APIs sometimes allow limited unauthenticated access\n"
@@ -908,6 +909,21 @@ def _spot_check_claims(
             "   e) If you get partial access (e.g. abstract-only for a paper), report what you "
             "CAN see and note it is partial\n"
             "   f) If no alternative works, report INSUFFICIENT with the access failure details\n"
+            "9. CITATION EXISTENCE CHECK (CRITICAL):\n"
+            "   a) If the cited URL is a DOI (doi.org) and returns 404, the DOI does NOT EXIST.\n"
+            "      DOIs are permanent identifiers — a 404 from doi.org means the citation is \n"
+            "      FABRICATED. Report: 'ASSESSMENT: CONTRADICTED — DOI does not exist (HTTP 404). "
+            "      Citation appears fabricated.'\n"
+            "   b) If the DOI resolves but the PAPER TITLE on the landing page does NOT match \n"
+            "      the title claimed in the draft, the citation is MISATTRIBUTED. Report: \n"
+            "      'ASSESSMENT: CONTRADICTED — DOI exists but points to [actual title], not \n"
+            "      [claimed title]. Citation is misattributed.'\n"
+            "   c) If ANY cited URL returns 404 (not just DOIs), note this explicitly. A regular \n"
+            "      URL 404 may mean the page was moved, so search for the title/content elsewhere \n"
+            "      before concluding fabrication. But if the page cannot be found anywhere, report \n"
+            "      INSUFFICIENT with the 404 details.\n"
+            "   d) NEVER assume a 404 DOI is just an 'access issue' — it is fundamentally \n"
+            "      different from a paywall (403) or rate limit (429).\n"
             "\nIn your final_answer, report:\n"
             "  • SOURCES CHECKED: [url] — [what it says about the claim]\n"
             "  • ASSESSMENT: SUPPORTED / CONTRADICTED / INSUFFICIENT\n"
@@ -1027,21 +1043,38 @@ def _spot_check_claims(
 
     meta["claims_checked"] = len(sc_evidence)
 
-    # Short-circuit: if >50% degraded evidence, auto-PASS.
-    # A claim is degraded if the sub-agent failed or returned very little.
+    # Short-circuit: if >50% degraded evidence AND none of the
+    # degradation is caused by dead citation URLs (404 on the
+    # cited source itself), auto-PASS. If cited URLs are dead,
+    # that is itself evidence of fabricated citations — let the
+    # compare LLM evaluate rather than silently passing.
     if sc_evidence:
-        degraded = sum(
-            1 for ev in sc_evidence
-            if ev.get("evidence_report", "").startswith("(verification failed")
-            or len(ev.get("evidence_report", "").strip()) < 100
-        )
-        if degraded > len(sc_evidence) / 2:
+        degraded = 0
+        dead_citations = 0
+        for ev in sc_evidence:
+            report = ev.get("evidence_report", "").strip()
+            if report.startswith("(verification failed"):
+                degraded += 1
+            elif len(report) < 100:
+                degraded += 1
+            # Check if the evidence mentions dead citation URLs
+            report_upper = report.upper()
+            if ("DOI DOES NOT EXIST" in report_upper
+                    or "CITATION APPEARS FABRICATED" in report_upper
+                    or "CITATION IS MISATTRIBUTED" in report_upper
+                    or ("404" in report and ev.get("source_url", ""))):
+                dead_citations += 1
+        # Only auto-PASS if degradation is from infrastructure issues
+        # (agent failures, thin reports), NOT from dead citations.
+        if degraded > len(sc_evidence) / 2 and dead_citations == 0:
             meta["spot_check_verdict"] = "PASSED"
             meta["spot_check_skipped_reason"] = "insufficient_evidence"
             meta["degraded_claims"] = degraded
             if state.verbose:
                 print(f"       \u23e9 Spot-check: {degraded}/{len(sc_evidence)} claims have degraded evidence, auto-PASS")
             return True, "", "", meta
+        if dead_citations and state.verbose:
+            print(f"       \u26a0\ufe0f  Spot-check: {dead_citations} dead/fabricated citation(s) detected, proceeding to compare")
 
     if not sc_evidence or "spot_check_skipped_reason" in meta:
         return True, "", "", meta
@@ -1054,6 +1087,17 @@ def _spot_check_claims(
     sc_evidence.sort(key=lambda ev: (
         _claim_texts.index(ev["claim"]) if ev["claim"] in _claim_texts else 999
     ))
+
+    # Store per-claim evidence in meta for trace visualization
+    meta["claim_evidence"] = [
+        {
+            "claim": ev.get("claim", ""),
+            "source_url": ev.get("source_url", ""),
+            "section": ev.get("section", ""),
+            "evidence_report": ev.get("evidence_report", ""),
+        }
+        for ev in sc_evidence
+    ]
 
     has_chain = any(ev.get("depends_on") is not None for ev in sc_evidence)
     evidence_parts = []
@@ -1102,21 +1146,43 @@ def _spot_check_claims(
             f"{chain_note}"
         )},
     ]
+    # Route through external verifier when configured for Stage 2
+    use_external_s2 = (
+        getattr(_cfg, "VERIFIER_STAGE2_PROVIDER", "self") == "external"
+        and _cfg.VERIFIER_MODEL
+    )
+    s2_model = _cfg.VERIFIER_MODEL if use_external_s2 else state.model
+    s2_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL) if use_external_s2 else _cfg.VLLM_API_URL
+    s2_temp = (_cfg.VERIFIER_TEMPERATURE if _cfg.VERIFIER_TEMPERATURE is not None else state.temperature) if use_external_s2 else state.temperature
+    s2_headers = {"Content-Type": "application/json"}
+    if use_external_s2:
+        s2_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+        if s2_api_key:
+            s2_headers["Authorization"] = f"Bearer {s2_api_key}"
+        if state.verbose:
+            print(f"       📑 Spot-check compare: using external model ({s2_model})")
+
+    s2_payload = {
+        "model": s2_model,
+        "messages": compare_msgs,
+        "temperature": s2_temp,
+        "reasoning_effort": "high",
+    }
+    if use_external_s2:
+        s2_payload["max_completion_tokens"] = min(state.max_tokens, 100_000)
+    else:
+        s2_payload["max_tokens"] = state.max_tokens
+
     compare_resp = requests.post(
-        f"{_cfg.VLLM_API_URL}/chat/completions",
-        json={
-            "model": state.model,
-            "messages": compare_msgs,
-            "temperature": state.temperature,
-            "max_tokens": state.max_tokens,
-            "reasoning_effort": "high",
-        },
+        f"{s2_api_url}/chat/completions",
+        json=s2_payload,
+        headers=s2_headers,
     )
     if compare_resp.status_code == 200:
-        compare_raw = (
-            compare_resp.json().get("choices", [{}])[0]
-            .get("message", {}).get("content", "")
-        ).strip()
+        _cmp_msg = compare_resp.json().get("choices", [{}])[0].get("message", {})
+        compare_raw = (_cmp_msg.get("content")
+                       or _cmp_msg.get("reasoning_content")
+                       or "").strip()
         meta["compare_response"] = compare_raw
         compare_text = _extract_xml_tag(compare_raw, "verdict")
         clean = compare_text.replace("*", "").upper()
@@ -1310,10 +1376,10 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
             },
         )
         if rc_resp.status_code == 200:
-            rc_raw = (
-                rc_resp.json().get("choices", [{}])[0]
-                .get("message", {}).get("content", "")
-            ).strip()
+            _rc_msg = rc_resp.json().get("choices", [{}])[0].get("message", {})
+            rc_raw = (_rc_msg.get("content")
+                      or _rc_msg.get("reasoning_content")
+                      or "").strip()
             meta["refusal_challenge_response"] = rc_raw
             rc_text = _extract_xml_tag(rc_raw, "verdict")
             rc_clean = rc_text.replace("*", "").upper()
@@ -1525,10 +1591,10 @@ def _run_citation_audit(
             timeout=90,
         )
         if audit_resp.status_code == 200:
-            audit_raw = (
-                audit_resp.json().get("choices", [{}])[0]
-                .get("message", {}).get("content", "")
-            ).strip()
+            _aud_msg = audit_resp.json().get("choices", [{}])[0].get("message", {})
+            audit_raw = (_aud_msg.get("content")
+                         or _aud_msg.get("reasoning_content")
+                         or "").strip()
             meta["audit_response"] = audit_raw
             audit_verdict_text = _extract_xml_tag(audit_raw, "audit")
             clean = audit_verdict_text.replace("*", "").upper()
@@ -1679,6 +1745,9 @@ def handle_research_complete(
 
     # ── Stage 1: LLM verification ────────────────────────────────────
     should_publish, verify_feedback, verify_text_raw, suspicious_claims = _run_verification(state, draft_content)
+    # Preserve Stage 1's own verdict/response before later stages can overwrite
+    stage1_passed = should_publish
+    stage1_response = verify_text_raw
 
     # ── Stage 2: Spot-check (deterministic citation verification + suspicious claims) ──
     spot_check_meta: dict = {}
@@ -1709,6 +1778,9 @@ def handle_research_complete(
             verify_meta["verification_verdict"] = "APPROVED"
             verify_meta["verification_response"] = verify_text_raw
         verify_meta["verification_attempt"] = state.verification_rejections + 1
+        # Per-stage verdicts for trace visualization
+        verify_meta["stage1_verdict"] = "APPROVED" if stage1_passed else "REVISION_NEEDED"
+        verify_meta["stage1_response"] = stage1_response
         if spot_check_meta:
             verify_meta["spot_check"] = spot_check_meta
         if citation_audit_meta:
@@ -1759,6 +1831,9 @@ def handle_research_complete(
             "verification_response": verify_text_raw or verify_feedback,
             "verification_attempt": state.verification_rejections,
             "spot_check_attempt": state.spot_check_rejections,
+            # Per-stage verdicts for trace visualization
+            "stage1_verdict": "APPROVED" if stage1_passed else "REVISION_NEEDED",
+            "stage1_response": stage1_response,
         }
         if spot_check_meta:
             reject_meta["spot_check"] = spot_check_meta
@@ -2093,6 +2168,16 @@ def handle_conduct_research(
             tool_name="conduct_research", turn=state.turn,
             content=output, description=desc,
         )
+        # ── Research log entry ────────────────────────────────────────
+        _task_snip = str(tool_args.get("task", ""))[:120]
+        _finding_snip = output.strip()[:200]
+        state.research_log.append({
+            "turn": state.turn, "tool": "conduct_research",
+            "task": _task_snip, "finding": _finding_snip,
+            "mem_key": mem_key,
+        })
+        if len(state.research_log) > 20:
+            state.research_log = state.research_log[-20:]
         if state.plan is not None:
             state.plan.record_tool_call(
                 tool_name="conduct_research", tool_args=tool_args,
@@ -2203,6 +2288,17 @@ def handle_summarize_webpage(
             tool_name="summarize_webpage", turn=state.turn,
             content=sw_output, description=sw_desc,
         )
+        # ── Research log entry ────────────────────────────────────────
+        _sw_task = f"summarize {sw_url[:80]}"
+        if sw_focus:
+            _sw_task += f" (focus: {sw_focus[:40]})"
+        state.research_log.append({
+            "turn": state.turn, "tool": "summarize_webpage",
+            "task": _sw_task[:120], "finding": sw_output.strip()[:200],
+            "mem_key": mem_key,
+        })
+        if len(state.research_log) > 20:
+            state.research_log = state.research_log[-20:]
         if state.plan is not None:
             state.plan.record_tool_call(
                 tool_name="summarize_webpage", tool_args=tool_args,
