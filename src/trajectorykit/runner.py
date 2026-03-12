@@ -193,23 +193,51 @@ def _extract_tool_results(messages: list, max_chars: int = 4000) -> str:
     return "\n---\n".join(tool_results)
 
 
-def _build_fallback_response(messages: list) -> str:
-    """Build a response from message history when synthesis fails."""
-    # First: check if any tool call was final_answer with content
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant":
-            answer = _extract_final_answer(msg)
-            if answer.strip():
-                return answer
+def _build_fallback_response(messages: list, findings: Optional[list] = None) -> str:
+    """Build a response from message history when synthesis fails.
 
-    # Second: check assistant content (for non-tool-choice cases)
+    If findings are provided (from state.findings), prefer them over
+    scanning messages — they contain the actual research snippets
+    gathered during the turn loop.
+    """
+    # First: check if any assistant message contains an actual final_answer
+    # tool call with content (strict — no content fallback here).
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in (msg.get("tool_calls") or []):
+            func = tc.get("function", {})
+            name = func.get("name", "").split("<|")[0]
+            if name == "final_answer":
+                try:
+                    args = json.loads(func.get("arguments", "{}") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                answer = args.get("answer", "")
+                if answer.strip():
+                    return answer
+
+    # Second: use accumulated findings if available — these contain
+    # the real research data gathered by search/fetch/wikipedia tools.
+    # Always preferred over assistant content (which is often monologue).
+    if findings:
+        findings_text = "\n".join(findings[-20:])  # most recent 20
+        if len(findings_text) > 6000:
+            findings_text = findings_text[:6000] + "\n... (truncated)"
+        if findings_text.strip():
+            return (
+                "[Auto-condensed from research findings]\n\n"
+                + findings_text
+            )
+
+    # Third: check assistant content
     for msg in reversed(messages):
         if msg.get("role") == "assistant":
             content = msg.get("content", "") or ""
             if content.strip():
                 return content
 
-    # Third: concatenate the last few tool results as raw findings
+    # Fourth: concatenate the last few tool results as raw findings
     tool_results = _extract_tool_results(messages, max_chars=3000)
     if tool_results.strip():
         return f"[Auto-extracted from research — synthesis failed]\n\n{tool_results}"
@@ -566,22 +594,45 @@ def _inject_pre_turn(state: AgentState) -> Optional[List[dict]]:
                 if state.verbose:
                     print(f"\U0001f4ca  Checkpoint injected (turn {state.turn}/{state.turn_length}, interval={_ckpt_interval})")
 
-            # Escalating warnings
+            # Escalating warnings — inject findings condensation to help synthesis
             if remaining == 3:
+                # Build a quick findings recap so the model has a "cheat sheet"
+                findings_recap = ""
+                if state.findings:
+                    recent = state.findings[-10:]
+                    findings_recap = (
+                        "\n\nYour research findings so far:\n"
+                        + "\n".join(f"  {i+1}. {f[:300]}" for i, f in enumerate(recent))
+                        + "\n"
+                    )
                 state.messages.append({"role": "system", "content": (
                     "\u26a0\ufe0f BUDGET WARNING: You have 4 turns remaining (including this one). "
-                    "Start synthesizing NOW. Call think() to organize your findings, "
-                    "then call final_answer on the next turn.\n"
-                    f"Question: {q_echo}"
+                    "Start synthesizing NOW. Call final_answer with everything you have gathered.\n"
+                    f"{findings_recap}\n"
+                    f"Question: {q_echo}\n\n"
+                    "Combine these findings into a clear answer. A partial answer with "
+                    "real data is better than no answer."
                 )})
             elif remaining == 2:
                 state.messages.append({"role": "system", "content": (
                     "\U0001f6a8 FINAL WARNING: 3 turns left. Call final_answer THIS TURN "
-                    "or NEXT TURN. Do NOT start new searches."
+                    "or NEXT TURN with your research. Do NOT start new searches."
                 )})
             elif remaining == 1:
+                # Last chance — inject findings directly so forced synthesis
+                # has them even if the model fails to synthesize
+                findings_dump = ""
+                if state.findings:
+                    recent = state.findings[-10:]
+                    findings_dump = (
+                        "\n\nHere are your findings — include them in final_answer:\n"
+                        + "\n".join(f"  - {f[:400]}" for f in recent)
+                        + "\n"
+                    )
                 state.messages.append({"role": "system", "content": (
-                    "\U0001f6a8 LAST CHANCE: 2 turns remaining. Call final_answer NOW."
+                    "\U0001f6a8 LAST CHANCE: 2 turns remaining. Call final_answer NOW "
+                    "with a comprehensive answer using everything below."
+                    f"{findings_dump}"
                 )})
 
         # Hard stop: restrict to terminal tool on final turn (all sub-agents)
@@ -826,7 +877,26 @@ def _run_synthesis(state: AgentState) -> Dict[str, Any]:
                 if synth_choices and isinstance(synth_choices, list) and len(synth_choices) > 0:
                     synth_msg = synth_choices[0].get("message", {})
                     state.messages.append(synth_msg)
-                    final_content = _extract_final_answer(synth_msg)
+                    # Strict extraction: only accept an actual final_answer
+                    # tool call — do NOT fall back to assistant content, which
+                    # is often garbage monologue from vLLM when it ignores
+                    # tools_override.
+                    final_content = ""
+                    for tc in (synth_msg.get("tool_calls") or []):
+                        func = tc.get("function", {})
+                        name = func.get("name", "").split("<|")[0]
+                        if name == "final_answer":
+                            try:
+                                args = json.loads(func.get("arguments", "{}") or "{}")
+                            except json.JSONDecodeError:
+                                args = {}
+                            final_content = args.get("answer", "")
+                            break
+                    if not final_content:
+                        # Fall back to assistant content if present.
+                        # Findings-based fallback downstream will catch
+                        # cases where this is low-quality.
+                        final_content = (synth_msg.get("content", "") or "").strip()
                     if final_content.strip():
                         synth_usage = synth_result.get("usage", {})
                         synth_record = TurnRecord(
@@ -878,14 +948,27 @@ def _run_synthesis(state: AgentState) -> Dict[str, Any]:
             print(f"\U0001f4e6 Uploading {stats['entries']} memory entries to sandbox "
                   f"({len(memory_json):,} bytes as research_data.json)")
 
+        # Include a findings recap in the task so the synthesizer
+        # has immediate context before even opening the file
+        findings_hint = ""
+        if state.findings:
+            recent = state.findings[-10:]
+            findings_hint = (
+                "\n\nKey findings so far (details in research_data.json):\n"
+                + "\n".join(f"  - {f[:300]}" for f in recent)
+                + "\n"
+            )
+
         synthesis_task = (
             f"Answer this question using the research data in research_data.json:\n\n"
             f"{state.user_input}"
+            f"{findings_hint}"
         )
         sandbox_files = {"research_data.json": memory_b64}
 
         try:
-            synth_turn_budget = min(_cfg.SUB_AGENT_TURN_BUDGET, 10)
+            # Synthesis needs at most 3-5 turns: read data + answer
+            synth_turn_budget = min(_cfg.SUB_AGENT_TURN_BUDGET, 5)
 
             if state.verbose:
                 print(f"\U0001f504 Spawning synthesis sub-agent ({synth_turn_budget} turn budget, "
@@ -946,7 +1029,7 @@ def _run_synthesis(state: AgentState) -> Dict[str, Any]:
                 print(f"\u274c Synthesis sub-agent failed: {e}")
 
     # ── Absolute fallback ─────────────────────────────────────────────
-    final_content = _build_fallback_response(state.messages)
+    final_content = _build_fallback_response(state.messages, findings=state.findings)
 
     if state.verbose:
         if final_content:

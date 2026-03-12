@@ -3382,6 +3382,10 @@ def dispatch_tool_call(tool_name: str, tool_args: dict, _depth: int = 0, model: 
             model_files = tool_args.get("files") or {}
             merged = {**_sandbox_files, **model_files}  # model files take precedence
             tool_args = {**tool_args, "files": merged}
+        # Strip unknown kwargs the model may hallucinate (e.g. 'timeout')
+        _EXEC_VALID = {"code", "completion", "stdin", "compile_timeout", "run_timeout",
+                       "memory_limit_mb", "language", "files", "fetch_files"}
+        tool_args = {k: v for k, v in tool_args.items() if k in _EXEC_VALID}
         return execute_code_wrapper(**tool_args)
     elif tool_name == "search_web":
         return search_web_wrapper(**tool_args)
@@ -3417,7 +3421,7 @@ TOOLS = [
         "description": (
             "Execute code in a sandboxed environment with support for multiple languages, "
             "input/output handling, file I/O, and resource limits. "
-            "The code should be provided in a markdown code block (e.g., ```python code here ```). "
+            "Pass your code as a plain string in the 'code' parameter. "
             "Returns execution results including stdout, stderr, exit status, and any requested output files.\n\n"
             "WHEN TO USE:\n"
             "- SEARCH truncated pages: when a page is truncated, the full text is auto-loaded "
@@ -3453,9 +3457,10 @@ TOOLS = [
                 "code": {
                     "type": "string",
                     "description": (
-                        "Code to execute. Wrap in markdown code blocks "
-                        "(```python ... ``` or ``` ... ```) or provide raw code. "
-                        "Code blocks are automatically extracted."
+                        "REQUIRED. The source code to execute as a plain string. "
+                        "Example: \"import math\\nprint(math.sqrt(144))\" — "
+                        "do NOT pass extra keyword arguments like 'timeout'; "
+                        "use 'run_timeout' or 'compile_timeout' instead if needed."
                     )
                 },
                 "stdin": {
