@@ -572,6 +572,27 @@ body {
 }
 .final-body { padding: 16px 20px; }
 
+/* ── Rendered markdown in final response ── */
+.final-rendered {
+  font-size: 14px; line-height: 1.7; color: var(--text);
+}
+.final-rendered h1 { font-size: 22px; font-weight: 600; margin: 24px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.final-rendered h2 { font-size: 18px; font-weight: 600; margin: 20px 0 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.final-rendered h3 { font-size: 15px; font-weight: 600; margin: 16px 0 8px; }
+.final-rendered p { margin: 8px 0; }
+.final-rendered ul, .final-rendered ol { margin: 8px 0; padding-left: 24px; }
+.final-rendered li { margin: 4px 0; }
+.final-rendered a { color: var(--accent); text-decoration: none; }
+.final-rendered a:hover { text-decoration: underline; }
+.final-rendered code { background: var(--off); padding: 2px 5px; border-radius: 3px; font-family: var(--mono); font-size: 12px; }
+.final-rendered pre { background: var(--off); border: 1px solid var(--border); border-radius: 4px; padding: 12px; overflow-x: auto; }
+.final-rendered pre code { background: none; padding: 0; }
+.final-rendered blockquote { border-left: 3px solid var(--accent); margin: 8px 0; padding: 4px 16px; color: var(--text-mid); }
+.final-rendered table { border-collapse: collapse; margin: 12px 0; width: 100%; font-size: 13px; }
+.final-rendered th, .final-rendered td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.final-rendered th { background: var(--off); font-weight: 600; }
+.final-rendered strong { font-weight: 600; }
+
 /* ── Responsive ── */
 @media (max-width: 768px) {
   .viewer { grid-template-columns: 1fr; }
@@ -811,6 +832,22 @@ document.addEventListener('DOMContentLoaded', function() {
     if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); idx = Math.max(idx - 1, 0); cards[idx].scrollIntoView({ behavior: 'smooth', block: 'start' }); }
     if ((e.key === 'Enter' || e.key === ' ') && idx >= 0) { e.preventDefault(); var h = cards[idx].querySelector('.turn-header'); if (h) toggle(h); }
   });
+
+  /* Render final response as Markdown */
+  var mdSrc = document.getElementById('final-md');
+  var mdDst = document.getElementById('final-rendered');
+  if (mdSrc && mdDst) {
+    var raw = mdSrc.textContent;
+    if (typeof marked !== 'undefined') {
+      mdDst.innerHTML = marked.parse(raw);
+    } else {
+      /* marked.js didn't load (offline) — show as preformatted text */
+      var pre = document.createElement('pre');
+      pre.className = 'output-block';
+      pre.textContent = raw;
+      mdDst.appendChild(pre);
+    }
+  }
 });
 """
 
@@ -1718,7 +1755,10 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
 
     # Strip broken markdown image references
     final_clean = re.sub(r'!\[.*?\]\(data:image[^)]*\)', '', final_raw).strip()
-    final = _esc(final_clean)
+    # For the <script type="text/template"> tag: escape only </script> sequences
+    # so the browser doesn't prematurely close the tag.  The JS reads textContent
+    # and feeds it to marked.parse(), so HTML entities must NOT be used here.
+    final = final_clean.replace('</script>', '<\\/script>')
 
     # Collect all images produced during the episode
     all_images = _collect_all_images(d)
@@ -1796,6 +1836,7 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,100..900;1,9..144,100..900&family=JetBrains+Mono:wght@300;400;500&family=Plus+Jakarta+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>{_CSS}</style>
 </head>
 <body>
@@ -1856,7 +1897,8 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
     <div class="final-card" id="final">
       <div class="final-header">\u2705 Final Response</div>
       <div class="final-body">
-        <div class="output-block">{final}</div>
+        <script type="text/template" id="final-md">{final}</script>
+        <div class="final-rendered" id="final-rendered"></div>
         {images_html}
       </div>
     </div>

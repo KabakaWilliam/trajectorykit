@@ -10,6 +10,15 @@ is a citation-faithfulness check: does the cited page contain or
 clearly support the claim the author attached to it?
 
 ═══════════════════════════════════════════
+REQUIRED OUTPUT FORMAT (read this first)
+═══════════════════════════════════════════
+
+Wrap your ENTIRE response in <audit></audit> XML tags.
+Inside, list each citation result, then end with exactly:
+  **Verdict: CITATION_PASS** or **Verdict: CITATION_FAIL**
+See full format details at the end of this prompt.
+
+═══════════════════════════════════════════
 RULES
 ═══════════════════════════════════════════
 

@@ -8,6 +8,16 @@ that would be most damaging if wrong. Aim for thoroughness —
 typically 5-10 claims for a detailed answer, fewer for short answers.
 
 ═══════════════════════════════════════════
+REQUIRED OUTPUT FORMAT (read this first)
+═══════════════════════════════════════════
+
+Wrap your ENTIRE JSON response in <claims></claims> XML tags.
+The JSON inside must be: {"claims": [{...}, ...]}
+You may reason before the opening <claims> tag, but the JSON
+MUST be inside the tags. No markdown fences inside the tags.
+See full format details at the end of this prompt.
+
+═══════════════════════════════════════════
 CAUSAL CHAIN DETECTION
 ═══════════════════════════════════════════
 

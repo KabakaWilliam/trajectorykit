@@ -13,6 +13,18 @@ evidence support or contradict the claims?
 CURRENT_DATE: {current_date}
 
 ═══════════════════════════════════════════
+REQUIRED OUTPUT FORMAT (read this first)
+═══════════════════════════════════════════
+
+Wrap your ENTIRE final response in <verdict></verdict> XML tags.
+Inside, start with exactly one of:
+  VERDICT: SPOT_CHECK_PASSED
+  VERDICT: SPOT_CHECK_FAILED
+You may reason before the opening <verdict> tag, but the final
+structured output MUST be inside the tags. See full examples at
+the end of this prompt.
+
+═══════════════════════════════════════════
 CORE ANSWER VERIFICATION (CLAIM #1)
 ═══════════════════════════════════════════
 

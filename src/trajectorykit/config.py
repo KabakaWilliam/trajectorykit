@@ -179,7 +179,7 @@ def _update_module_constants():
     global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
     global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT, DRAFT_FORMAT
-    global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT, VERIFIER_MODEL, VERIFIER_API_URL, VERIFIER_API_KEY, VERIFIER_TEMPERATURE
+    global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT, VERIFIER_EXTERNAL_PROMPT, VERIFIER_MODEL, VERIFIER_API_URL, VERIFIER_API_KEY, VERIFIER_TEMPERATURE
     global VERIFIER_STAGE1_PROVIDER, VERIFIER_STAGE3_PROVIDER
     global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
     global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
@@ -252,12 +252,18 @@ def _update_module_constants():
     VERIFIER_STAGE1_PROVIDER = verifier_cfg.get("stage1_provider", "self")
     VERIFIER_STAGE3_PROVIDER = verifier_cfg.get("stage3_provider", "self")
 
-    # Verifier prompt
+    # Verifier prompts
     verifier_path = c.get("prompts", {}).get("verifier", "configs/prompts/verifier.txt")
     try:
         VERIFIER_PROMPT = _load_prompt(verifier_path)
     except FileNotFoundError:
         VERIFIER_PROMPT = ""  # gracefully degrade if file missing
+
+    verifier_external_path = c.get("prompts", {}).get("verifier_external", "configs/prompts/verifier_external.txt")
+    try:
+        VERIFIER_EXTERNAL_PROMPT = _load_prompt(verifier_external_path)
+    except FileNotFoundError:
+        VERIFIER_EXTERNAL_PROMPT = ""
 
     # Spot-check (Stage 2 verification)
     SPOT_CHECK_ENABLED = agent_cfg.get("spot_check_enabled", False)

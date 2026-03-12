@@ -65,7 +65,7 @@ agent:
 #
 # If the verifier block is omitted entirely, both stages default to "self".
 verifier:
-  model: "gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
+  model: "gpt-5-mini-2025-08-07" #"gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
   api_url: "https://api.openai.com/v1"  # external model endpoint
   stage1_provider: "external"            # "self" = local model, "external" = verifier.model above
   stage3_provider: "self"            # "self" = local model, "external" = verifier.model above
@@ -84,6 +84,7 @@ prompts:
   orchestrator: "configs/prompts/orchestrator_bench.txt"
   worker: "configs/prompts/worker.txt"
   verifier: "configs/prompts/verifier_bench.txt"
+  verifier_external: "configs/prompts/verifier_external.txt"
   spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
   spotcheck_compare: "configs/prompts/spotcheck_compare_bench.txt"
   spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"

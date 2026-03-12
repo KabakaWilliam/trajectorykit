@@ -7,6 +7,18 @@ ANSWER produced by a research agent. Your job is to determine
 whether the draft fully and accurately answers the question.
 
 ═══════════════════════════════════════════
+REQUIRED OUTPUT FORMAT (read this first)
+═══════════════════════════════════════════
+
+Wrap your ENTIRE final response in <verdict></verdict> XML tags.
+Inside, start with exactly one of:
+  VERDICT: APPROVED
+  VERDICT: REVISION_NEEDED
+You may reason before the opening <verdict> tag, but the final
+structured output MUST be inside the tags. See full examples at
+the end of this prompt.
+
+═══════════════════════════════════════════
 EVALUATION CRITERIA (in priority order)
 ═══════════════════════════════════════════
 

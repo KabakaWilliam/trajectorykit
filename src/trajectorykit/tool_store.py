@@ -310,7 +310,7 @@ def _search_ddg(q: str, num_results: int = 5) -> str:
                 evt.set()
 
 
-def _search_exa(q: str, num_results: int = 5) -> str:
+def _search_exa(q: str, num_results: int = 10) -> str:
     """Neural search via Exa.ai API.
 
     Exa combines keyword and neural search, making it good at finding

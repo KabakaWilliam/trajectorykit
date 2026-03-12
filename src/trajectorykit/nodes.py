@@ -395,6 +395,7 @@ def _focused_page_summary(
             _summary_payload["temperature"] = temperature
         if max_tokens is not None:
             _summary_payload["max_tokens"] = max_tokens
+        _summary_payload["reasoning_effort"] = "high"
         resp = requests.post(
             f"{vllm_url}/chat/completions",
             json=_summary_payload,
@@ -462,8 +463,8 @@ def _extract_xml_tag(text: str, tag: str = "summary") -> str:
 _extract_summary_tags = lambda text: _extract_xml_tag(text, "summary")
 
 
-def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str, str]:
-    """Run Stage-1 LLM verifier.  Returns (should_publish, feedback, raw_text)."""
+def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str, str, list]:
+    """Run Stage-1 LLM verifier.  Returns (should_publish, feedback, raw_text, suspicious_claims)."""
     if (
         not _cfg.VERIFY_BEFORE_PUBLISH
         or not _cfg.VERIFIER_PROMPT
@@ -471,12 +472,22 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
     ):
         if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS and state.verbose:
             print(f"       \u23e9 Verifier: max rejections reached, force-publishing")
-        return True, "", ""
+        return True, "", "", []
 
     try:
-        # Build findings summary for cross-checking
+        # Resolve verifier model + endpoint: "external" uses verifier.model, "self" uses the local model
+        use_external = (
+            getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
+            and _cfg.VERIFIER_MODEL
+        )
+        v_model = _cfg.VERIFIER_MODEL if use_external else state.model
+        v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL) if use_external else _cfg.VLLM_API_URL
+
+        # External model gets ONLY question + draft (no findings) for unbiased
+        # cross-checking using its own training knowledge.
+        # Local model gets research findings for context-aware verification.
         findings_section = ""
-        if state.findings:
+        if not use_external and state.findings:
             lines = []
             total = 0
             for i, f in enumerate(state.findings, 1):
@@ -490,16 +501,14 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
                 "\n\nRESEARCH FINDINGS (raw worker outputs for cross-checking):\n"
                 + "\n".join(lines)
             )
-        # Resolve verifier model + endpoint: "external" uses verifier.model, "self" uses the local model
-        use_external = (
-            getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
-            and _cfg.VERIFIER_MODEL
-        )
-        v_model = _cfg.VERIFIER_MODEL if use_external else state.model
-        v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL) if use_external else _cfg.VLLM_API_URL
+
+        # External model uses a dedicated prompt that outputs SUSPICIOUS_CLAIMS
+        v_prompt = _cfg.VERIFIER_PROMPT
+        if use_external and getattr(_cfg, "VERIFIER_EXTERNAL_PROMPT", ""):
+            v_prompt = _cfg.VERIFIER_EXTERNAL_PROMPT
 
         verify_messages = [
-            {"role": "system", "content": _cfg.VERIFIER_PROMPT},
+            {"role": "system", "content": v_prompt},
             {
                 "role": "user",
                 "content": (
@@ -512,9 +521,16 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         payload = {
             "model": v_model,
             "messages": verify_messages,
-            "temperature": _cfg.VERIFIER_TEMPERATURE if _cfg.VERIFIER_TEMPERATURE is not None else state.temperature,
-            "max_tokens": state.max_tokens,
+            "reasoning_effort": "high",
         }
+        # OpenAI newer models require max_completion_tokens; vLLM uses max_tokens.
+        # External reasoning models (gpt-5-*) only support temperature=1 and have
+        # lower max-completion-token ceilings, so we cap and omit temperature.
+        if use_external:
+            payload["max_completion_tokens"] = min(state.max_tokens, 100_000)
+        else:
+            payload["max_tokens"] = state.max_tokens
+            payload["temperature"] = _cfg.VERIFIER_TEMPERATURE if _cfg.VERIFIER_TEMPERATURE is not None else state.temperature
         v_label = v_model if v_model != state.model else "same model"
         if state.verbose:
             print(f"       \U0001f50d Verifier ({v_label}): auditing draft (attempt {state.verification_rejections + 1})...")
@@ -530,6 +546,20 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
                 .get("message", {})
                 .get("content", "")
             ).strip()
+
+            # Parse suspicious claims flagged by the external model
+            suspicious_claims = []
+            sc_json = _extract_xml_tag(raw_text, "suspicious_claims")
+            if sc_json:
+                try:
+                    sc_parsed = json.loads(sc_json)
+                    if isinstance(sc_parsed, list):
+                        suspicious_claims = sc_parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if suspicious_claims and state.verbose:
+                print(f"       \U0001f50d Verifier: flagged {len(suspicious_claims)} suspicious claim(s)")
+
             text = _extract_xml_tag(raw_text, "verdict")
             clean = text.replace("*", "").upper()
             if "VERDICT: REVISION_NEEDED" in clean or "VERDICT:REVISION_NEEDED" in clean:
@@ -543,19 +573,24 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
                 if state.verbose:
                     print(f"       \u26a0\ufe0f  Verifier: REVISION_NEEDED "
                           f"(rejection {state.verification_rejections}/{state.MAX_VERIFICATION_REJECTIONS})")
-                return False, feedback, text
+                return False, feedback, text, suspicious_claims
             else:
                 if state.verbose:
                     print(f"       \u2705 Verifier: APPROVED")
-                return True, "", text
+                return True, "", text, suspicious_claims
         else:
             if state.verbose:
-                print(f"       \u26a0\ufe0f  Verifier API error ({resp.status_code}), skipping verification")
-            return True, "", ""
+                err_body = ""
+                try:
+                    err_body = resp.json().get("error", {}).get("message", "")[:200]
+                except Exception:
+                    err_body = resp.text[:200]
+                print(f"       \u26a0\ufe0f  Verifier API error ({resp.status_code}): {err_body}")
+            return True, "", "", []
     except Exception as e:
         if state.verbose:
             print(f"       \u26a0\ufe0f  Verifier error: {e}, skipping verification")
-        return True, "", ""
+        return True, "", "", []
 
 
 def _resolve_numbered_citations(draft: str) -> Tuple[str, dict]:
@@ -666,15 +701,27 @@ def _linkify_citations(draft: str) -> str:
     return linked_body + sources_section
 
 
-def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, str, dict]:
-    """Run Stage-2 spot-check (search-verify key claims).
+def _section_at_position(text: str, pos: int) -> str:
+    """Return the nearest ## heading active at `pos` in the text."""
+    best = ""
+    for m in re.finditer(r'^##\s+(.+?)(?:\s*$)', text[:pos], re.MULTILINE):
+        best = m.group(1).strip()
+    return best
+
+
+def _run_spot_check(state: AgentState, draft_content: str,
+                    suspicious_claims: list | None = None) -> Tuple[bool, str, str, dict]:
+    """Run Stage-2 spot-check — deterministic citation verification + Stage 1 suspicious claims.
+
+    Instead of LLM-mediated claim extraction (fragile, arbitrary), this
+    deterministically extracts ALL cited claims via _extract_citation_pairs()
+    and merges any suspicious claims flagged by the external Stage 1 verifier.
 
     Returns (should_publish, feedback, raw_text, metadata_dict).
     """
     meta: dict = {}
     if (
         not _cfg.SPOT_CHECK_ENABLED
-        or not _cfg.SPOTCHECK_EXTRACT_PROMPT
         or not _cfg.SPOTCHECK_COMPARE_PROMPT
         or state.spot_check_rejections >= state.MAX_SPOT_CHECK_REJECTIONS
     ):
@@ -683,60 +730,46 @@ def _run_spot_check(state: AgentState, draft_content: str) -> Tuple[bool, str, s
         return True, "", "", meta
 
     try:
-        if state.verbose:
-            print(f"       \U0001f50e Spot-check: extracting checkable claims...")
-
-        # Pre-resolve numbered citations [1] → [1](URL) so the extraction
-        # LLM can see URLs inline next to each claim.
-        expanded_draft, citation_map = _resolve_numbered_citations(draft_content)
-        if citation_map and state.verbose:
-            print(f"       \U0001f50e Spot-check: resolved {len(citation_map)} numbered citation(s)")
+        # ── Step 1: Deterministic citation extraction ─────────────────
+        # Extract ALL [N] citation-claim pairs with their source URLs.
+        result = _extract_citation_pairs(draft_content)
+        citation_map, pairs = result if result else ({}, [])
         meta["citation_map"] = {str(k): v for k, v in citation_map.items()}
 
-        # Step 1: Extract claims from draft
-        # Inject chain plan as a hint so the extract LLM confirms the
-        # pre-computed chain structure rather than re-discovering it.
-        _chain_hint = ""
-        if state.chain_plan and state.chain_plan.has_chain:
-            _chain_hint = f"\n\nPRE-COMPUTED CHAIN ANALYSIS:\n{state.chain_plan.render()}\n"
-        sc_extract_msgs = [
-            {"role": "system", "content": _cfg.SPOTCHECK_EXTRACT_PROMPT},
-            {"role": "user", "content": (
-                f"QUESTION:\n{state.user_input}"
-                f"{_chain_hint}\n\n"
-                f"DRAFT ANSWER:\n{expanded_draft}"
-            )},
-        ]
-        sc_extract_payload: dict = {
-            "model": state.model,
-            "messages": sc_extract_msgs,
-            "temperature": state.temperature,
-            "max_tokens": state.max_tokens,
-        }
-        sc_extract_resp = requests.post(
-            f"{_cfg.VLLM_API_URL}/chat/completions",
-            json=sc_extract_payload,
-        )
-        sc_claims = []
-        if sc_extract_resp.status_code == 200:
-            sc_extract_raw = (
-                sc_extract_resp.json().get("choices", [{}])[0]
-                .get("message", {}).get("content", "")
-            ).strip()
-            meta["extract_response"] = sc_extract_raw
-            sc_json_text = _extract_xml_tag(sc_extract_raw, "claims")
-            # Strip residual markdown fences if model added them inside the tags
-            sc_json_text = re.sub(r'^```(?:json)?\s*', '', sc_json_text, flags=re.MULTILINE)
-            sc_json_text = re.sub(r'```\s*$', '', sc_json_text, flags=re.MULTILINE).strip()
-            try:
-                sc_parsed = json.loads(sc_json_text)
-                sc_claims = sc_parsed.get("claims", [])
-            except json.JSONDecodeError:
-                if state.verbose:
-                    print(f"       \u26a0\ufe0f  Spot-check: failed to parse claims JSON, skipping")
-        else:
-            if state.verbose:
-                print(f"       \u26a0\ufe0f  Spot-check: extract API error ({sc_extract_resp.status_code}), skipping")
+        # Convert citation pairs to claim objects for _spot_check_claims
+        sc_claims: list[dict] = []
+        for pair in pairs:
+            clean_fact = re.sub(r'\[\d+\]', '', pair["attributed_fact"]).strip()
+            # Detect which report section this citation is in
+            pos = draft_content.find(pair["attributed_fact"][:50])
+            section = _section_at_position(draft_content, pos) if pos >= 0 else ""
+            sc_claims.append({
+                "claim": pair["attributed_fact"],
+                "search_query": clean_fact[:200],
+                "source_url": pair["url"],
+                "section": section,
+            })
+
+        # ── Step 2: Add Stage 1 suspicious claims ────────────────────
+        if suspicious_claims:
+            for sc in suspicious_claims:
+                claim_text = sc.get("claim", "")
+                if claim_text and not any(c["claim"] == claim_text for c in sc_claims):
+                    sc_claims.append({
+                        "claim": claim_text,
+                        "search_query": claim_text[:200],
+                        "source_url": "",
+                        "section": "",
+                    })
+
+        meta["cited_claims_extracted"] = len(pairs)
+        meta["stage1_suspicious_claims"] = len(suspicious_claims or [])
+        meta["total_claims"] = len(sc_claims)
+
+        if state.verbose:
+            print(f"       \U0001f50e Spot-check: {len(pairs)} cited claim(s) + "
+                  f"{len(suspicious_claims or [])} suspicious \u2192 "
+                  f"{len(sc_claims)} total to verify")
 
         if sc_claims:
             return _spot_check_claims(state, draft_content, sc_claims, meta)
@@ -1076,6 +1109,7 @@ def _spot_check_claims(
             "messages": compare_msgs,
             "temperature": state.temperature,
             "max_tokens": state.max_tokens,
+            "reasoning_effort": "high",
         },
     )
     if compare_resp.status_code == 200:
@@ -1272,6 +1306,7 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
                 "messages": rc_msgs,
                 "temperature": state.temperature,
                 "max_tokens": state.max_tokens,
+                "reasoning_effort": "high",
             },
         )
         if rc_resp.status_code == 200:
@@ -1470,14 +1505,22 @@ def _run_citation_audit(
         if state.verbose and use_external_s3:
             print(f"       📑 Citation audit: using external model ({ca_model})")
 
-        audit_resp = requests.post(
-            f"{ca_api_url}/chat/completions",
-            json={
+        audit_payload = {
                 "model": ca_model,
                 "messages": audit_msgs,
-                "temperature": ca_temp,
-                "max_tokens": state.max_tokens,
-            },
+                "reasoning_effort": "high",
+            }
+        # OpenAI newer models require max_completion_tokens; vLLM uses max_tokens.
+        # External reasoning models only support temperature=1 and have lower token ceilings.
+        if use_external_s3:
+            audit_payload["max_completion_tokens"] = min(state.max_tokens, 100_000)
+        else:
+            audit_payload["max_tokens"] = state.max_tokens
+            audit_payload["temperature"] = ca_temp
+
+        audit_resp = requests.post(
+            f"{ca_api_url}/chat/completions",
+            json=audit_payload,
             headers=ca_headers,
             timeout=90,
         )
@@ -1635,19 +1678,22 @@ def handle_research_complete(
         return _CONTINUE
 
     # ── Stage 1: LLM verification ────────────────────────────────────
-    should_publish, verify_feedback, verify_text_raw = _run_verification(state, draft_content)
+    should_publish, verify_feedback, verify_text_raw, suspicious_claims = _run_verification(state, draft_content)
 
-    # ── Stage 2: Spot-check ──────────────────────────────────────────
+    # ── Stage 2: Spot-check (deterministic citation verification + suspicious claims) ──
     spot_check_meta: dict = {}
     if should_publish:
-        should_publish, sc_feedback, sc_raw, spot_check_meta = _run_spot_check(state, draft_content)
+        should_publish, sc_feedback, sc_raw, spot_check_meta = _run_spot_check(
+            state, draft_content, suspicious_claims=suspicious_claims)
         if not should_publish:
             verify_feedback = sc_feedback
             verify_text_raw = sc_raw
 
-    # ── Stage 3: Citation audit (citation faithfulness) ──────────────
+    # ── Stage 3: Citation audit (only when spot-check is disabled) ───
+    # When spot-check is enabled, citation verification is already done
+    # deterministically in Stage 2 via _extract_citation_pairs().
     citation_audit_meta: dict = {}
-    if should_publish:
+    if should_publish and not _cfg.SPOT_CHECK_ENABLED:
         should_publish, ca_feedback, ca_raw, citation_audit_meta = _run_citation_audit(state, draft_content)
         if not should_publish:
             verify_feedback = ca_feedback
@@ -2279,6 +2325,7 @@ def handle_compress_findings(
                 "messages": compress_messages,
                 "temperature": state.temperature,
                 "max_tokens": state.max_tokens,
+                "reasoning_effort": "high",
             }
             cf_resp = requests.post(f"{_cfg.VLLM_API_URL}/chat/completions", json=cf_payload)
             if cf_resp.status_code == 200:
