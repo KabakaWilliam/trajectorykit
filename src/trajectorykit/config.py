@@ -187,6 +187,7 @@ def _update_module_constants():
     global CHAIN_ANALYSIS_ENABLED, CHAIN_ANALYSIS_PROMPT
     global HISTORY_COMPACTION_ENABLED, HISTORY_COMPACTION_MSG_THRESHOLD
     global HISTORY_COMPACTION_MIN_INTERVAL, HISTORY_COMPACTION_RECENT_TURNS
+    global RUBRIC_ENABLED, RUBRIC_PROMPT, DRAFT_CRITIQUE_ENABLED, DRAFT_CRITIQUE_PROMPT
 
     c = _config
 
@@ -308,6 +309,20 @@ def _update_module_constants():
         CHAIN_ANALYSIS_PROMPT = _load_prompt(chain_analysis_path)
     except FileNotFoundError:
         CHAIN_ANALYSIS_PROMPT = ""
+
+    # Rubric-conditioned critique (pre-research rubric + post-draft critique)
+    RUBRIC_ENABLED = agent_cfg.get("rubric_enabled", False)
+    rubric_path = c.get("prompts", {}).get("rubric_generator", "configs/prompts/rubric_generator.txt")
+    try:
+        RUBRIC_PROMPT = _load_prompt(rubric_path) if RUBRIC_ENABLED else ""
+    except FileNotFoundError:
+        RUBRIC_PROMPT = ""
+    DRAFT_CRITIQUE_ENABLED = agent_cfg.get("draft_critique_enabled", False)
+    critique_path = c.get("prompts", {}).get("draft_critique", "configs/prompts/draft_critique.txt")
+    try:
+        DRAFT_CRITIQUE_PROMPT = _load_prompt(critique_path) if DRAFT_CRITIQUE_ENABLED else ""
+    except FileNotFoundError:
+        DRAFT_CRITIQUE_PROMPT = ""
 
     # Dataset & eval (new — used by eval.py)
     DATASET_CONFIG = c.get("dataset", {})

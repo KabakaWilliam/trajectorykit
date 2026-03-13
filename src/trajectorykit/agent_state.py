@@ -85,7 +85,9 @@ class AgentState:
     draft_path: Optional[str] = None
     draft_versions: List[Tuple[int, str]] = field(default_factory=list)
     draft_feedback: Dict[int, str] = field(default_factory=dict)  # version → feedback
-
+    # ── Rubric-conditioned critique (root only) ─────────────────────
+    rubric: Optional[str] = None             # XML rubric from external pre-research pass
+    critique_tasks: List[str] = field(default_factory=list)  # follow-up tasks from draft critique
     # ── Verification (root only) ──────────────────────────────────────
     verification_rejections: int = 0
     spot_check_rejections: int = 0

@@ -594,6 +594,240 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         return True, "", f"[VERIFIER ERROR: {type(e).__name__}: {e}]", []
 
 
+def _generate_rubric(state: AgentState) -> Optional[str]:
+    """Call external model (question-only) to generate a quality rubric.
+
+    Runs once before research begins. Returns raw XML rubric string, or None
+    if rubric generation is disabled / unavailable.
+    """
+    if not getattr(_cfg, "RUBRIC_ENABLED", False) or not getattr(_cfg, "RUBRIC_PROMPT", ""):
+        return None
+    use_external = (
+        getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
+        and _cfg.VERIFIER_MODEL
+    )
+    if not use_external:
+        return None
+
+    v_model = _cfg.VERIFIER_MODEL
+    v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL)
+    v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+
+    try:
+        payload = {
+            "model": v_model,
+            "messages": [
+                {"role": "system", "content": _cfg.RUBRIC_PROMPT},
+                {"role": "user", "content": f"QUESTION:\n{state.user_input}"},
+            ],
+            "reasoning_effort": "high",
+            "max_completion_tokens": 4000,
+        }
+        headers = {"Content-Type": "application/json"}
+        if v_api_key:
+            headers["Authorization"] = f"Bearer {v_api_key}"
+        if state.verbose:
+            print(f"       \U0001f4d0 Generating research rubric via {v_model}...")
+        resp = requests.post(
+            f"{v_api_url}/chat/completions", json=payload,
+            headers=headers, timeout=120,
+        )
+        if resp.status_code == 200:
+            msg = resp.json()["choices"][0]["message"]
+            raw = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            if state.verbose:
+                print(f"       \U0001f4d0 Rubric generated ({len(raw):,} chars)")
+            return raw or None
+        else:
+            if state.verbose:
+                print(f"       \u26a0\ufe0f  Rubric API error ({resp.status_code})")
+    except Exception as e:
+        if state.verbose:
+            print(f"       \u26a0\ufe0f  Rubric generation error: {e}")
+    return None
+
+
+def _run_draft_critique(
+    state: AgentState,
+    draft_content: str,
+) -> Tuple[bool, str, str, list, dict]:
+    """Run a rubric-conditioned draft critique (replaces binary Stage-1 verifier).
+
+    Uses the external model to score the draft across RACE dimensions,
+    identify missing coverage, flag risky claims, and produce at most 3
+    targeted follow-up research tasks.
+
+    Returns (should_publish, feedback, raw_text, risky_claims_list, critique_meta).
+    critique_meta is a structured dict written into the trace metadata.
+    Saves follow-up tasks to state.critique_tasks.
+    """
+    if not getattr(_cfg, "DRAFT_CRITIQUE_ENABLED", False) or not getattr(_cfg, "DRAFT_CRITIQUE_PROMPT", ""):
+        # Fall back to legacy verifier
+        return (*_run_verification(state, draft_content), {})
+
+    use_external = (
+        getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
+        and _cfg.VERIFIER_MODEL
+    )
+    if not use_external:
+        return (*_run_verification(state, draft_content), {})
+
+    if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS:
+        if state.verbose:
+            print(f"       \u23e9 Critique: max rejections reached, force-publishing")
+        return True, "", "", [], {}
+
+    v_model = _cfg.VERIFIER_MODEL
+    v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL)
+    v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+
+    rubric_section = ""
+    if state.rubric:
+        rubric_section = f"\n\nRUBRIC:\n{state.rubric}"
+
+    try:
+        payload = {
+            "model": v_model,
+            "messages": [
+                {"role": "system", "content": _cfg.DRAFT_CRITIQUE_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"QUESTION:\n{state.user_input}"
+                        f"{rubric_section}\n\n"
+                        f"DRAFT:\n{draft_content}"
+                    ),
+                },
+            ],
+            "reasoning_effort": "high",
+            "max_completion_tokens": min(state.max_tokens, 100_000),
+        }
+        headers = {"Content-Type": "application/json"}
+        if v_api_key:
+            headers["Authorization"] = f"Bearer {v_api_key}"
+        if state.verbose:
+            print(f"       \U0001f50d Critique ({v_model}): evaluating draft "
+                  f"(attempt {state.verification_rejections + 1})...")
+        resp = requests.post(
+            f"{v_api_url}/chat/completions", json=payload,
+            headers=headers, timeout=300,
+        )
+        if resp.status_code != 200:
+            if state.verbose:
+                print(f"       \u26a0\ufe0f  Critique API error ({resp.status_code})")
+            return True, "", "", [], {}
+
+        msg = resp.json()["choices"][0]["message"]
+        raw_text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+
+        # ── Parse verdict ──────────────────────────────────────────────
+        verdict_xml = _extract_xml_tag(raw_text, "verdict")
+        should_publish = "PUBLISH" in verdict_xml.upper()
+
+        # ── Parse scores ───────────────────────────────────────────────
+        scores_xml = _extract_xml_tag(raw_text, "scores")
+        comp = _extract_xml_tag(scores_xml, "comprehensiveness")
+        ins = _extract_xml_tag(scores_xml, "insight")
+        instr = _extract_xml_tag(scores_xml, "instruction_following")
+        read = _extract_xml_tag(scores_xml, "readability")
+
+        # ── Parse missing coverage ─────────────────────────────────────
+        missing_xml = _extract_xml_tag(raw_text, "missing_coverage")
+        missing_items: list = []
+        for m in re.finditer(r'<item\s+checklist_id="([^"]*)"[^>]*>(.*?)</item>', missing_xml, re.DOTALL):
+            missing_items.append({
+                "checklist_id": m.group(1).strip(),
+                "description": m.group(2).strip(),
+            })
+        if not missing_items:
+            for m in re.finditer(r"<item[^>]*>(.*?)</item>", missing_xml, re.DOTALL):
+                missing_items.append({"checklist_id": "", "description": m.group(1).strip()})
+
+        # ── Parse risky claims ─────────────────────────────────────────
+        risky_claims: list = []
+        risky_xml = _extract_xml_tag(raw_text, "risky_claims")
+        risky_claims_structured: list = []
+        for m in re.finditer(r'<claim\s+severity="([^"]*)"[^>]*>(.*?)</claim>', risky_xml, re.DOTALL):
+            severity = m.group(1).strip() or "medium"
+            claim_text = m.group(2).strip()
+            risky_claims_structured.append({"severity": severity, "claim": claim_text})
+            risky_claims.append({"claim": claim_text, "category": "risky"})
+        if not risky_claims_structured:
+            for m in re.finditer(r"<claim[^>]*>(.*?)</claim>", risky_xml, re.DOTALL):
+                claim_text = m.group(1).strip()
+                risky_claims_structured.append({"severity": "medium", "claim": claim_text})
+                risky_claims.append({"claim": claim_text, "category": "risky"})
+
+        # ── Parse weak sections ────────────────────────────────────────
+        weak_xml = _extract_xml_tag(raw_text, "weak_sections")
+        weak_sections: list = []
+        for m in re.finditer(r"<section[^>]*>(.*?)</section>", weak_xml, re.DOTALL):
+            s = m.group(1).strip()
+            if s:
+                weak_sections.append(s)
+
+        # ── Parse follow-up tasks ──────────────────────────────────────
+        tasks_xml = _extract_xml_tag(raw_text, "follow_up_tasks")
+        follow_up_tasks = []
+        for m in re.finditer(r"<task[^>]*>(.*?)</task>", tasks_xml, re.DOTALL):
+            t = m.group(1).strip()
+            if t:
+                follow_up_tasks.append(t)
+        state.critique_tasks = follow_up_tasks[:3]
+
+        critique_meta = {
+            "scores": {
+                "comprehensiveness": comp,
+                "insight": ins,
+                "instruction_following": instr,
+                "readability": read,
+            },
+            "missing_coverage": missing_items,
+            "risky_claims": risky_claims_structured,
+            "weak_sections": weak_sections,
+            "follow_up_tasks": follow_up_tasks[:3],
+            "verdict": "PUBLISH" if should_publish else "REVISE",
+        }
+
+        if state.verbose:
+            score_str = f"C={comp} I={ins} IF={instr} R={read}"
+            print(f"       {'✅' if should_publish else '⚠️ '} Critique: "
+                  f"{'PUBLISH' if should_publish else 'REVISE'} "
+                  f"({score_str}, {len(follow_up_tasks)} follow-up tasks)")
+
+        if not should_publish:
+            state.verification_rejections += 1
+            # Build structured feedback for root
+            feedback_parts = [
+                f"CRITIQUE SCORES: Comprehensiveness={comp}/10, Insight={ins}/10, "
+                f"InstructionFollowing={instr}/10, Readability={read}/10",
+            ]
+            if missing_items:
+                feedback_parts.append("\nMISSING COVERAGE:")
+                for item in missing_items:
+                    cid = f"[{item['checklist_id']}] " if item['checklist_id'] else ""
+                    feedback_parts.append(f"  {cid}{item['description']}")
+            if weak_sections:
+                feedback_parts.append("\nWEAK SECTIONS:\n" + "\n".join(f"  - {s}" for s in weak_sections))
+            if risky_claims_structured:
+                feedback_parts.append("\nRISKY CLAIMS:")
+                for rc in risky_claims_structured:
+                    feedback_parts.append(f"  [{rc['severity'].upper()}] {rc['claim']}")
+            if follow_up_tasks:
+                feedback_parts.append(
+                    "\nSUGGESTED FOLLOW-UP TASKS (conduct_research on these to close gaps):\n"
+                    + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(follow_up_tasks))
+                )
+            return False, "\n".join(feedback_parts), raw_text, risky_claims, critique_meta
+        else:
+            return True, "", raw_text, risky_claims, critique_meta
+
+    except Exception as e:
+        if state.verbose:
+            print(f"       \u26a0\ufe0f  Critique error: {e}, falling back to verify")
+        return (*_run_verification(state, draft_content), {})
+
+
 def _resolve_numbered_citations(draft: str) -> Tuple[str, dict]:
     """Parse ## Sources section and inline-expand [N] → [N](URL) throughout the draft.
 
@@ -1743,8 +1977,8 @@ def handle_research_complete(
             print(f"       \u26a0\ufe0f  Format check failed: {format_issues}")
         return _CONTINUE
 
-    # ── Stage 1: LLM verification ────────────────────────────────────
-    should_publish, verify_feedback, verify_text_raw, suspicious_claims = _run_verification(state, draft_content)
+    # ── Stage 1: LLM verification (or rubric-conditioned critique) ──────
+    should_publish, verify_feedback, verify_text_raw, suspicious_claims, critique_meta = _run_draft_critique(state, draft_content)
     # Preserve Stage 1's own verdict/response before later stages can overwrite
     stage1_passed = should_publish
     stage1_response = verify_text_raw
@@ -1781,6 +2015,8 @@ def handle_research_complete(
         # Per-stage verdicts for trace visualization
         verify_meta["stage1_verdict"] = "APPROVED" if stage1_passed else "REVISION_NEEDED"
         verify_meta["stage1_response"] = stage1_response
+        if critique_meta:
+            verify_meta["critique"] = critique_meta
         if spot_check_meta:
             verify_meta["spot_check"] = spot_check_meta
         if citation_audit_meta:
@@ -1835,6 +2071,8 @@ def handle_research_complete(
             "stage1_verdict": "APPROVED" if stage1_passed else "REVISION_NEEDED",
             "stage1_response": stage1_response,
         }
+        if critique_meta:
+            reject_meta["critique"] = critique_meta
         if spot_check_meta:
             reject_meta["spot_check"] = spot_check_meta
         if citation_audit_meta:
