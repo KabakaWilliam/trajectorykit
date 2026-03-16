@@ -135,6 +135,8 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
               ┌──────────────────────────────┐
               │     ⛓ CHAIN ANALYSIS         │
               │     (pre-dispatch, root only) │
+              │     [External/Local]          │
+              │  (e.g. GPT-5.4, Claude)      │
               │                              │
               │  LLM detects causal chains:  │
               │    Step 1: find X → {step_1} │
@@ -151,10 +153,12 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      ┌───────────────────────────────────────────────┐
      │            🔄 RESEARCH LOOP                   │
      │            (runner.py)                         │
+     │     [External/Local] ↔ Interchangeable        │
      │                                               │
      │  ┌─────────────────────────────────────────┐  │
      │  │ Each turn:                              │  │
      │  │   LLM → tool calls → execute → results │  │
+     │  │   [External/Local model routes here]   │  │
      │  │         ▲                     │         │  │
      │  │         └─────────────────────┘         │  │
      │  └─────────────────────────────────────────┘  │
@@ -187,6 +191,8 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      │  │    wikipedia, extract_tables, code,     │  │
      │  │    read_page, recall_memory             │  │
      │  │  • Return findings via final_answer     │  │
+     │  │  • [External/Local] at root             │  │
+     │  │    (local recommended to minimize cost) │  │
      │  └─────────────────────────────────────────┘  │
      │                                               │
      │  Root tools: conduct_research, refine_draft,  │
@@ -207,6 +213,7 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      │  │  Fail → back to research loop              │
      │  ▼                                            │
      │  Stage 1 ── Verifier LLM                      │
+     │  │  [External/Local] ↔ Interchangeable       │
      │  │  9 criteria: adequacy (hard-stop),         │
      │  │  language, depth, insight, comprehensiveness│
      │  │  section quality, citations, coherence,    │
@@ -217,6 +224,7 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      │                                               │
      │  ┌─────────────────────────────────────────┐  │
      │  │ Step 1: EXTRACT                         │  │
+     │  │  [External/Local] ↔ Interchangeable     │  │
      │  │  LLM extracts checkable claims from     │  │
      │  │  draft. Chain plan injected as hint.     │  │
      │  │  Claim #1 = core answer (mandatory).    │  │
@@ -224,6 +232,8 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      │                   ▼                           │
      │  ┌─────────────────────────────────────────┐  │
      │  │ Step 2: VERIFY (parallel sub-agents)    │  │
+     │  │  ** Sub-agents: Local models only **    │  │
+     │  │  (spawned at root, separate context)    │  │
      │  │                                         │  │
      │  │  Each claim → 1 verification sub-agent  │  │
      │  │  (3 turns, fresh context, full tools)   │  │
@@ -242,6 +252,7 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      │                   ▼                           │
      │  ┌─────────────────────────────────────────┐  │
      │  │ Step 3: COMPARE (LLM judge)             │  │
+     │  │  [External/Local] ↔ Interchangeable     │  │
      │  │  Claims + sub-agent evidence reports    │  │
      │  │  → 4-point core answer check            │  │
      │  │  → Chain coherence verification         │  │
@@ -254,6 +265,7 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
      │    REFUSAL_JUSTIFIED / REFUSAL_CHALLENGED     │
      │                                               │
      │  Stage 3 ── Citation Audit                    │
+     │  │  [External/Local] ↔ Interchangeable       │
      │  │  Extracts [N]→URL pairs from Sources       │
      │  │  Fetches each cited URL (cache-first)      │
      │  │  LLM judges: does cited URL support the    │
@@ -282,6 +294,7 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
 
 | Concern | Approach |
 |---------|----------|
+| Model interchangeability | Most LLM steps (chain analysis, research loop, verification stages 1/3) accept external (GPT-5.4, Claude) or local models as drop-in replacements. Sub-agents use independent model configuration; verification sub-agents (spawned at root) may use local models to minimize cost. Configure via `model.name` and `model.api_url` in YAML. |
 | Causal chains | Pre-dispatch LLM detects dependency chains → `ChainPlan` enforces sequential resolution with placeholder blocking |
 | Verification | 4-stage pipeline: format gate → verifier LLM (insight criterion) → sub-agent spot-check → citation audit (URL faithfulness) |
 | Cycle prevention | 5 runner gates: must draft before publish, must revise before re-publish, must research before draft, must follow plan, must research after first draft (report mode) |
@@ -402,6 +415,18 @@ trajectorykit/
 │   ├── utils.py                      # Shared utilities
 │   └── apptainer.sh                  # Sandbox container pull + run
 │
+├── deep_research_bench/              # 📊 Evaluation Benchmark
+│   ├── README.md                     # Benchmark setup, results, and evaluation framework
+│   ├── deepresearch_bench_race.py    # RACE (Reference-based Adaptive Criteria) evaluator
+│   ├── rewrite_articles.py           # ✨ Post-processing rewrite with GPT-5.4/Claude
+│   ├── run_benchmark.sh              # End-to-end benchmark runner
+│   ├── data/
+│   │   ├── deep_research_bench/      # 100 benchmark queries (22 domains)
+│   │   ├── test_data/                # Agent outputs (JSONL format)
+│   │   └── criteria_data/            # Evaluation rubrics
+│   ├── results/race/                 # RACE eval results per model
+│   └── results/fact/                 # FACT eval results per model
+│
 ├── evals/
 │   ├── eval.py                       # DeepSearchQA evaluation runner
 │   ├── eval_deep_research_bench.py   # Deep Research Bench eval (RACE + FACT)
@@ -499,7 +524,51 @@ The HTML viewer is self-contained with:
 
 ---
 
-## Evaluation Pipeline
+## 🏆 Deep Research Bench Evaluation
+
+TrajectoryKit is evaluated on **[Deep Research Bench](deep_research_bench/README.md)**, a comprehensive benchmark with 100 PhD-level research tasks across 22 domains. The framework includes a **post-processing enhancement step** using GPT-5.4 with high reasoning effort:
+
+### Results with Post-Processing
+
+| Metric | Baseline | With Rewrite | Improvement |
+|--------|----------|--------------|-------------|
+| Comprehensiveness | 0.4543 | **0.5078** | +11.8% |
+| Insight/Depth | 0.4373 | **0.5472** | +25.2% |
+| Instruction Following | 0.4825 | **0.5215** | +8.1% |
+| Readability | 0.4861 | **0.5213** | +7.2% |
+| **Overall Score** | **0.4597** | **0.5266** | **+14.6%** |
+
+### Post-Processing Pipeline
+
+After the agent generates a draft report, an optional **high-reasoning rewrite step** enhances quality:
+
+```bash
+# Rewrite with GPT-5.4 (high reasoning, 128k tokens)
+python deep_research_bench/rewrite_articles.py \
+  -i traces/research_results.jsonl \
+  -o rewrite_research_results.jsonl \
+  -c 5
+
+# Or use Anthropic Claude Opus
+python deep_research_bench/rewrite_articles.py \
+  --provider anthropic \
+  -i traces/research_results.jsonl \
+  -o rewrite_research_results.jsonl
+```
+
+**Key enhancements applied:**
+- Quantify vague claims with specific metrics and benchmarks
+- Deepen entity and case study coverage
+- Reduce scaffolding and eliminate redundancy
+- Execute frameworks with worked examples
+- Ground risks in real-world incidents
+- Specify regulatory and standards content
+- Update stale reference points
+- Build consolidated comparison tables
+- Strengthen causal reasoning
+- Improve source quality framing
+
+For detailed evaluation methodology and benchmark setup, see [Deep Research Bench README](deep_research_bench/README.md).
 
 The evaluation pipeline is fully automated:
 
@@ -571,7 +640,8 @@ Settings are loaded from YAML with fallback chain: explicit path → `TRAJECTORY
 | `SERPER_API_KEY` | Primary web search (Serper.dev). Falls back to Exa → DuckDuckGo if not set or credits exhausted. |
 | `EXA_API_KEY` | Exa.ai neural search (fallback) + Exa contents API (fetch fallback). Highly recommended. |
 | `JINA_API_KEY` | Jina Reader API for fetching JS-heavy / paywalled pages. Optional but improves fetch success rate. |
-| `OPENAI_API_KEY` | LLM judge (GPT-4.1-mini by default). Only needed if `judge.enabled: true`. |
+| `OPENAI_API_KEY` | OpenAI API key for LLM judge (GPT-4.1-mini) and post-processing rewrite (GPT-5.4). Only needed for these features. |
+| `ANTHROPIC_API_KEY` | Anthropic API key for alternative post-processing rewrite (Claude Opus). Optional. |
 | `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, set `SEARCH_BACKEND=serpapi`). |
 | `GOOGLE_API_KEY` | Gemini API key. Required only when using Gemini models as the LLM judge. |
 

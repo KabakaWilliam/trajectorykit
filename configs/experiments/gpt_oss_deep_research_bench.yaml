@@ -117,7 +117,7 @@ dataset:
   name: "deep_research_bench"
   query_file: "deep_research_bench/data/prompt_data/query.jsonl"
   # lang: "en"                             # uncomment to restrict: "en" or "zh"
-  limit: 50                              # uncomment to cap prompts (for testing)
+  limit: 100                              # uncomment to cap prompts (for testing)
   shuffle: true                           # random sampling (stratified by language when no lang filter)
   seed: 42                                # reproducible shuffle seed
 
@@ -126,7 +126,7 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: "deep_research_bench/traces"
-  workers: 5
+  workers: 10
 
 judge:
   enabled: true

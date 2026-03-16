@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import random
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -944,13 +945,97 @@ def _section_at_position(text: str, pos: int) -> str:
     return best
 
 
+def _select_spotcheck_claims(state: AgentState, sc_claims: list[dict]) -> list[dict]:
+    """Select a bounded, high-value subset of claims for Stage-2 verification.
+
+    Strategy (in priority order):
+      1) Core answer anchor (first extracted claim)
+            2) Stage-1 suspicious claims
+            3) One representative claim per section
+      4) Numeric/derived claims
+      5) Random fill from remaining claims
+
+    The total selected claims are capped by SPOT_CHECK_CLAIMS when that
+    config value is > 0. If SPOT_CHECK_CLAIMS <= 0, all claims are checked.
+    """
+    if not sc_claims:
+        return []
+
+    cap_cfg = int(getattr(_cfg, "SPOT_CHECK_CLAIMS", 3) or 0)
+    if cap_cfg <= 0 or len(sc_claims) <= cap_cfg:
+        return sc_claims
+
+    max_claims = cap_cfg
+
+    def _key(c: dict) -> tuple:
+        return (
+            (c.get("claim") or "").strip(),
+            (c.get("source_url") or "").strip(),
+            (c.get("section") or "").strip(),
+        )
+
+    def _is_numeric_claim(text: str) -> bool:
+        t = (text or "").lower()
+        if re.search(r"\d", t):
+            return True
+        return any(tok in t for tok in [
+            "%", "percent", "ratio", " x ", "times", "increase", "decrease",
+            "growth", "rank", "ranking", "million", "billion", "year", "yr",
+        ])
+
+    selected: list[dict] = []
+    selected_keys: set[tuple] = set()
+
+    def _add(c: dict):
+        if len(selected) >= max_claims:
+            return
+        k = _key(c)
+        if k in selected_keys:
+            return
+        selected.append(c)
+        selected_keys.add(k)
+
+    # 1) Core answer anchor: first extracted claim
+    _add(sc_claims[0])
+
+    # 2) Stage-1 suspicious claims
+    for c in sc_claims:
+        if c.get("is_suspicious"):
+            _add(c)
+
+    # 3) One representative claim per section
+    seen_sections: set[str] = set()
+    for c in sc_claims:
+        sec = (c.get("section") or "").strip().lower()
+        if sec and sec not in seen_sections:
+            seen_sections.add(sec)
+            _add(c)
+
+    # 4) Numeric/derived claims
+    for c in sc_claims:
+        if _is_numeric_claim(c.get("claim", "")):
+            _add(c)
+
+    # 5) Random fill from remaining claims
+    remaining = [c for c in sc_claims if _key(c) not in selected_keys]
+    seed = f"{state.episode.trace_id}:{state.spot_check_rejections}:{len(sc_claims)}"
+    rng = random.Random(seed)
+    rng.shuffle(remaining)
+    for c in remaining:
+        _add(c)
+
+    return selected
+
+
 def _run_spot_check(state: AgentState, draft_content: str,
                     suspicious_claims: list | None = None) -> Tuple[bool, str, str, dict]:
     """Run Stage-2 spot-check — deterministic citation verification + Stage 1 suspicious claims.
 
     Instead of LLM-mediated claim extraction (fragile, arbitrary), this
     deterministically extracts ALL cited claims via _extract_citation_pairs()
-    and merges any suspicious claims flagged by the external Stage 1 verifier.
+    and merges any suspicious claims flagged by Stage 1. Before expensive
+    per-claim verification, claims are prioritized and sampled using
+    SPOT_CHECK_CLAIMS as a cap.
 
     Returns (should_publish, feedback, raw_text, metadata_dict).
     """
@@ -983,31 +1068,41 @@ def _run_spot_check(state: AgentState, draft_content: str,
                 "search_query": clean_fact[:200],
                 "source_url": pair["url"],
                 "section": section,
+                "is_suspicious": False,
             })
 
         # ── Step 2: Add Stage 1 suspicious claims ────────────────────
         if suspicious_claims:
             for sc in suspicious_claims:
                 claim_text = sc.get("claim", "")
-                if claim_text and not any(c["claim"] == claim_text for c in sc_claims):
+                if claim_text:
+                    existing = next((c for c in sc_claims if c.get("claim") == claim_text), None)
+                    if existing is not None:
+                        existing["is_suspicious"] = True
+                        continue
                     sc_claims.append({
                         "claim": claim_text,
                         "search_query": claim_text[:200],
                         "source_url": "",
                         "section": "",
+                        "is_suspicious": True,
                     })
 
         meta["cited_claims_extracted"] = len(pairs)
         meta["stage1_suspicious_claims"] = len(suspicious_claims or [])
         meta["total_claims"] = len(sc_claims)
+        selected_claims = _select_spotcheck_claims(state, sc_claims)
+        meta["selected_claims"] = len(selected_claims)
+        meta["sampled_claims"] = len(selected_claims) < len(sc_claims)
+        meta["selection_strategy"] = "anchor+suspicious+section+numeric+random"
 
         if state.verbose:
             print(f"       \U0001f50e Spot-check: {len(pairs)} cited claim(s) + "
                   f"{len(suspicious_claims or [])} suspicious \u2192 "
-                  f"{len(sc_claims)} total to verify")
+                  f"{len(sc_claims)} total, checking {len(selected_claims)}")
 
-        if sc_claims:
-            return _spot_check_claims(state, draft_content, sc_claims, meta)
+        if selected_claims:
+            return _spot_check_claims(state, draft_content, selected_claims, meta)
 
         # No checkable claims — check if it's a refusal
         return _spot_check_refusal(state, draft_content, meta)
