@@ -36,6 +36,8 @@ agent:
   history_compaction_msg_threshold: 15
   history_compaction_min_interval: 2
   history_compaction_recent_turns: 2
+  rubric_enabled: true               # generate quality rubric before research starts
+  draft_critique_enabled: true       # replace binary verifier with rubric-conditioned critique
 
 # ── Verifier configuration ────────────────────────────────────────────
 # Controls which model runs Stage 1 (quality audit) and Stage 3 (citation audit).
@@ -65,9 +67,10 @@ agent:
 #
 # If the verifier block is omitted entirely, both stages default to "self".
 verifier:
-  model: "gpt-5-mini-2025-08-07" #"gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
+  model: "gpt-5.4-2026-03-05" # "gpt-5-mini-2025-08-07" #"gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
   api_url: "https://api.openai.com/v1"  # external model endpoint
   stage1_provider: "external"            # "self" = local model, "external" = verifier.model above
+  stage2_provider: "self"            # "self" = local model, "external" = verifier.model above (compare step only)
   stage3_provider: "self"            # "self" = local model, "external" = verifier.model above
 
 sandbox:
@@ -90,6 +93,8 @@ prompts:
   spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
   chain_analysis: "configs/prompts/chain_analysis.txt"
   citation_audit: "configs/prompts/citation_audit.txt"
+  rubric_generator: "configs/prompts/rubric_generator.txt"
+  draft_critique: "configs/prompts/draft_critique.txt"
 
 model_profiles:
   "Qwen/Qwen3-8B":
@@ -112,7 +117,7 @@ dataset:
   name: "deep_research_bench"
   query_file: "deep_research_bench/data/prompt_data/query.jsonl"
   # lang: "en"                             # uncomment to restrict: "en" or "zh"
-  limit: 50                              # uncomment to cap prompts (for testing)
+  limit: 100                              # uncomment to cap prompts (for testing)
   shuffle: true                           # random sampling (stratified by language when no lang filter)
   seed: 42                                # reproducible shuffle seed
 
@@ -121,11 +126,11 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: "deep_research_bench/traces"
-  workers: 8
+  workers: 10
 
 judge:
   enabled: true
-  model: "gpt-4.1-mini"
+  model: "gemini-2.5-pro" #"gpt-4.1-mini" #"gemini-2.5-pro"
   threads: 5
 
 ntfy:

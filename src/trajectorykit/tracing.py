@@ -84,6 +84,9 @@ class EpisodeTrace:
     # Chain analysis (pre-dispatch decomposition, root only)
     chain_plan: Optional[Dict[str, Any]] = None
 
+    # Pre-research quality rubric (root only, generated before turn 1)
+    rubric: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the full trace tree to a dict (JSON-safe)."""
         def _serialize(obj):
@@ -479,6 +482,54 @@ body {
   text-decoration: underline; margin-top: 4px; display: inline-block;
 }
 
+/* ── Verification pipeline overview ── */
+.verify-pipeline {
+  display: flex; align-items: center; gap: 0; margin: 10px 0 6px 0;
+  font-family: var(--mono); font-size: 10px;
+}
+.verify-stage {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border: 1px solid var(--border);
+  background: var(--bg); border-radius: 3px; white-space: nowrap;
+}
+.verify-stage.passed { background: #e8f5e9; border-color: var(--success); }
+.verify-stage.failed { background: #ffebee; border-color: var(--error); }
+.verify-stage.skipped { background: #fff8e1; border-color: #f1c40f; }
+.verify-stage.empty { background: #f5f5f5; border-color: #ccc; color: #999; }
+.verify-stage-icon { font-size: 12px; }
+.verify-arrow { color: var(--text-light); font-size: 14px; padding: 0 4px; }
+.claim-evidence-card {
+  margin: 4px 0; padding: 8px 10px; border-radius: 3px;
+  border: 1px solid var(--border); background: var(--white); font-size: 11px;
+}
+.claim-evidence-card.supported { border-left: 3px solid var(--success); }
+.claim-evidence-card.contradicted { border-left: 3px solid var(--error); }
+.claim-evidence-card.insufficient { border-left: 3px solid #f1c40f; }
+.claim-evidence-card.fabricated { border-left: 3px solid #9b59b6; }
+.claim-evidence-header {
+  display: flex; justify-content: space-between; align-items: center;
+  font-weight: 600; font-size: 10px; margin-bottom: 4px;
+}
+.claim-assess-badge {
+  display: inline-block; padding: 1px 6px; border-radius: 2px;
+  font-size: 9px; font-weight: 600; text-transform: uppercase;
+}
+.claim-assess-badge.supported { background: #e8f5e9; color: #2e7d32; }
+.claim-assess-badge.contradicted { background: #ffebee; color: #c62828; }
+.claim-assess-badge.insufficient { background: #fff8e1; color: #f57f17; }
+.claim-assess-badge.fabricated { background: #f3e5f5; color: #7b1fa2; }
+.claim-assess-badge.degraded { background: #f5f5f5; color: #999; }
+.claim-source-url {
+  font-size: 9px; color: var(--accent); word-break: break-all;
+  margin-bottom: 4px;
+}
+.citation-audit-block {
+  margin-top: 8px; padding: 10px 14px; border-radius: 3px;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px;
+}
+.citation-audit-block.passed { background: #f0faf0; border-color: var(--success); }
+.citation-audit-block.failed { background: #fdf0f0; border-color: var(--error); }
+
 /* ── Draft card ── */
 .draft-card {
   margin-top: 10px; padding: 14px 16px; border-radius: 4px;
@@ -785,6 +836,112 @@ body {
 .tl-chain-dot { font-size: 8px; line-height: 1; }
 .tl-chain-dot.resolved { color: var(--success); }
 .tl-chain-dot.pending { color: var(--text-light); }
+
+/* ── Rubric panel ── */
+.rubric-panel {
+  background: var(--white); border: 1px solid #b8c8e8;
+  border-radius: 4px; margin-bottom: 20px; overflow: hidden;
+}
+.rubric-panel-header {
+  padding: 14px 20px; border-bottom: 1px solid #b8c8e8;
+  display: flex; align-items: center; justify-content: space-between;
+  cursor: pointer; user-select: none; background: #f0f4fb;
+}
+.rubric-panel-header:hover { background: #e8eef8; }
+.rubric-panel-title {
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  display: flex; align-items: center; gap: 8px;
+}
+.rubric-panel-body { padding: 20px; }
+.rubric-panel-body.collapsed { display: none; }
+.rubric-section-label {
+  font-family: var(--mono); font-size: 9px; color: var(--text-light);
+  letter-spacing: 0.12em; text-transform: uppercase; margin: 12px 0 6px;
+}
+.rubric-section-label:first-child { margin-top: 0; }
+.rubric-item {
+  padding: 5px 10px; background: var(--off); border: 1px solid var(--border);
+  border-radius: 3px; margin-bottom: 4px; font-size: 12px; color: var(--text-mid);
+  font-family: var(--mono);
+}
+.rubric-item .rubric-id {
+  color: var(--accent); font-weight: 600; margin-right: 6px;
+}
+.rubric-depth {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.rubric-depth-pill {
+  padding: 2px 10px; border-radius: 12px; font-size: 11px;
+  background: var(--accent-bg); color: var(--accent);
+  border: 1px solid #b8c8e8; font-family: var(--mono);
+}
+.rubric-trap {
+  padding: 5px 10px; background: #fff8f0; border: 1px solid #f0c080;
+  border-radius: 3px; margin-bottom: 4px; font-size: 12px; color: #854d0e;
+  font-family: var(--mono);
+}
+
+/* ── Critique panel (inside Stage 1 verifier block) ── */
+.critique-block {
+  margin-top: 10px; padding: 12px 16px; border-radius: 4px;
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 11px;
+}
+.critique-block.publish { background: #f0faf0; border-color: var(--success); }
+.critique-block.revise { background: #fdf8f0; border-color: var(--warn); }
+.critique-scores {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 10px 0;
+}
+.critique-score-item { text-align: center; }
+.critique-score-label {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--text-light); margin-bottom: 4px; display: block;
+}
+.critique-score-bar-wrap {
+  height: 6px; border-radius: 3px; background: var(--off);
+  border: 1px solid var(--border); overflow: hidden; margin-bottom: 3px;
+}
+.critique-score-bar {
+  height: 100%; border-radius: 3px; transition: width 0.4s ease;
+}
+.critique-score-bar.high { background: var(--success); }
+.critique-score-bar.mid { background: var(--warn); }
+.critique-score-bar.low { background: var(--error); }
+.critique-score-val {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  font-family: var(--serif);
+}
+.critique-items { margin: 6px 0; }
+.critique-item {
+  padding: 4px 8px; margin-bottom: 3px; border-radius: 3px;
+  font-size: 11px; line-height: 1.4; border: 1px solid var(--border);
+  background: var(--white); color: var(--text-mid);
+}
+.critique-item .cid { color: var(--accent); font-weight: 600; margin-right: 4px; }
+.risky-badge {
+  display: inline-block; padding: 1px 5px; border-radius: 3px;
+  font-size: 9px; font-weight: 700; text-transform: uppercase;
+  margin-right: 5px; letter-spacing: 0.05em;
+}
+.risky-badge.high { background: var(--error); color: white; }
+.risky-badge.medium { background: var(--warn); color: white; }
+.risky-badge.low { background: #f1c40f; color: #333; }
+.critique-task-list { margin: 6px 0; counter-reset: task-counter; }
+.critique-task {
+  display: flex; gap: 8px; padding: 5px 8px; margin-bottom: 3px;
+  border-radius: 3px; border: 1px solid #b8c8e8; background: var(--accent-bg);
+  font-size: 11px; color: var(--accent); counter-increment: task-counter;
+}
+.critique-task::before {
+  content: counter(task-counter) "."; font-weight: 700; min-width: 14px;
+  flex-shrink: 0;
+}
+.critique-verdict-badge {
+  display: inline-block; padding: 3px 12px; border-radius: 3px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; margin-bottom: 10px;
+}
+.critique-verdict-badge.publish { background: var(--success); color: white; }
+.critique-verdict-badge.revise { background: var(--warn); color: white; }
 """
 
 _JS = """\
@@ -1099,6 +1256,187 @@ def _depth_badge(depth: int) -> str:
     return f'<span class="turn-badge {cls}">{label}</span>'
 
 
+def _render_critique_panel(critique: dict) -> list[str]:
+    """Render a structured rubric-conditioned critique as HTML fragments."""
+    parts: list[str] = []
+    verdict = critique.get("verdict", "")
+    scores = critique.get("scores", {})
+    missing = critique.get("missing_coverage", [])
+    risky = critique.get("risky_claims", [])
+    weak = critique.get("weak_sections", [])
+    tasks = critique.get("follow_up_tasks", [])
+
+    is_publish = verdict.upper() == "PUBLISH"
+    block_cls = "publish" if is_publish else "revise"
+
+    parts.append(f'<div class="critique-block {block_cls}">')
+
+    # Verdict badge
+    verdict_label = verdict or ("PUBLISH" if is_publish else "REVISE")
+    badge_icon = "✅" if is_publish else "🔄"
+    parts.append(f'<span class="critique-verdict-badge {block_cls}">{badge_icon} Critique: {_esc(verdict_label)}</span>')
+
+    # Score bars (4 RACE dimensions)
+    if scores:
+        parts.append('<div class="verifier-section-label">Scores (RACE dimensions)</div>')
+        parts.append('<div class="critique-scores">')
+        dim_labels = {
+            "comprehensiveness": "Compreh.", "insight": "Insight",
+            "instruction_following": "Instr.Follow", "readability": "Readability"
+        }
+        for dim, label in dim_labels.items():
+            raw_val = scores.get(dim, "?")
+            try:
+                num = int(raw_val)
+                pct = num * 10
+                bar_cls = "high" if num >= 7 else ("mid" if num >= 4 else "low")
+                bar_html = (
+                    f'<div class="critique-score-bar-wrap">'
+                    f'<div class="critique-score-bar {bar_cls}" style="width:{pct}%"></div>'
+                    f'</div>'
+                    f'<span class="critique-score-val">{num}/10</span>'
+                )
+            except (ValueError, TypeError):
+                bar_html = f'<span class="critique-score-val">{_esc(str(raw_val))}</span>'
+            parts.append(
+                f'<div class="critique-score-item">'
+                f'<span class="critique-score-label">{label}</span>'
+                f'{bar_html}'
+                f'</div>'
+            )
+        parts.append('</div>')  # .critique-scores
+
+    # Missing coverage
+    if missing:
+        parts.append('<div class="verifier-section-label">Missing Coverage</div>')
+        parts.append('<div class="critique-items">')
+        for item in missing:
+            cid = item.get("checklist_id", "")
+            desc = _esc(item.get("description", ""))
+            cid_html = f'<span class="cid">[{_esc(cid)}]</span>' if cid else ""
+            parts.append(f'<div class="critique-item">{cid_html}{desc}</div>')
+        parts.append('</div>')
+
+    # Risky claims
+    if risky:
+        parts.append('<div class="verifier-section-label">Risky Claims</div>')
+        parts.append('<div class="critique-items">')
+        for rc in risky:
+            sev = (rc.get("severity") or "medium").lower()
+            badge_cls = sev if sev in ("high", "medium", "low") else "medium"
+            claim = _esc(rc.get("claim", ""))
+            parts.append(
+                f'<div class="critique-item">'
+                f'<span class="risky-badge {badge_cls}">{sev}</span>{claim}'
+                f'</div>'
+            )
+        parts.append('</div>')
+
+    # Weak sections
+    if weak:
+        parts.append('<div class="verifier-section-label">Weak Sections</div>')
+        parts.append('<div class="critique-items">')
+        for s in weak:
+            parts.append(f'<div class="critique-item">{_esc(s)}</div>')
+        parts.append('</div>')
+
+    # Follow-up tasks
+    if tasks:
+        parts.append('<div class="verifier-section-label">Follow-Up Tasks</div>')
+        parts.append('<div class="critique-task-list">')
+        for t in tasks:
+            parts.append(f'<div class="critique-task">{_esc(t)}</div>')
+        parts.append('</div>')
+
+    parts.append('</div>')  # .critique-block
+    return parts
+
+
+def _render_rubric_panel(rubric_xml: str) -> str:
+    """Render the pre-research rubric as a collapsible panel. Returns HTML string."""
+    import re as _re
+
+    def _extract(tag: str, src: str) -> str:
+        m = _re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", src, _re.DOTALL | _re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    parts = ['<div class="rubric-panel">']
+    parts.append(
+        '<div class="rubric-panel-header" onclick="'
+        'var b=this.nextElementSibling;b.classList.toggle(\'collapsed\');">'
+        '<div class="rubric-panel-title">📐 Quality Rubric</div>'
+        '<div style="font-family:var(--mono);font-size:10px;color:var(--accent);">'
+        'generated pre-research · click to expand'
+        f'{_CHEVRON_SVG}</div>'
+        '</div>'
+    )
+    parts.append('<div class="rubric-panel-body collapsed">')
+
+    # Sub-questions
+    sq_xml = _extract("sub_questions", rubric_xml)
+    sq_items = _re.findall(r"<question[^>]*>(.*?)</question>", sq_xml, _re.DOTALL)
+    if sq_items:
+        parts.append('<div class="rubric-section-label">Sub-Questions</div>')
+        for i, q in enumerate(sq_items, 1):
+            parts.append(f'<div class="rubric-item"><span class="rubric-id">Q{i}</span>{_esc(q.strip())}</div>')
+
+    # Coverage checklist
+    cl_xml = _extract("coverage_checklist", rubric_xml)
+    cl_items = _re.findall(r'<item\s+id="([^"]*)"[^>]*>(.*?)</item>', cl_xml, _re.DOTALL)
+    if not cl_items:
+        cl_items_plain = _re.findall(r"<item[^>]*>(.*?)</item>", cl_xml, _re.DOTALL)
+        cl_items = [(f"c{i+1}", t) for i, t in enumerate(cl_items_plain)]
+    if cl_items:
+        parts.append('<div class="rubric-section-label">Coverage Checklist</div>')
+        for cid, text in cl_items:
+            parts.append(f'<div class="rubric-item"><span class="rubric-id">[{_esc(cid)}]</span>{_esc(text.strip())}</div>')
+
+    # Source requirements
+    sr_xml = _extract("source_requirements", rubric_xml)
+    sr_items = _re.findall(r"<requirement[^>]*>(.*?)</requirement>", sr_xml, _re.DOTALL)
+    if sr_items:
+        parts.append('<div class="rubric-section-label">Source Requirements</div>')
+        for r_txt in sr_items:
+            parts.append(f'<div class="rubric-item">{_esc(r_txt.strip())}</div>')
+
+    # Depth profile
+    dp_xml = _extract("depth_profile", rubric_xml)
+    if dp_xml:
+        depth_pills = _re.findall(r"<[^/][^>]*>(.*?)</[^>]+>", dp_xml, _re.DOTALL)
+        pills_clean = [p.strip() for p in depth_pills if p.strip()]
+        if pills_clean:
+            parts.append('<div class="rubric-section-label">Depth Profile</div>')
+            parts.append('<div class="rubric-depth">')
+            for p in pills_clean:
+                parts.append(f'<span class="rubric-depth-pill">{_esc(p)}</span>')
+            parts.append('</div>')
+
+    # Hallucination traps
+    ht_xml = _extract("hallucination_traps", rubric_xml)
+    ht_items = _re.findall(r"<trap[^>]*>(.*?)</trap>", ht_xml, _re.DOTALL)
+    if ht_items:
+        parts.append('<div class="rubric-section-label">⚠️ Hallucination Traps</div>')
+        for t_txt in ht_items:
+            parts.append(f'<div class="rubric-trap">{_esc(t_txt.strip())}</div>')
+
+    # Insight bar
+    ib_xml = _extract("insight_bar", rubric_xml)
+    if ib_xml:
+        parts.append('<div class="rubric-section-label">Insight Bar</div>')
+        parts.append(f'<div class="rubric-item">{_esc(ib_xml)}</div>')
+
+    # Fallback: raw XML if nothing parsed
+    if not sq_items and not cl_items and not ht_items:
+        parts.append(
+            f'<pre style="font-family:var(--mono);font-size:11px;white-space:pre-wrap;'
+            f'word-break:break-word;color:var(--text-mid);">{_esc(rubric_xml)}</pre>'
+        )
+
+    parts.append('</div>')  # .rubric-panel-body
+    parts.append('</div>')  # .rubric-panel
+    return "\n".join(parts)
+
+
 def _render_verification_meta(meta: dict) -> list[str]:
     """Render verifier + spot-check metadata blocks. Returns HTML fragments."""
     parts: list[str] = []
@@ -1106,22 +1444,71 @@ def _render_verification_meta(meta: dict) -> list[str]:
     response = meta.get("verification_response", "")
     link_report = meta.get("link_check_report", "")
     attempt = meta.get("verification_attempt", "")
+    sc = meta.get("spot_check")
+    ca = meta.get("citation_audit")
 
-    if verdict == "APPROVED":
+    # ── Pipeline overview bar ─────────────────────────────────────
+    def _stage_cls(stage_verdict: str, empty: bool = False) -> str:
+        if empty:
+            return "empty"
+        v = stage_verdict.upper()
+        if v in ("APPROVED", "PASSED"):
+            return "passed"
+        if v in ("REVISION_NEEDED", "FAILED", "SPOT_CHECK_FAILED", "CITATION_FAIL"):
+            return "failed"
+        if "SKIP" in v:
+            return "skipped"
+        return "empty"
+
+    # Use per-stage verdicts when available (avoids Stage 2 verdict bleeding into Stage 1)
+    s1_v = meta.get("stage1_verdict", verdict or "")
+    s2_v = sc.get("spot_check_verdict", "") if sc else ""
+    s3_v = ""
+    if ca:
+        s3_v = ca.get("citation_audit_verdict", "")
+    if not s3_v:
+        s3_v = meta.get("citation_audit_verdict", "")
+
+    s1_response = meta.get("stage1_response", response)
+    s1_cls = _stage_cls(s1_v, empty=not s1_response)
+    s2_cls = _stage_cls(s2_v, empty=not sc)
+    s3_cls = _stage_cls(s3_v, empty=not ca and not s3_v)
+
+    attempt_str = f" #{attempt}" if attempt else ""
+    parts.append('<div class="verify-pipeline">')
+    parts.append(f'<div class="verify-stage {s1_cls}"><span class="verify-stage-icon">{"✅" if s1_cls == "passed" else "❌" if s1_cls == "failed" else "⬜"}</span> S1 Plausibility{_esc(attempt_str)}</div>')
+    parts.append('<span class="verify-arrow">→</span>')
+    parts.append(f'<div class="verify-stage {s2_cls}"><span class="verify-stage-icon">{"✅" if s2_cls == "passed" else "❌" if s2_cls == "failed" else "⬜"}</span> S2 Spot-Check</div>')
+    parts.append('<span class="verify-arrow">→</span>')
+    parts.append(f'<div class="verify-stage {s3_cls}"><span class="verify-stage-icon">{"✅" if s3_cls == "passed" else "❌" if s3_cls == "failed" else "⬜"}</span> S3 Citation Audit</div>')
+    parts.append('</div>')
+
+    # ── Stage 1: Verifier / Critique ─────────────────────────────
+    if s1_v == "APPROVED":
         v_cls = "approved"
-    elif verdict in ("REVISION_NEEDED", "SPOT_CHECK_FAILED"):
+    elif s1_v in ("REVISION_NEEDED", "SPOT_CHECK_FAILED"):
         v_cls = "rejected"
     else:
         v_cls = ""
-    badge_label = verdict or "VERIFIED"
-    attempt_str = f" (attempt {attempt})" if attempt else ""
+    s1_badge = s1_v or "VERIFIED"
 
     parts.append(f'<div class="verifier-block {v_cls}">')
-    parts.append(f'<span class="verifier-badge {v_cls}">\U0001f50d {_esc(badge_label)}{_esc(attempt_str)}</span>')
 
-    if response:
-        parts.append(f'<div class="verifier-section-label">Verifier Response</div>')
-        parts.append(f'<div class="verifier-detail">{_esc(response)}</div>')
+    # If structured critique is available, render it richly
+    critique = meta.get("critique")
+    if critique:
+        parts.extend(_render_critique_panel(critique))
+    else:
+        parts.append(f'<span class="verifier-badge {v_cls}">🔍 Stage 1: {_esc(s1_badge)}</span>')
+
+    # Raw response (always collapsible regardless of critique rendering)
+    if s1_response:
+        _s1_id = f"s1-resp-{id(meta)}"
+        parts.append(f'<div class="verifier-section-label">Raw Verifier Response</div>')
+        parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_s1_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+        parts.append(f'<div id="{_s1_id}" class="verifier-detail" style="display:none">{_esc(s1_response)}</div>')
+    elif not critique:
+        parts.append('<div class="verifier-detail" style="color:#999;font-style:italic">(no response — external verifier may have returned empty)</div>')
 
     if link_report:
         parts.append(f'<div class="verifier-section-label">Link Check</div>')
@@ -1129,8 +1516,7 @@ def _render_verification_meta(meta: dict) -> list[str]:
 
     parts.append('</div>')  # .verifier-block
 
-    # ── Spot-check metadata ───────────────────────────────────────
-    sc = meta.get("spot_check")
+    # ── Stage 2: Spot-check ───────────────────────────────────────
     if sc:
         sc_verdict = sc.get("spot_check_verdict", "")
         sc_skipped = sc.get("spot_check_skipped_reason", "")
@@ -1139,6 +1525,8 @@ def _render_verification_meta(meta: dict) -> list[str]:
         sc_compare = sc.get("compare_response", "")
         sc_refusal = sc.get("refusal_challenge_response", "")
         sc_degraded = sc.get("degraded_claims", 0)
+        sc_evidence = sc.get("claim_evidence", [])
+        sc_citation_map = sc.get("citation_map", {})
 
         if sc_verdict == "PASSED":
             sc_cls = "passed"
@@ -1155,12 +1543,74 @@ def _render_verification_meta(meta: dict) -> list[str]:
 
         sc_label = sc_verdict or (f"SKIPPED ({sc_skipped})" if sc_skipped else "RAN")
         parts.append(f'<div class="spotcheck-block {sc_cls}">')
-        parts.append(f'<span class="spotcheck-badge {sc_cls}">\U0001f9ea Spot-Check: {_esc(sc_label)}</span>')
+        parts.append(f'<span class="spotcheck-badge {sc_cls}">🧪 Stage 2 Spot-Check: {_esc(sc_label)}</span>')
 
+        # Summary stats
+        stats = []
         if sc_claims_n:
-            parts.append(f'<div class="verifier-section-label">Claims Checked: {sc_claims_n}</div>')
+            stats.append(f"Claims: {sc_claims_n}")
         if sc_degraded:
-            parts.append(f'<div class="verifier-section-label">Degraded Evidence: {sc_degraded}/{sc_claims_n}</div>')
+            stats.append(f"Degraded: {sc_degraded}")
+        cited_n = sc.get("cited_claims_extracted", 0)
+        if cited_n:
+            stats.append(f"Citations Extracted: {cited_n}")
+        s1_suspicious = sc.get("stage1_suspicious_claims", 0)
+        if s1_suspicious:
+            stats.append(f"S1 Suspicious: {s1_suspicious}")
+        if stats:
+            parts.append(f'<div class="verifier-section-label">{" · ".join(stats)}</div>')
+
+        # Citation map (collapsed)
+        if sc_citation_map:
+            _cm_id = f"sc-citmap-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Citation Map ({len(sc_citation_map)} URLs)</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_cm_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            cm_lines = []
+            for cnum, curl in sorted(sc_citation_map.items(), key=lambda x: str(x[0])):
+                cm_lines.append(f"[{_esc(str(cnum))}] {_esc(str(curl))}")
+            parts.append(f'<div id="{_cm_id}" class="verifier-detail" style="display:none">{chr(10).join(cm_lines)}</div>')
+
+        # Per-claim evidence cards
+        if sc_evidence:
+            _ev_id = f"sc-evidence-{id(sc)}"
+            parts.append(f'<div class="verifier-section-label">Per-Claim Evidence ({len(sc_evidence)} claims)</div>')
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_ev_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_ev_id}" style="display:none">')
+            for i, ev in enumerate(sc_evidence, 1):
+                report = ev.get("evidence_report", "")
+                # Classify the assessment from the evidence report
+                report_upper = report.upper()
+                if "ASSESSMENT: SUPPORTED" in report_upper or "ASSESSMENT:SUPPORTED" in report_upper:
+                    ev_cls = "supported"
+                    ev_badge = "SUPPORTED"
+                elif "ASSESSMENT: CONTRADICTED" in report_upper or "ASSESSMENT:CONTRADICTED" in report_upper:
+                    if "FABRICAT" in report_upper or "DOI DOES NOT EXIST" in report_upper:
+                        ev_cls = "fabricated"
+                        ev_badge = "FABRICATED"
+                    else:
+                        ev_cls = "contradicted"
+                        ev_badge = "CONTRADICTED"
+                elif report.startswith("(verification failed"):
+                    ev_cls = "insufficient"
+                    ev_badge = "DEGRADED"
+                else:
+                    ev_cls = "insufficient"
+                    ev_badge = "INSUFFICIENT"
+                claim_text = _esc(ev.get("claim", "")[:200])
+                source_url = ev.get("source_url", "")
+                parts.append(f'<div class="claim-evidence-card {ev_cls}">')
+                parts.append(f'<div class="claim-evidence-header">'
+                             f'<span>Claim {i}: {claim_text}</span>'
+                             f'<span class="claim-assess-badge {ev_cls}">{ev_badge}</span>'
+                             f'</div>')
+                if source_url:
+                    parts.append(f'<div class="claim-source-url">📎 {_esc(source_url)}</div>')
+                # Expandable evidence report
+                _ev_detail_id = f"sc-ev-{id(sc)}-{i}"
+                parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_ev_detail_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">evidence</span>')
+                parts.append(f'<div id="{_ev_detail_id}" class="verifier-detail" style="display:none">{_esc(report)}</div>')
+                parts.append('</div>')  # .claim-evidence-card
+            parts.append('</div>')
 
         if sc_extract:
             _sc_ext_id = f"sc-extract-{id(sc)}"
@@ -1170,7 +1620,7 @@ def _render_verification_meta(meta: dict) -> list[str]:
 
         if sc_compare:
             _sc_cmp_id = f"sc-compare-{id(sc)}"
-            parts.append(f'<div class="verifier-section-label">Claim Comparison</div>')
+            parts.append(f'<div class="verifier-section-label">Compare LLM Verdict</div>')
             parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_sc_cmp_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
             parts.append(f'<div id="{_sc_cmp_id}" class="verifier-detail" style="display:none">{_esc(sc_compare)}</div>')
 
@@ -1197,6 +1647,24 @@ def _render_verification_meta(meta: dict) -> list[str]:
                 )
 
         parts.append('</div>')  # .spotcheck-block
+
+    # ── Stage 3: Citation Audit ───────────────────────────────────
+    ca_verdict = meta.get("citation_audit_verdict", "")
+    ca_response = ""
+    if ca and isinstance(ca, dict):
+        ca_verdict = ca_verdict or ca.get("citation_audit_verdict", "")
+        ca_response = ca.get("audit_response", "")
+    if ca_verdict or ca_response:
+        ca_cls = "passed" if ca_verdict == "PASSED" else ("failed" if ca_verdict == "FAILED" else "")
+        parts.append(f'<div class="citation-audit-block {ca_cls}">')
+        ca_icon = "✅" if ca_cls == "passed" else ("❌" if ca_cls == "failed" else "📑")
+        parts.append(f'<span class="verifier-badge {ca_cls.replace("passed","approved").replace("failed","rejected")}">'
+                     f'{ca_icon} Stage 3 Citation Audit: {_esc(ca_verdict or "RAN")}</span>')
+        if ca_response:
+            _ca_id = f"ca-resp-{id(meta)}"
+            parts.append(f'<span class="spotcheck-toggle" onclick="var e=document.getElementById(\'{_ca_id}\');e.style.display=e.style.display===\'none\'?\'block\':\'none\'">show/hide</span>')
+            parts.append(f'<div id="{_ca_id}" class="verifier-detail" style="display:none">{_esc(ca_response)}</div>')
+        parts.append('</div>')
 
     return parts
 
@@ -1815,6 +2283,10 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
             prev_chain_snapshot = root_snap
 
     # Build chain analysis panel
+    # Build rubric panel (only present when RUBRIC_ENABLED ran)
+    rubric_xml = d.get("rubric") or ""
+    rubric_html = _render_rubric_panel(rubric_xml) if rubric_xml else ""
+
     chain_html = _render_chain_panel(d.get("chain_plan"))
 
     # Build final response images
@@ -1860,6 +2332,9 @@ def render_trace_html(trace_dict: dict, title: str = "Dispatch Trace") -> str:
       <div class="prompt-label">User Prompt</div>
       <div class="prompt-text">{user_input}</div>
     </div>
+
+    <!-- Rubric -->
+    {rubric_html}
 
     <!-- Chain analysis -->
     {chain_html}

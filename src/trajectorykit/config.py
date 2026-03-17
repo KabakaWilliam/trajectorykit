@@ -180,13 +180,14 @@ def _update_module_constants():
     global DATASET_CONFIG, EVAL_CONFIG
     global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT, DRAFT_FORMAT
     global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT, VERIFIER_EXTERNAL_PROMPT, VERIFIER_MODEL, VERIFIER_API_URL, VERIFIER_API_KEY, VERIFIER_TEMPERATURE
-    global VERIFIER_STAGE1_PROVIDER, VERIFIER_STAGE3_PROVIDER
+    global VERIFIER_STAGE1_PROVIDER, VERIFIER_STAGE2_PROVIDER, VERIFIER_STAGE3_PROVIDER
     global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
     global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
     global CITATION_AUDIT_ENABLED, CITATION_AUDIT_PROMPT
     global CHAIN_ANALYSIS_ENABLED, CHAIN_ANALYSIS_PROMPT
     global HISTORY_COMPACTION_ENABLED, HISTORY_COMPACTION_MSG_THRESHOLD
     global HISTORY_COMPACTION_MIN_INTERVAL, HISTORY_COMPACTION_RECENT_TURNS
+    global RUBRIC_ENABLED, RUBRIC_PROMPT, DRAFT_CRITIQUE_ENABLED, DRAFT_CRITIQUE_PROMPT
 
     c = _config
 
@@ -250,6 +251,7 @@ def _update_module_constants():
 
     # Per-stage provider: "self" = local model, "external" = verifier.model
     VERIFIER_STAGE1_PROVIDER = verifier_cfg.get("stage1_provider", "self")
+    VERIFIER_STAGE2_PROVIDER = verifier_cfg.get("stage2_provider", "self")
     VERIFIER_STAGE3_PROVIDER = verifier_cfg.get("stage3_provider", "self")
 
     # Verifier prompts
@@ -307,6 +309,20 @@ def _update_module_constants():
         CHAIN_ANALYSIS_PROMPT = _load_prompt(chain_analysis_path)
     except FileNotFoundError:
         CHAIN_ANALYSIS_PROMPT = ""
+
+    # Rubric-conditioned critique (pre-research rubric + post-draft critique)
+    RUBRIC_ENABLED = agent_cfg.get("rubric_enabled", False)
+    rubric_path = c.get("prompts", {}).get("rubric_generator", "configs/prompts/rubric_generator.txt")
+    try:
+        RUBRIC_PROMPT = _load_prompt(rubric_path) if RUBRIC_ENABLED else ""
+    except FileNotFoundError:
+        RUBRIC_PROMPT = ""
+    DRAFT_CRITIQUE_ENABLED = agent_cfg.get("draft_critique_enabled", False)
+    critique_path = c.get("prompts", {}).get("draft_critique", "configs/prompts/draft_critique.txt")
+    try:
+        DRAFT_CRITIQUE_PROMPT = _load_prompt(critique_path) if DRAFT_CRITIQUE_ENABLED else ""
+    except FileNotFoundError:
+        DRAFT_CRITIQUE_PROMPT = ""
 
     # Dataset & eval (new — used by eval.py)
     DATASET_CONFIG = c.get("dataset", {})

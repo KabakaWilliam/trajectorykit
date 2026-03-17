@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import random
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -403,7 +404,7 @@ def _focused_page_summary(
         if resp.status_code == 200:
             choices = resp.json().get("choices", [])
             if choices:
-                text = choices[0].get("message", {}).get("content", "")
+                text = choices[0].get("message", {}).get("content") or ""
                 if text and text.strip():
                     return _extract_summary_tags(text.strip())
                 return f"LLM returned empty summary. Raw page excerpt:\n{page_content[:3000]}"
@@ -538,14 +539,15 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
         v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
         if v_api_key and v_api_url != _cfg.VLLM_API_URL:
             headers["Authorization"] = f"Bearer {v_api_key}"
-        resp = requests.post(f"{v_api_url}/chat/completions", json=payload, headers=headers, timeout=60)
+        resp = requests.post(f"{v_api_url}/chat/completions", json=payload, headers=headers, timeout=360)
         if resp.status_code == 200:
             result = resp.json()
-            raw_text = (
-                result.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            ).strip()
+            msg = result.get("choices", [{}])[0].get("message", {})
+            # Reasoning models (gpt-5-*) may return content=null; fall back
+            # to reasoning_content or empty string.
+            raw_text = (msg.get("content")
+                        or msg.get("reasoning_content")
+                        or "").strip()
 
             # Parse suspicious claims flagged by the external model
             suspicious_claims = []
@@ -577,7 +579,7 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
             else:
                 if state.verbose:
                     print(f"       \u2705 Verifier: APPROVED")
-                return True, "", text, suspicious_claims
+                return True, "", raw_text, suspicious_claims
         else:
             if state.verbose:
                 err_body = ""
@@ -590,7 +592,241 @@ def _run_verification(state: AgentState, draft_content: str) -> Tuple[bool, str,
     except Exception as e:
         if state.verbose:
             print(f"       \u26a0\ufe0f  Verifier error: {e}, skipping verification")
-        return True, "", "", []
+        return True, "", f"[VERIFIER ERROR: {type(e).__name__}: {e}]", []
+
+
+def _generate_rubric(state: AgentState) -> Optional[str]:
+    """Call external model (question-only) to generate a quality rubric.
+
+    Runs once before research begins. Returns raw XML rubric string, or None
+    if rubric generation is disabled / unavailable.
+    """
+    if not getattr(_cfg, "RUBRIC_ENABLED", False) or not getattr(_cfg, "RUBRIC_PROMPT", ""):
+        return None
+    use_external = (
+        getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
+        and _cfg.VERIFIER_MODEL
+    )
+    if not use_external:
+        return None
+
+    v_model = _cfg.VERIFIER_MODEL
+    v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL)
+    v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+
+    try:
+        payload = {
+            "model": v_model,
+            "messages": [
+                {"role": "system", "content": _cfg.RUBRIC_PROMPT},
+                {"role": "user", "content": f"QUESTION:\n{state.user_input}"},
+            ],
+            "reasoning_effort": "high",
+            "max_completion_tokens": 4000,
+        }
+        headers = {"Content-Type": "application/json"}
+        if v_api_key:
+            headers["Authorization"] = f"Bearer {v_api_key}"
+        if state.verbose:
+            print(f"       \U0001f4d0 Generating research rubric via {v_model}...")
+        resp = requests.post(
+            f"{v_api_url}/chat/completions", json=payload,
+            headers=headers, timeout=120,
+        )
+        if resp.status_code == 200:
+            msg = resp.json()["choices"][0]["message"]
+            raw = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            if state.verbose:
+                print(f"       \U0001f4d0 Rubric generated ({len(raw):,} chars)")
+            return raw or None
+        else:
+            if state.verbose:
+                print(f"       \u26a0\ufe0f  Rubric API error ({resp.status_code})")
+    except Exception as e:
+        if state.verbose:
+            print(f"       \u26a0\ufe0f  Rubric generation error: {e}")
+    return None
+
+
+def _run_draft_critique(
+    state: AgentState,
+    draft_content: str,
+) -> Tuple[bool, str, str, list, dict]:
+    """Run a rubric-conditioned draft critique (replaces binary Stage-1 verifier).
+
+    Uses the external model to score the draft across RACE dimensions,
+    identify missing coverage, flag risky claims, and produce at most 3
+    targeted follow-up research tasks.
+
+    Returns (should_publish, feedback, raw_text, risky_claims_list, critique_meta).
+    critique_meta is a structured dict written into the trace metadata.
+    Saves follow-up tasks to state.critique_tasks.
+    """
+    if not getattr(_cfg, "DRAFT_CRITIQUE_ENABLED", False) or not getattr(_cfg, "DRAFT_CRITIQUE_PROMPT", ""):
+        # Fall back to legacy verifier
+        return (*_run_verification(state, draft_content), {})
+
+    use_external = (
+        getattr(_cfg, "VERIFIER_STAGE1_PROVIDER", "self") == "external"
+        and _cfg.VERIFIER_MODEL
+    )
+    if not use_external:
+        return (*_run_verification(state, draft_content), {})
+
+    if state.verification_rejections >= state.MAX_VERIFICATION_REJECTIONS:
+        if state.verbose:
+            print(f"       \u23e9 Critique: max rejections reached, force-publishing")
+        return True, "", "", [], {}
+
+    v_model = _cfg.VERIFIER_MODEL
+    v_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL)
+    v_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+
+    rubric_section = ""
+    if state.rubric:
+        rubric_section = f"\n\nRUBRIC:\n{state.rubric}"
+
+    try:
+        payload = {
+            "model": v_model,
+            "messages": [
+                {"role": "system", "content": _cfg.DRAFT_CRITIQUE_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"QUESTION:\n{state.user_input}"
+                        f"{rubric_section}\n\n"
+                        f"DRAFT:\n{draft_content}"
+                    ),
+                },
+            ],
+            "reasoning_effort": "high",
+            "max_completion_tokens": min(state.max_tokens, 100_000),
+        }
+        headers = {"Content-Type": "application/json"}
+        if v_api_key:
+            headers["Authorization"] = f"Bearer {v_api_key}"
+        if state.verbose:
+            print(f"       \U0001f50d Critique ({v_model}): evaluating draft "
+                  f"(attempt {state.verification_rejections + 1})...")
+        resp = requests.post(
+            f"{v_api_url}/chat/completions", json=payload,
+            headers=headers, timeout=300,
+        )
+        if resp.status_code != 200:
+            if state.verbose:
+                print(f"       \u26a0\ufe0f  Critique API error ({resp.status_code})")
+            return True, "", "", [], {}
+
+        msg = resp.json()["choices"][0]["message"]
+        raw_text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+
+        # ── Parse verdict ──────────────────────────────────────────────
+        verdict_xml = _extract_xml_tag(raw_text, "verdict")
+        should_publish = "PUBLISH" in verdict_xml.upper()
+
+        # ── Parse scores ───────────────────────────────────────────────
+        scores_xml = _extract_xml_tag(raw_text, "scores")
+        comp = _extract_xml_tag(scores_xml, "comprehensiveness")
+        ins = _extract_xml_tag(scores_xml, "insight")
+        instr = _extract_xml_tag(scores_xml, "instruction_following")
+        read = _extract_xml_tag(scores_xml, "readability")
+
+        # ── Parse missing coverage ─────────────────────────────────────
+        missing_xml = _extract_xml_tag(raw_text, "missing_coverage")
+        missing_items: list = []
+        for m in re.finditer(r'<item\s+checklist_id="([^"]*)"[^>]*>(.*?)</item>', missing_xml, re.DOTALL):
+            missing_items.append({
+                "checklist_id": m.group(1).strip(),
+                "description": m.group(2).strip(),
+            })
+        if not missing_items:
+            for m in re.finditer(r"<item[^>]*>(.*?)</item>", missing_xml, re.DOTALL):
+                missing_items.append({"checklist_id": "", "description": m.group(1).strip()})
+
+        # ── Parse risky claims ─────────────────────────────────────────
+        risky_claims: list = []
+        risky_xml = _extract_xml_tag(raw_text, "risky_claims")
+        risky_claims_structured: list = []
+        for m in re.finditer(r'<claim\s+severity="([^"]*)"[^>]*>(.*?)</claim>', risky_xml, re.DOTALL):
+            severity = m.group(1).strip() or "medium"
+            claim_text = m.group(2).strip()
+            risky_claims_structured.append({"severity": severity, "claim": claim_text})
+            risky_claims.append({"claim": claim_text, "category": "risky"})
+        if not risky_claims_structured:
+            for m in re.finditer(r"<claim[^>]*>(.*?)</claim>", risky_xml, re.DOTALL):
+                claim_text = m.group(1).strip()
+                risky_claims_structured.append({"severity": "medium", "claim": claim_text})
+                risky_claims.append({"claim": claim_text, "category": "risky"})
+
+        # ── Parse weak sections ────────────────────────────────────────
+        weak_xml = _extract_xml_tag(raw_text, "weak_sections")
+        weak_sections: list = []
+        for m in re.finditer(r"<section[^>]*>(.*?)</section>", weak_xml, re.DOTALL):
+            s = m.group(1).strip()
+            if s:
+                weak_sections.append(s)
+
+        # ── Parse follow-up tasks ──────────────────────────────────────
+        tasks_xml = _extract_xml_tag(raw_text, "follow_up_tasks")
+        follow_up_tasks = []
+        for m in re.finditer(r"<task[^>]*>(.*?)</task>", tasks_xml, re.DOTALL):
+            t = m.group(1).strip()
+            if t:
+                follow_up_tasks.append(t)
+        state.critique_tasks = follow_up_tasks[:3]
+
+        critique_meta = {
+            "scores": {
+                "comprehensiveness": comp,
+                "insight": ins,
+                "instruction_following": instr,
+                "readability": read,
+            },
+            "missing_coverage": missing_items,
+            "risky_claims": risky_claims_structured,
+            "weak_sections": weak_sections,
+            "follow_up_tasks": follow_up_tasks[:3],
+            "verdict": "PUBLISH" if should_publish else "REVISE",
+        }
+
+        if state.verbose:
+            score_str = f"C={comp} I={ins} IF={instr} R={read}"
+            print(f"       {'✅' if should_publish else '⚠️ '} Critique: "
+                  f"{'PUBLISH' if should_publish else 'REVISE'} "
+                  f"({score_str}, {len(follow_up_tasks)} follow-up tasks)")
+
+        if not should_publish:
+            state.verification_rejections += 1
+            # Build structured feedback for root
+            feedback_parts = [
+                f"CRITIQUE SCORES: Comprehensiveness={comp}/10, Insight={ins}/10, "
+                f"InstructionFollowing={instr}/10, Readability={read}/10",
+            ]
+            if missing_items:
+                feedback_parts.append("\nMISSING COVERAGE:")
+                for item in missing_items:
+                    cid = f"[{item['checklist_id']}] " if item['checklist_id'] else ""
+                    feedback_parts.append(f"  {cid}{item['description']}")
+            if weak_sections:
+                feedback_parts.append("\nWEAK SECTIONS:\n" + "\n".join(f"  - {s}" for s in weak_sections))
+            if risky_claims_structured:
+                feedback_parts.append("\nRISKY CLAIMS:")
+                for rc in risky_claims_structured:
+                    feedback_parts.append(f"  [{rc['severity'].upper()}] {rc['claim']}")
+            if follow_up_tasks:
+                feedback_parts.append(
+                    "\nSUGGESTED FOLLOW-UP TASKS (conduct_research on these to close gaps):\n"
+                    + "\n".join(f"  {i+1}. {t}" for i, t in enumerate(follow_up_tasks))
+                )
+            return False, "\n".join(feedback_parts), raw_text, risky_claims, critique_meta
+        else:
+            return True, "", raw_text, risky_claims, critique_meta
+
+    except Exception as e:
+        if state.verbose:
+            print(f"       \u26a0\ufe0f  Critique error: {e}, falling back to verify")
+        return (*_run_verification(state, draft_content), {})
 
 
 def _resolve_numbered_citations(draft: str) -> Tuple[str, dict]:
@@ -709,13 +945,97 @@ def _section_at_position(text: str, pos: int) -> str:
     return best
 
 
+def _select_spotcheck_claims(state: AgentState, sc_claims: list[dict]) -> list[dict]:
+    """Select a bounded, high-value subset of claims for Stage-2 verification.
+
+    Strategy (in priority order):
+      1) Core answer anchor (first extracted claim)
+            2) Stage-1 suspicious claims
+            3) One representative claim per section
+      4) Numeric/derived claims
+      5) Random fill from remaining claims
+
+    The total selected claims are capped by SPOT_CHECK_CLAIMS when that
+    config value is > 0. If SPOT_CHECK_CLAIMS <= 0, all claims are checked.
+    """
+    if not sc_claims:
+        return []
+
+    cap_cfg = int(getattr(_cfg, "SPOT_CHECK_CLAIMS", 3) or 0)
+    if cap_cfg <= 0 or len(sc_claims) <= cap_cfg:
+        return sc_claims
+
+    max_claims = cap_cfg
+
+    def _key(c: dict) -> tuple:
+        return (
+            (c.get("claim") or "").strip(),
+            (c.get("source_url") or "").strip(),
+            (c.get("section") or "").strip(),
+        )
+
+    def _is_numeric_claim(text: str) -> bool:
+        t = (text or "").lower()
+        if re.search(r"\d", t):
+            return True
+        return any(tok in t for tok in [
+            "%", "percent", "ratio", " x ", "times", "increase", "decrease",
+            "growth", "rank", "ranking", "million", "billion", "year", "yr",
+        ])
+
+    selected: list[dict] = []
+    selected_keys: set[tuple] = set()
+
+    def _add(c: dict):
+        if len(selected) >= max_claims:
+            return
+        k = _key(c)
+        if k in selected_keys:
+            return
+        selected.append(c)
+        selected_keys.add(k)
+
+    # 1) Core answer anchor: first extracted claim
+    _add(sc_claims[0])
+
+    # 2) Stage-1 suspicious claims
+    for c in sc_claims:
+        if c.get("is_suspicious"):
+            _add(c)
+
+    # 3) One representative claim per section
+    seen_sections: set[str] = set()
+    for c in sc_claims:
+        sec = (c.get("section") or "").strip().lower()
+        if sec and sec not in seen_sections:
+            seen_sections.add(sec)
+            _add(c)
+
+    # 4) Numeric/derived claims
+    for c in sc_claims:
+        if _is_numeric_claim(c.get("claim", "")):
+            _add(c)
+
+    # 5) Random fill from remaining claims
+    remaining = [c for c in sc_claims if _key(c) not in selected_keys]
+    seed = f"{state.episode.trace_id}:{state.spot_check_rejections}:{len(sc_claims)}"
+    rng = random.Random(seed)
+    rng.shuffle(remaining)
+    for c in remaining:
+        _add(c)
+
+    return selected
+
+
 def _run_spot_check(state: AgentState, draft_content: str,
                     suspicious_claims: list | None = None) -> Tuple[bool, str, str, dict]:
     """Run Stage-2 spot-check — deterministic citation verification + Stage 1 suspicious claims.
 
     Instead of LLM-mediated claim extraction (fragile, arbitrary), this
     deterministically extracts ALL cited claims via _extract_citation_pairs()
-    and merges any suspicious claims flagged by the external Stage 1 verifier.
+    and merges any suspicious claims flagged by Stage 1. Before expensive
+    per-claim verification, claims are prioritized and sampled using
+    SPOT_CHECK_CLAIMS as a cap.
 
     Returns (should_publish, feedback, raw_text, metadata_dict).
     """
@@ -748,31 +1068,41 @@ def _run_spot_check(state: AgentState, draft_content: str,
                 "search_query": clean_fact[:200],
                 "source_url": pair["url"],
                 "section": section,
+                "is_suspicious": False,
             })
 
         # ── Step 2: Add Stage 1 suspicious claims ────────────────────
         if suspicious_claims:
             for sc in suspicious_claims:
                 claim_text = sc.get("claim", "")
-                if claim_text and not any(c["claim"] == claim_text for c in sc_claims):
+                if claim_text:
+                    existing = next((c for c in sc_claims if c.get("claim") == claim_text), None)
+                    if existing is not None:
+                        existing["is_suspicious"] = True
+                        continue
                     sc_claims.append({
                         "claim": claim_text,
                         "search_query": claim_text[:200],
                         "source_url": "",
                         "section": "",
+                        "is_suspicious": True,
                     })
 
         meta["cited_claims_extracted"] = len(pairs)
         meta["stage1_suspicious_claims"] = len(suspicious_claims or [])
         meta["total_claims"] = len(sc_claims)
+        selected_claims = _select_spotcheck_claims(state, sc_claims)
+        meta["selected_claims"] = len(selected_claims)
+        meta["sampled_claims"] = len(selected_claims) < len(sc_claims)
+        meta["selection_strategy"] = "anchor+suspicious+section+numeric+random"
 
         if state.verbose:
             print(f"       \U0001f50e Spot-check: {len(pairs)} cited claim(s) + "
                   f"{len(suspicious_claims or [])} suspicious \u2192 "
-                  f"{len(sc_claims)} total to verify")
+                  f"{len(sc_claims)} total, checking {len(selected_claims)}")
 
-        if sc_claims:
-            return _spot_check_claims(state, draft_content, sc_claims, meta)
+        if selected_claims:
+            return _spot_check_claims(state, draft_content, selected_claims, meta)
 
         # No checkable claims — check if it's a refusal
         return _spot_check_refusal(state, draft_content, meta)
@@ -896,7 +1226,7 @@ def _spot_check_claims(
             "snapshot (e.g. 'Guardian 2024 rankings', '2020 Census'), verify against THAT "
             "exact version — not a different year's edition. If you can only find a different "
             "version, note the mismatch explicitly in your assessment.\n"
-            "8. ACCESS FAILURES: If you cannot access a source (paywall, 403/404, login-wall, "
+            "8. ACCESS FAILURES: If you cannot access a source (paywall, 403, login-wall, "
             "rate-limit, geo-block, API auth error):\n"
             "   a) ALWAYS try the original URL first — paywalls aren't always enforced and "
             "APIs sometimes allow limited unauthenticated access\n"
@@ -908,6 +1238,21 @@ def _spot_check_claims(
             "   e) If you get partial access (e.g. abstract-only for a paper), report what you "
             "CAN see and note it is partial\n"
             "   f) If no alternative works, report INSUFFICIENT with the access failure details\n"
+            "9. CITATION EXISTENCE CHECK (CRITICAL):\n"
+            "   a) If the cited URL is a DOI (doi.org) and returns 404, the DOI does NOT EXIST.\n"
+            "      DOIs are permanent identifiers — a 404 from doi.org means the citation is \n"
+            "      FABRICATED. Report: 'ASSESSMENT: CONTRADICTED — DOI does not exist (HTTP 404). "
+            "      Citation appears fabricated.'\n"
+            "   b) If the DOI resolves but the PAPER TITLE on the landing page does NOT match \n"
+            "      the title claimed in the draft, the citation is MISATTRIBUTED. Report: \n"
+            "      'ASSESSMENT: CONTRADICTED — DOI exists but points to [actual title], not \n"
+            "      [claimed title]. Citation is misattributed.'\n"
+            "   c) If ANY cited URL returns 404 (not just DOIs), note this explicitly. A regular \n"
+            "      URL 404 may mean the page was moved, so search for the title/content elsewhere \n"
+            "      before concluding fabrication. But if the page cannot be found anywhere, report \n"
+            "      INSUFFICIENT with the 404 details.\n"
+            "   d) NEVER assume a 404 DOI is just an 'access issue' — it is fundamentally \n"
+            "      different from a paywall (403) or rate limit (429).\n"
             "\nIn your final_answer, report:\n"
             "  • SOURCES CHECKED: [url] — [what it says about the claim]\n"
             "  • ASSESSMENT: SUPPORTED / CONTRADICTED / INSUFFICIENT\n"
@@ -1027,21 +1372,38 @@ def _spot_check_claims(
 
     meta["claims_checked"] = len(sc_evidence)
 
-    # Short-circuit: if >50% degraded evidence, auto-PASS.
-    # A claim is degraded if the sub-agent failed or returned very little.
+    # Short-circuit: if >50% degraded evidence AND none of the
+    # degradation is caused by dead citation URLs (404 on the
+    # cited source itself), auto-PASS. If cited URLs are dead,
+    # that is itself evidence of fabricated citations — let the
+    # compare LLM evaluate rather than silently passing.
     if sc_evidence:
-        degraded = sum(
-            1 for ev in sc_evidence
-            if ev.get("evidence_report", "").startswith("(verification failed")
-            or len(ev.get("evidence_report", "").strip()) < 100
-        )
-        if degraded > len(sc_evidence) / 2:
+        degraded = 0
+        dead_citations = 0
+        for ev in sc_evidence:
+            report = ev.get("evidence_report", "").strip()
+            if report.startswith("(verification failed"):
+                degraded += 1
+            elif len(report) < 100:
+                degraded += 1
+            # Check if the evidence mentions dead citation URLs
+            report_upper = report.upper()
+            if ("DOI DOES NOT EXIST" in report_upper
+                    or "CITATION APPEARS FABRICATED" in report_upper
+                    or "CITATION IS MISATTRIBUTED" in report_upper
+                    or ("404" in report and ev.get("source_url", ""))):
+                dead_citations += 1
+        # Only auto-PASS if degradation is from infrastructure issues
+        # (agent failures, thin reports), NOT from dead citations.
+        if degraded > len(sc_evidence) / 2 and dead_citations == 0:
             meta["spot_check_verdict"] = "PASSED"
             meta["spot_check_skipped_reason"] = "insufficient_evidence"
             meta["degraded_claims"] = degraded
             if state.verbose:
                 print(f"       \u23e9 Spot-check: {degraded}/{len(sc_evidence)} claims have degraded evidence, auto-PASS")
             return True, "", "", meta
+        if dead_citations and state.verbose:
+            print(f"       \u26a0\ufe0f  Spot-check: {dead_citations} dead/fabricated citation(s) detected, proceeding to compare")
 
     if not sc_evidence or "spot_check_skipped_reason" in meta:
         return True, "", "", meta
@@ -1054,6 +1416,17 @@ def _spot_check_claims(
     sc_evidence.sort(key=lambda ev: (
         _claim_texts.index(ev["claim"]) if ev["claim"] in _claim_texts else 999
     ))
+
+    # Store per-claim evidence in meta for trace visualization
+    meta["claim_evidence"] = [
+        {
+            "claim": ev.get("claim", ""),
+            "source_url": ev.get("source_url", ""),
+            "section": ev.get("section", ""),
+            "evidence_report": ev.get("evidence_report", ""),
+        }
+        for ev in sc_evidence
+    ]
 
     has_chain = any(ev.get("depends_on") is not None for ev in sc_evidence)
     evidence_parts = []
@@ -1102,21 +1475,43 @@ def _spot_check_claims(
             f"{chain_note}"
         )},
     ]
+    # Route through external verifier when configured for Stage 2
+    use_external_s2 = (
+        getattr(_cfg, "VERIFIER_STAGE2_PROVIDER", "self") == "external"
+        and _cfg.VERIFIER_MODEL
+    )
+    s2_model = _cfg.VERIFIER_MODEL if use_external_s2 else state.model
+    s2_api_url = (_cfg.VERIFIER_API_URL or _cfg.VLLM_API_URL) if use_external_s2 else _cfg.VLLM_API_URL
+    s2_temp = (_cfg.VERIFIER_TEMPERATURE if _cfg.VERIFIER_TEMPERATURE is not None else state.temperature) if use_external_s2 else state.temperature
+    s2_headers = {"Content-Type": "application/json"}
+    if use_external_s2:
+        s2_api_key = getattr(_cfg, "VERIFIER_API_KEY", "") or ""
+        if s2_api_key:
+            s2_headers["Authorization"] = f"Bearer {s2_api_key}"
+        if state.verbose:
+            print(f"       📑 Spot-check compare: using external model ({s2_model})")
+
+    s2_payload = {
+        "model": s2_model,
+        "messages": compare_msgs,
+        "temperature": s2_temp,
+        "reasoning_effort": "high",
+    }
+    if use_external_s2:
+        s2_payload["max_completion_tokens"] = min(state.max_tokens, 100_000)
+    else:
+        s2_payload["max_tokens"] = state.max_tokens
+
     compare_resp = requests.post(
-        f"{_cfg.VLLM_API_URL}/chat/completions",
-        json={
-            "model": state.model,
-            "messages": compare_msgs,
-            "temperature": state.temperature,
-            "max_tokens": state.max_tokens,
-            "reasoning_effort": "high",
-        },
+        f"{s2_api_url}/chat/completions",
+        json=s2_payload,
+        headers=s2_headers,
     )
     if compare_resp.status_code == 200:
-        compare_raw = (
-            compare_resp.json().get("choices", [{}])[0]
-            .get("message", {}).get("content", "")
-        ).strip()
+        _cmp_msg = compare_resp.json().get("choices", [{}])[0].get("message", {})
+        compare_raw = (_cmp_msg.get("content")
+                       or _cmp_msg.get("reasoning_content")
+                       or "").strip()
         meta["compare_response"] = compare_raw
         compare_text = _extract_xml_tag(compare_raw, "verdict")
         clean = compare_text.replace("*", "").upper()
@@ -1310,10 +1705,10 @@ def _spot_check_refusal(state: AgentState, draft_content: str, meta: dict) -> Tu
             },
         )
         if rc_resp.status_code == 200:
-            rc_raw = (
-                rc_resp.json().get("choices", [{}])[0]
-                .get("message", {}).get("content", "")
-            ).strip()
+            _rc_msg = rc_resp.json().get("choices", [{}])[0].get("message", {})
+            rc_raw = (_rc_msg.get("content")
+                      or _rc_msg.get("reasoning_content")
+                      or "").strip()
             meta["refusal_challenge_response"] = rc_raw
             rc_text = _extract_xml_tag(rc_raw, "verdict")
             rc_clean = rc_text.replace("*", "").upper()
@@ -1525,10 +1920,10 @@ def _run_citation_audit(
             timeout=90,
         )
         if audit_resp.status_code == 200:
-            audit_raw = (
-                audit_resp.json().get("choices", [{}])[0]
-                .get("message", {}).get("content", "")
-            ).strip()
+            _aud_msg = audit_resp.json().get("choices", [{}])[0].get("message", {})
+            audit_raw = (_aud_msg.get("content")
+                         or _aud_msg.get("reasoning_content")
+                         or "").strip()
             meta["audit_response"] = audit_raw
             audit_verdict_text = _extract_xml_tag(audit_raw, "audit")
             clean = audit_verdict_text.replace("*", "").upper()
@@ -1677,8 +2072,11 @@ def handle_research_complete(
             print(f"       \u26a0\ufe0f  Format check failed: {format_issues}")
         return _CONTINUE
 
-    # ── Stage 1: LLM verification ────────────────────────────────────
-    should_publish, verify_feedback, verify_text_raw, suspicious_claims = _run_verification(state, draft_content)
+    # ── Stage 1: LLM verification (or rubric-conditioned critique) ──────
+    should_publish, verify_feedback, verify_text_raw, suspicious_claims, critique_meta = _run_draft_critique(state, draft_content)
+    # Preserve Stage 1's own verdict/response before later stages can overwrite
+    stage1_passed = should_publish
+    stage1_response = verify_text_raw
 
     # ── Stage 2: Spot-check (deterministic citation verification + suspicious claims) ──
     spot_check_meta: dict = {}
@@ -1709,6 +2107,11 @@ def handle_research_complete(
             verify_meta["verification_verdict"] = "APPROVED"
             verify_meta["verification_response"] = verify_text_raw
         verify_meta["verification_attempt"] = state.verification_rejections + 1
+        # Per-stage verdicts for trace visualization
+        verify_meta["stage1_verdict"] = "APPROVED" if stage1_passed else "REVISION_NEEDED"
+        verify_meta["stage1_response"] = stage1_response
+        if critique_meta:
+            verify_meta["critique"] = critique_meta
         if spot_check_meta:
             verify_meta["spot_check"] = spot_check_meta
         if citation_audit_meta:
@@ -1759,7 +2162,12 @@ def handle_research_complete(
             "verification_response": verify_text_raw or verify_feedback,
             "verification_attempt": state.verification_rejections,
             "spot_check_attempt": state.spot_check_rejections,
+            # Per-stage verdicts for trace visualization
+            "stage1_verdict": "APPROVED" if stage1_passed else "REVISION_NEEDED",
+            "stage1_response": stage1_response,
         }
+        if critique_meta:
+            reject_meta["critique"] = critique_meta
         if spot_check_meta:
             reject_meta["spot_check"] = spot_check_meta
         if citation_audit_meta:
@@ -2093,6 +2501,16 @@ def handle_conduct_research(
             tool_name="conduct_research", turn=state.turn,
             content=output, description=desc,
         )
+        # ── Research log entry ────────────────────────────────────────
+        _task_snip = str(tool_args.get("task", ""))[:120]
+        _finding_snip = output.strip()[:200]
+        state.research_log.append({
+            "turn": state.turn, "tool": "conduct_research",
+            "task": _task_snip, "finding": _finding_snip,
+            "mem_key": mem_key,
+        })
+        if len(state.research_log) > 20:
+            state.research_log = state.research_log[-20:]
         if state.plan is not None:
             state.plan.record_tool_call(
                 tool_name="conduct_research", tool_args=tool_args,
@@ -2203,6 +2621,17 @@ def handle_summarize_webpage(
             tool_name="summarize_webpage", turn=state.turn,
             content=sw_output, description=sw_desc,
         )
+        # ── Research log entry ────────────────────────────────────────
+        _sw_task = f"summarize {sw_url[:80]}"
+        if sw_focus:
+            _sw_task += f" (focus: {sw_focus[:40]})"
+        state.research_log.append({
+            "turn": state.turn, "tool": "summarize_webpage",
+            "task": _sw_task[:120], "finding": sw_output.strip()[:200],
+            "mem_key": mem_key,
+        })
+        if len(state.research_log) > 20:
+            state.research_log = state.research_log[-20:]
         if state.plan is not None:
             state.plan.record_tool_call(
                 tool_name="summarize_webpage", tool_args=tool_args,
