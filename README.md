@@ -90,8 +90,8 @@ The framework supports different reasoning effort levels. Here's how reasoning e
 
 | Reasoning Effort | Comprehensiveness | Insight | Instruction Following | Readability | Overall |
 |------------------|-------------------|---------|----------------------|-------------|---------|
-| LOW | 0.5199 | 0.5636 | 0.5223 | 0.5247 | **0.5360** |
-| MEDIUM | 0.5183 | 0.5645 | 0.5239 | 0.5237 | **0.5361** |
+| LOW | 0.5199 | 0.5636 | 0.5223 | 0.5247 | 0.5360 |
+| MEDIUM | 0.5183 | 0.5645 | 0.5239 | 0.5237 | 0.5361 |
 | HIGH | 0.5260 | 0.5701 | 0.5260 | 0.5247 | **0.5407** |
 
 
