@@ -1,6 +1,6 @@
 # 🤖 TrajectoryKit
 
-> A local-first agentic framework for running LLM agents with recursive sub-agents, sandboxed code execution, and full execution tracing — all from a single YAML config.
+> A **minimal deep research agent harness** for running LLM agents with recursive sub-agents, sandboxed code execution, and full execution tracing — all from a single YAML config. Built on GPT-OSS-20B with GPT-5.4 as an optional refinement layer.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
@@ -11,6 +11,7 @@
 
 Most agent frameworks are cloud-first and opaque. TrajectoryKit is designed for researchers who want full control:
 
+- **Minimal-model design.** Achieve PhD-level research quality with an open-weight 20B model (GPT-OSS-20B). Use GPT-5.4 only as an optional post-processing refinement layer, not the primary research engine. This approach cuts inference costs while maintaining competitive quality across 22 research domains.
 - **One config, one command.** Write a single YAML file that specifies your model, GPU devices, vLLM configuration, sandbox, dataset, and optional judge. Then just run `orchestrate.py` — it handles everything: pulling container images, launching services, running evaluation, and grading output.
 - **Recursive delegation that actually works.** Sub-agents run in isolated contexts with their own tools and traces, so they never pollute the parent's memory. Each one maintains its own research trajectory.
 - **Memory that doesn't blow up your context window.** Tool outputs get stored externally and accessed on-demand via code execution, which is way more efficient than dumping everything into attention. The LLM can write programs to search its own research history.
@@ -69,235 +70,109 @@ result["trace"].save()  # Saves to traces/trace_YYYYMMDD_HHMMSS_uuid.json + .htm
 
 ---
 
-## Architecture
+## 🏆 Evaluation Results
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  orchestrate.py                                          │
-│  Reads YAML → starts Apptainer sandbox → starts vLLM    │
-│  → runs eval → runs LLM judge / RACE scorer             │
-└──────────────┬───────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────┐
-│  agent.py → agent_state.py → runner.py → nodes.py       │
-│                                                          │
-│  agent.py:       dispatch() entry, config_path reload,   │
-│                  pre-dispatch chain analysis (chain.py)   │
-│  agent_state.py: AgentState dataclass + create_state()   │
-│  runner.py:      turn loop, 5 cycle gates, plan inject,  │
-│                  history compaction, synthesis pipeline   │
-│  nodes.py:       tool handlers, 4-stage verification     │
-│  plan.py:        ResearchPlan + PlanTask tracking         │
-│  config.py:      YAML loader, prompt loader, 30+ keys    │
-│                                                          │
-│  Depth 0 (root):  orchestrator prompt, root tools        │
-│  Depth 1+ (sub):  worker prompt, worker tools            │
-│  Synthesis:       synthesizer prompt, code + final_answer│
-└──────────────┬───────────────────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────────────────────────────────┐
-│  tool_store.py  (4,200+ lines)                           │
-│                                                          │
-│  ROOT TOOLS (orchestrator only):                         │
-│  conduct_research  Delegate task → sub-agent             │
-│  refine_draft      Write/replace the full draft report   │
-│  read_draft        Read previous draft versions/feedback │
-│  research_complete Publish draft (triggers verification) │
-│  summarize_webpage Fetch URL + LLM-focused summary       │
-│  think             Reasoning scratchpad                  │
-│                                                          │
-│  WORKER TOOLS (sub-agents):                              │
-│  search_web        Serper → Exa → DuckDuckGo fallback   │
-│  fetch_url         Direct → Jina → Exa → Wayback chain  │
-│  read_page         Paginate cached page text (no I/O)    │
-│  extract_tables    HTML tables → structured JSON         │
-│  read_pdf          PDF download + text extraction        │
-│  wikipedia_lookup  MediaWiki API → article/section/info  │
-│  fetch_cached      Wayback Machine archived pages        │
-│  execute_code      Sandboxed execution via Apptainer     │
-│  recall_memory     Retrieve stored tool outputs by key   │
-│  spawn_agent       Recursive sub-agent (fresh context)   │
-│  final_answer      Terminates the agent loop             │
-│  think             Reasoning scratchpad                  │
-│  search_available_tools  Self-introspection              │
-└──────────────────────────────────────────────────────────┘
+TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.com/Ayanami0730/deep_research_bench)**, a benchmark with 100 PhD-level research tasks across 22 domains. The primary research engine uses **GPT-OSS-20B** (open-weight, locally deployed), with optional GPT-5.4 refinement:
+
+| Metric | Baseline (GPT-OSS-20B) | With Rewrite (+GPT4.5 refiner) | Improvement |
+|--------|----------|--------------|-------------|
+| Comprehensiveness | 0.4548 | **0.5260** | +15.7% |
+| Insight/Depth | 0.4397 | **0.5701** | **+29.7%** ⭐ |
+| Instruction Following | 0.5071 | **0.5260** | +3.7% |
+| Readability | 0.4899 | **0.5247** | +7.1% |
+| **Overall Score** | 0.4696 | **0.5407** | **+15.1%** |
+
+**Key insight:** The baseline (GPT-OSS-20B alone) reaches 0.4696 on Deep Research Bench before any rewrite step, showing that much of the performance comes from the harness rather than a large multi-model stack.
+
+### Impact of Reasoning Effort
+
+The framework supports different reasoning effort levels. Here's how reasoning effort affects performance on Deep Research Bench:
+
+| Reasoning Effort | Comprehensiveness | Insight | Instruction Following | Readability | Overall |
+|------------------|-------------------|---------|----------------------|-------------|---------|
+| LOW | 0.5199 | 0.5636 | 0.5223 | 0.5247 | **0.5360** |
+| MEDIUM | 0.5183 | 0.5645 | 0.5239 | 0.5237 | **0.5361** |
+| HIGH | 0.5260 | 0.5701 | 0.5260 | 0.5247 | **0.5407** |
+
+
+---
+
+## Agent Overview
+
+### Complete Workflow
+
+```mermaid
+flowchart LR
+    A["🧑 User Query"] --> B["📋 Config YAML"]
+    B --> C["🚀 orchestrate.py"]
+    C --> D["🧠 Agent Loop"]
+    D --> E["🔍 Research"]
+    E --> F["📝 Draft"]
+    F --> G["✅ Verification"]
+    G -->|Fail| E
+    G -->|Pass| H["📊 Results"]
+    H --> I["📈 Evaluation"]
+    I --> J["🏆 Score"]
 ```
 
-### Agent Flow
+### Overall Harness
 
-Here's the full journey from your question to a verified answer:
+TrajectoryKit separates planning, research, drafting, and verification into distinct stages. The root orchestrator can recursively delegate research to fresh-context worker agents, then consolidate their findings into a draft before publishing only after verification passes.
 
+```mermaid
+flowchart TD
+    A[User question] --> B[Chain analysis + rubric generation]
+    B --> C[Root orchestrator]
+    C --> D[Research loop]
+    D --> E[Draft report]
+    E --> F[Verification pipeline]
+    F -->|pass| G[Published answer]
+    F -->|fail with feedback| D
+    D --> H[Worker sub-agent]
+    H --> I[Search, fetch, PDFs, code, memory]
+    I --> H
+    H --> D
+    G --> J[Trace saved as JSON + HTML]
 ```
-                        User Question
-                             │
-                             ▼
-              ┌──────────────────────────────┐
-              │     ⛓ CHAIN ANALYSIS         │
-              │     (pre-dispatch, root only) │
-              │     [External/Local]          │
-              │  (e.g. GPT-5.4, Claude)      │
-              │                              │
-              │  LLM detects causal chains:  │
-              │    Step 1: find X → {step_1} │
-              │    Step 2: Y of {step_1}     │
-              │         → {step_2}           │
-              │    Step 3: Z of {step_2}     │
-              │         → final answer       │
-              │                              │
-              │  → ChainPlan on state        │
-              │  → Seeds ResearchPlan        │
-              └──────────┬───────────────────┘
-                         │
-                         ▼
-     ┌───────────────────────────────────────────────┐
-     │            🔄 RESEARCH LOOP                   │
-     │            (runner.py)                         │
-     │     [External/Local] ↔ Interchangeable        │
-     │                                               │
-     │  ┌─────────────────────────────────────────┐  │
-     │  │ Each turn:                              │  │
-     │  │   LLM → tool calls → execute → results │  │
-     │  │   [External/Local model routes here]   │  │
-     │  │         ▲                     │         │  │
-     │  │         └─────────────────────┘         │  │
-     │  └─────────────────────────────────────────┘  │
-     │                                               │
-     │  Cycle enforcement (5 gates):                 │
-     │    G1: can't publish without a draft          │
-     │    G2: can't re-publish without revising      │
-     │    G3: can't draft without researching         │
-     │        (1 round for QA, 2 for report mode)    │
-     │    G4: must follow plan when active            │
-     │    G5: report mode — must research after first │
-     │        draft before publishing                │
-     │                                               │
-     │  History compaction:                          │
-     │    • Evicts old messages when threshold hit   │
-     │    • Preserves system prompt + recent turns   │
-     │    • Configurable threshold/interval/window   │
-     │                                               │
-     │  Chain enforcement:                           │
-     │    • Chain plan injected at turns 0–2         │
-     │    • Tasks with unresolved placeholders       │
-     │      are hard-blocked                         │
-     │    • Sub-agent results matched to chain       │
-     │      steps → placeholders resolved            │
-     │                                               │
-     │  ┌─────────────────────────────────────────┐  │
-     │  │ Sub-agents (depth 1+)                   │  │
-     │  │  • Fresh context, worker prompt         │  │
-     │  │  • Full tools: search, fetch, read_pdf, │  │
-     │  │    wikipedia, extract_tables, code,     │  │
-     │  │    read_page, recall_memory             │  │
-     │  │  • Return findings via final_answer     │  │
-     │  │  • [External/Local] at root             │  │
-     │  │    (local recommended to minimize cost) │  │
-     │  └─────────────────────────────────────────┘  │
-     │                                               │
-     │  Root tools: conduct_research, refine_draft,  │
-     │    read_draft, think, summarize_webpage,       │
-     │    research_complete                           │
-     └──────────────────┬────────────────────────────┘
-                        │
-               research_complete()
-                        │
-                        ▼
-     ┌───────────────────────────────────────────────┐
-     │       🛡️ VERIFICATION PIPELINE (4 stages)     │
-     │                                               │
-     │  Stage 0 ── Format Gate                       │
-     │  │  Report mode: ## Executive Summary +       │
-     │  │    ## Sources                              │
-     │  │  QA mode: **Final Answer:** + **Sources:** │
-     │  │  Fail → back to research loop              │
-     │  ▼                                            │
-     │  Stage 1 ── Verifier LLM                      │
-     │  │  [External/Local] ↔ Interchangeable       │
-     │  │  9 criteria: adequacy (hard-stop),         │
-     │  │  language, depth, insight, comprehensiveness│
-     │  │  section quality, citations, coherence,    │
-     │  │  conflicts, gaps                           │
-     │  │  Fail → back to loop with feedback         │
-     │  ▼                                            │
-     │  Stage 2 ── Spot-Check (sub-agent powered)    │
-     │                                               │
-     │  ┌─────────────────────────────────────────┐  │
-     │  │ Step 1: EXTRACT                         │  │
-     │  │  [External/Local] ↔ Interchangeable     │  │
-     │  │  LLM extracts checkable claims from     │  │
-     │  │  draft. Chain plan injected as hint.     │  │
-     │  │  Claim #1 = core answer (mandatory).    │  │
-     │  └────────────────┬────────────────────────┘  │
-     │                   ▼                           │
-     │  ┌─────────────────────────────────────────┐  │
-     │  │ Step 2: VERIFY (parallel sub-agents)    │  │
-     │  │  ** Sub-agents: Local models only **    │  │
-     │  │  (spawned at root, separate context)    │  │
-     │  │                                         │  │
-     │  │  Each claim → 1 verification sub-agent  │  │
-     │  │  (3 turns, fresh context, full tools)   │  │
-     │  │                                         │  │
-     │  │  The sub-agent can:                     │  │
-     │  │    • Search the web                     │  │
-     │  │    • Fetch & read cited source URLs     │  │
-     │  │    • Open PDFs, gov sites, .edu pages   │  │
-     │  │    • Use wikipedia_lookup               │  │
-     │  │    • Think & try different queries       │  │
-     │  │    • Report: sources, assessment,       │  │
-     │  │      corrections                        │  │
-     │  │                                         │  │
-     │  │  Up to 4 sub-agents run in parallel     │  │
-     │  └────────────────┬────────────────────────┘  │
-     │                   ▼                           │
-     │  ┌─────────────────────────────────────────┐  │
-     │  │ Step 3: COMPARE (LLM judge)             │  │
-     │  │  [External/Local] ↔ Interchangeable     │  │
-     │  │  Claims + sub-agent evidence reports    │  │
-     │  │  → 4-point core answer check            │  │
-     │  │  → Chain coherence verification         │  │
-     │  │  → SPOT_CHECK_PASSED / FAILED           │  │
-     │  └─────────────────────────────────────────┘  │
-     │                                               │
-     │  Refusal path:                                │
-     │    No claims → refusal detected →             │
-     │    sub-agent investigates independently →      │
-     │    REFUSAL_JUSTIFIED / REFUSAL_CHALLENGED     │
-     │                                               │
-     │  Stage 3 ── Citation Audit                    │
-     │  │  [External/Local] ↔ Interchangeable       │
-     │  │  Extracts [N]→URL pairs from Sources       │
-     │  │  Fetches each cited URL (cache-first)      │
-     │  │  LLM judges: does cited URL support the    │
-     │  │    specific claim attributed to it?         │
-     │  │  ≥3 UNSUPPORTED citations → FAIL           │
-     │  ▼                                            │
-     │  Post-processing:                             │
-     │    Linkification: [N] → [[N]](url)            │
-     │                                               │
-     │  Fail → back to research loop with feedback   │
-     │  Pass → publish                               │
-     └──────────────────┬────────────────────────────┘
-                        │
-                        ▼
-              ┌──────────────────────────────┐
-              │     ✅ PUBLISHED ANSWER      │
-              │                              │
-              │  Final response returned     │
-              │  Trace: JSON + HTML          │
-              │  Chain panel shows step      │
-              │  resolution in HTML viewer   │
-              └──────────────────────────────┘
+
+#### Recursive Delegation
+```mermaid
+flowchart LR
+    A[Root agent] --> B[conduct_research]
+    B --> C[Worker 1<br/>fresh context]
+    B --> D[Worker 2<br/>fresh context]
+    C --> E[Web / PDF / code tools]
+    D --> F[Web / memory / code tools]
+    E --> C
+    F --> D
+    C --> G[Findings]
+    D --> G
+    G --> H[Root updates draft]
 ```
+
+#### Verification Pipeline
+```mermaid
+flowchart TD
+    A["research_complete()"] --> B[Stage 0: Format gate]
+    B -->|fail| R[Return to research loop]
+    B -->|pass| C[Stage 1: Quality audit]
+    C -->|fail| R
+    C -->|pass| D[Stage 2: Spot-check verification]
+    D -->|fail| R
+    D -->|pass| E[Stage 3: Citation audit]
+    E -->|fail| R
+    E -->|pass| F[Publish]
+```
+
+**Deep Research Bench Configuration Note:** The diagram above reflects the production setup for evaluating on Deep Research Bench. Chain analysis and rubric generation use GPT-5.4 (external) to design high-quality evaluation criteria before research begins. The research loop itself runs on gpt-oss-20b (local) for efficiency. Quality auditing (Stage 1) uses GPT-5.4 (external) with the rubric to guide depth assessment, while spot-check verification and citation audit use local models to minimize cost at scale.
 
 ### Key design decisions
 
 | Concern | Approach |
 |---------|----------|
-| Model flexibility | You can swap between cloud models (GPT-5.4, Claude) and local ones freely — most LLM steps accept either as drop-in replacements. Research loops, chain analysis, and verification stages 1 and 3 all support both. The only exception: verification sub-agents (spawned at root) run on local models to keep costs down. Just configure `model.name` and `model.api_url` in your YAML. |
+| Model flexibility | In bench mode (Deep Research), specific models are assigned: chain analysis and rubric generation use external GPT-5.4, research loop uses local gpt-oss-20b, Stage 1 quality audit uses external GPT-5.4, and Stages 2–3 use local models. In general mode, most LLM steps accept either external or local as drop-in replacements via `verifier.stage1_provider` and `verifier.stage2_provider` config. Configure via `model.name`, `model.api_url`, and verifier block. |
 | Causal chains | Before dispatch, the LLM reads your question and detects multi-step dependencies. We build a `ChainPlan` that enforces sequential execution — if a step depends on an earlier result, we block it until that result exists. |
-| Verification | Four-stage pipeline that runs after the agent publishes. First, we validate the format. Next, a verifier LLM checks for depth and insight. Then, parallel sub-agents spot-check claims by actually searching and reading sources. Finally, we audit the citations to make sure each quoted URL actually supports the claim. |
+| Verification | Five-stage pipeline (rubric generation + 4-stage verification): First, create a rubric defining sub-questions, coverage checklist, source requirements, hallucination traps, and insight bar. Then after publishing: format gate → Stage 1 quality audit (8 criteria: adequacy, language consistency, depth, comprehensiveness, section quality, citations, coherence, conflicts/gaps) → Stage 2 spot-check (extract claims with external model, verify with local sub-agents in parallel, compare with local judge) → Stage 3 citation audit (verify URLs support claims). Fail paths loop back with rubric feedback. |
 | Cycle prevention | Five safety gates prevent infinite loops: can't publish without a draft, can't republish without revising, can't draft without researching, must follow the plan once it's active, and in report mode can't publish without a second research phase after the first draft. |
 | Context management | When the conversation gets long, we automatically trim old messages but keep the system prompt and recent turns. Tool outputs get stashed in an external `MemoryStore`, and synthesis sub-agents can query them by running code. No context is ever wasted. |
 | Search resilience | Three-tier fallback for search: try Serper first, then Exa.ai if Serper fails (better for neural queries), then DuckDuckGo as the last resort. Each tier handles credit exhaustion, auth failures, and rate limits gracefully. |
@@ -371,6 +246,66 @@ The orchestrator does the heavy lifting:
 6. Leaves services running so you can iterate
 
 Results are saved to `data/` as parquet files with per-item and aggregate metrics.
+
+---
+
+## Running Evaluations
+
+### Quick Start: One Command
+
+```bash
+# End-to-end: services → eval → judge → scoring
+python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
+```
+
+### Available Benchmark Configurations
+
+| Benchmark | Config | Model | Dataset |
+|-----------|--------|-------|---------|
+| **DeepSearchQA** | `gpt_oss_deepsearchqa.yaml` | GPT-OSS-20B | Google DeepSearchQA (~100 samples) |
+| **Deep Research Bench** | `gpt_oss_deep_research_bench.yaml` | GPT-OSS-20B | Deep Research Bench (100 PhD-level tasks, 22 domains) |
+| **Alternative: Qwen** | `qwen3_deepsearchqa.yaml` | Qwen3-8B | Google DeepSearchQA |
+
+**Model Flexibility:** All configs default to minimal-model approaches (20B or 8B open-weight). You can swap in heavier models (e.g., GPT-4.5, Claude-3) by modifying the `model.name` and `model.api_url` fields in any config.
+
+<p align="center">
+  <strong>Get results in minutes:</strong> Choose a config above and run <code>python orchestrate.py --config ...</code>
+</p>
+
+### Evaluation Pipeline
+
+```mermaid
+flowchart TD
+    A["📊 Config"] --> B["🎯 Start Services"]
+    B --> C["🧪 Run Evaluation"]
+    C --> D["💾 Save Traces"]
+    D --> E["🏛️ Run Judge"]
+    E --> F["📈 Aggregate Metrics"]
+    F --> G["✅ Results Ready"]
+    G --> H["data/results.parquet"]
+    G --> I["results_judge_ratings.json"]
+```
+
+### Standalone Usage
+
+For more control, run evaluation components separately:
+
+```bash
+# Just eval (no judge)
+python evals/eval.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
+
+# Just judge (on existing results)
+python evals/llm_judge.py --results data/google_deepsearchqa/gpt_oss_20b/results.parquet
+
+# Recover parquet from trace JSONs (if eval crashed mid-run)
+python evals/recover_parquet.py
+```
+
+### Evaluation Output
+
+- `results.parquet` — Per-item metrics, token counts, latency
+- `results_judge_ratings.json` — Judge scores with per-metric breakdowns
+- `traces/` — Full JSON + HTML traces for each query
 
 ---
 
@@ -534,107 +469,6 @@ The HTML viewer is fully interactive: collapse and expand turns, view reasoning 
 
 ---
 
-## 🏆 Deep Research Bench Evaluation
-
-TrajectoryKit is evaluated on **[Deep Research Bench](deep_research_bench/README.md)**, a comprehensive benchmark with 100 PhD-level research tasks across 22 domains. The framework includes a **post-processing enhancement step** using GPT-5.4 with high reasoning effort:
-
-### Results with Post-Processing
-
-| Metric | Baseline | With Rewrite | Improvement |
-|--------|----------|--------------|-------------|
-| Comprehensiveness | 0.4548 | **0.5078** | +11.7% |
-| Insight/Depth | 0.4397 | **0.5472** | +24.5% |
-| Instruction Following | 0.5071 | **0.5215** | +2.8% |
-| Readability | 0.4899 | **0.5213** | +6.4% |
-| **Overall Score** | **0.4696** | **0.5266** | **+12.1%** |
-
-<!-- ## LOW
-Comprehensiveness: xxxx
-Insight: xxxx
-Instruction Following: xxxx
-Readability: xxxx
-Overall Score: xxxx -->
-
-<!-- ## LOW
-Comprehensiveness: 0.5199
-Insight: 0.5636
-Instruction Following: 0.5223
-Readability: 0.5247
-Overall Score: 0.5360 -->
-
-<!-- ## MEDIUM
-Comprehensiveness: 0.5183
-Insight: 0.5645
-Instruction Following: 0.5239
-Readability: 0.5237
-Overall Score: 0.5361 -->
-
-<!-- ## HIGH
-Comprehensiveness: 0.5078
-Insight: 0.5472
-Instruction Following: 0.5215
-Readability: 0.5213
-Overall Score: 0.5266 -->
-
-### Post-Processing Pipeline
-
-After the agent generates a draft report, an optional **high-reasoning rewrite step** enhances quality:
-
-```bash
-# Rewrite with GPT-5.4 (high reasoning, 128k tokens)
-python deep_research_bench/rewrite_articles.py \
-  -i traces/research_results.jsonl \
-  -o rewrite_research_results.jsonl \
-  -c 5
-
-# Or use Anthropic Claude Opus
-python deep_research_bench/rewrite_articles.py \
-  --provider anthropic \
-  -i traces/research_results.jsonl \
-  -o rewrite_research_results.jsonl
-```
-
-**Key enhancements applied:**
-- Quantify vague claims with specific metrics and benchmarks
-- Deepen entity and case study coverage
-- Reduce scaffolding and eliminate redundancy
-- Execute frameworks with worked examples
-- Ground risks in real-world incidents
-- Specify regulatory and standards content
-- Update stale reference points
-- Build consolidated comparison tables
-- Strengthen causal reasoning
-- Improve source quality framing
-
-For detailed evaluation methodology and benchmark setup, see [Deep Research Bench README](deep_research_bench/README.md).
-
-The evaluation pipeline is fully automated:
-
-```bash
-# End-to-end: services → eval → judge
-python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
-```
-
-**What happens:**
-
-1. `eval.py` runs the agent on each dataset sample, saving per-item traces and a `results.parquet`
-2. `llm_judge.py` grades each `(question, response)` pair using an OpenAI judge model
-3. Outputs: `results.parquet`, `results_judge_ratings.json` with per-item and aggregate metrics
-
-**Standalone usage:**
-
-```bash
-# Just eval (no judge)
-python evals/eval.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
-
-# Just judge (on existing results)
-python evals/llm_judge.py --results data/google_deepsearchqa/gpt_oss_20b/results.parquet
-
-# Recover parquet from trace JSONs (if eval crashed mid-run)
-python evals/recover_parquet.py
-```
----
-
 ## Configuration
 
 Settings are loaded from a YAML config file with a fallback chain: explicit path → `TRAJECTORYKIT_CONFIG` environment variable → `configs/default.yaml` → built-in defaults.
@@ -669,6 +503,62 @@ You need to set a few API keys depending on which features you're using:
 
 ---
 
+## Codebase map
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  orchestrate.py                                          │
+│  Reads YAML → starts Apptainer sandbox → starts vLLM    │
+│  → runs eval → runs LLM judge / RACE scorer             │
+└──────────────┬───────────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│  agent.py → agent_state.py → runner.py → nodes.py       │
+│                                                          │
+│  agent.py:       dispatch() entry, config_path reload,   │
+│                  pre-dispatch chain analysis (chain.py)   │
+│  agent_state.py: AgentState dataclass + create_state()   │
+│  runner.py:      turn loop, 5 cycle gates, plan inject,  │
+│                  history compaction, synthesis pipeline   │
+│  nodes.py:       tool handlers, 4-stage verification     │
+│  plan.py:        ResearchPlan + PlanTask tracking         │
+│  config.py:      YAML loader, prompt loader, 30+ keys    │
+│                                                          │
+│  Depth 0 (root):  orchestrator prompt, root tools        │
+│  Depth 1+ (sub):  worker prompt, worker tools            │
+│  Synthesis:       synthesizer prompt, code + final_answer│
+└──────────────┬───────────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│  tool_store.py  (4,200+ lines)                           │
+│                                                          │
+│  ROOT TOOLS (orchestrator only):                         │
+│  conduct_research  Delegate task → sub-agent             │
+│  refine_draft      Write/replace the full draft report   │
+│  read_draft        Read previous draft versions/feedback │
+│  research_complete Publish draft (triggers verification) │
+│  summarize_webpage Fetch URL + LLM-focused summary       │
+│  think             Reasoning scratchpad                  │
+│                                                          │
+│  WORKER TOOLS (sub-agents):                              │
+│  search_web        Serper → Exa → DuckDuckGo fallback   │
+│  fetch_url         Direct → Jina → Exa → Wayback chain  │
+│  read_page         Paginate cached page text (no I/O)    │
+│  extract_tables    HTML tables → structured JSON         │
+│  read_pdf          PDF download + text extraction        │
+│  wikipedia_lookup  MediaWiki API → article/section/info  │
+│  fetch_cached      Wayback Machine archived pages        │
+│  execute_code      Sandboxed execution via Apptainer     │
+│  recall_memory     Retrieve stored tool outputs by key   │
+│  spawn_agent       Recursive sub-agent (fresh context)   │
+│  final_answer      Terminates the agent loop             │
+│  think             Reasoning scratchpad                  │
+│  search_available_tools  Self-introspection              │
+└──────────────────────────────────────────────────────────┘
+```
+
 ## `dispatch()` API
 
 Call the agent directly from Python:
@@ -693,6 +583,7 @@ result["tool_calls"]       # int — total tools invoked
 result["messages"]         # list — full conversation history
 result["trace"]            # EpisodeTrace — complete execution tree
 ```
+
 
 ---
 

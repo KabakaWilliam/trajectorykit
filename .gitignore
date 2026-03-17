@@ -9,6 +9,7 @@ __pycache__/
 *.pyo
 *.parquet
 *.json
+.nfs*
 CI_demo.md
 serve_vllm_oss.sh
 data
