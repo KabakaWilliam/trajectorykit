@@ -11,36 +11,40 @@
 
 Most agent frameworks are cloud-first and opaque. TrajectoryKit is designed for researchers who want full control:
 
-- **One config, one command.** A single YAML defines the model, GPU assignment, vLLM flags, sandbox container, evaluation dataset, and judge — then `orchestrate.py` handles the rest.
-- **Recursive delegation.** The root agent spawns sub-agents that each get a fresh context window, their own tool access, and a recorded trace — no context pollution.
-- **RLM-inspired memory.** Long tool outputs are stored in an external `MemoryStore` and accessed programmatically via code execution, not via attention. The LLM writes programs to query its own research history.
-- **Every token is traced.** Full execution trees (turns, tool calls, sub-agent trees, token counts, latencies) are saved as JSON and rendered as interactive HTML.
+- **One config, one command.** Write a single YAML file that specifies your model, GPU devices, vLLM configuration, sandbox, dataset, and optional judge. Then just run `orchestrate.py` — it handles everything: pulling container images, launching services, running evaluation, and grading output.
+- **Recursive delegation that actually works.** Sub-agents run in isolated contexts with their own tools and traces, so they never pollute the parent's memory. Each one maintains its own research trajectory.
+- **Memory that doesn't blow up your context window.** Tool outputs get stored externally and accessed on-demand via code execution, which is way more efficient than dumping everything into attention. The LLM can write programs to search its own research history.
+- **Every turn is recorded.** Full execution trees with turn-by-turn details, all tool calls, sub-agent cascades, token usage, and wall-clock latency get saved as JSON and rendered as an interactive HTML trace you can click through.
 
 ---
 
 ## Quickstart
 
+Get up and running in three commands:
+
 ```bash
-# 1. Install
+# 1. Set up the environment
 conda env create -f environment.yml
 conda activate pika
 pip install -e .
 
-# 2. Run an experiment end-to-end (sandbox + vLLM + eval + judge)
+# 2. Run a full experiment (this launches sandbox + vLLM + eval + judge grading)
 python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
 ```
 
-Or start services and run the eval separately:
+Or if you want more control, start the services separately:
 
 ```bash
-# Start services only
+# Start services in the background
 python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml --services-only
 
-# Run eval (includes LLM judge if judge.enabled: true in config)
+# Then run eval and judge independently
 python evals/eval.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
 ```
 
 ### Programmatic use
+
+You can also import and use the agent directly in Python:
 
 ```python
 from trajectorykit import dispatch
@@ -52,7 +56,7 @@ result = dispatch(
 )
 
 print(result["final_response"])
-result["trace"].save()  # → traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
+result["trace"].save()  # Saves to traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
 ```
 
 <p align="center">
@@ -61,10 +65,7 @@ result["trace"].save()  # → traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
 
 ### Live Demo
 
-> [**▶ Walk through a real agent trace**](https://kabakawilliam.github.io/trajectorykit/demo_trace.html)
->
-> Click through the sidebar timeline to see how the agent searches the web, reads pages,
-> executes Python in a sandbox, and synthesizes an answer across 15+ turns.
+[**Click here to see a real agent trace in action.**](https://kabakawilliam.github.io/trajectorykit/demo_trace.html) The HTML viewer lets you step through the timeline: watch the agent searching the web, reading pages, running code in a sandbox, and synthesizing answers across 15+ turns.
 
 ---
 
@@ -126,7 +127,7 @@ result["trace"].save()  # → traces/trace_YYYYMMDD_HHMMSS_uuid.json + .html
 
 ### Agent Flow
 
-The full lifecycle of a `dispatch()` call, from question to verified answer:
+Here's the full journey from your question to a verified answer:
 
 ```
                         User Question
@@ -294,22 +295,22 @@ The full lifecycle of a `dispatch()` call, from question to verified answer:
 
 | Concern | Approach |
 |---------|----------|
-| Model interchangeability | Most LLM steps (chain analysis, research loop, verification stages 1/3) accept external (GPT-5.4, Claude) or local models as drop-in replacements. Sub-agents use independent model configuration; verification sub-agents (spawned at root) may use local models to minimize cost. Configure via `model.name` and `model.api_url` in YAML. |
-| Causal chains | Pre-dispatch LLM detects dependency chains → `ChainPlan` enforces sequential resolution with placeholder blocking |
-| Verification | 4-stage pipeline: format gate → verifier LLM (insight criterion) → sub-agent spot-check → citation audit (URL faithfulness) |
-| Cycle prevention | 5 runner gates: must draft before publish, must revise before re-publish, must research before draft, must follow plan, must research after first draft (report mode) |
-| Context management | History compaction evicts old messages when threshold hit, keeping system prompt + recent turns. `MemoryStore` captures full tool outputs externally; synthesis sub-agent queries them via `execute_code` |
-| Search resilience | Serper (primary) → Exa.ai neural search → DuckDuckGo — three-tier automatic fallback on credit/auth/rate errors |
-| Fetch resilience | Direct HTTP → Jina Reader (headless Chrome, GET then POST) → Exa contents API → Wayback Machine — four-tier fallback with domain-aware routing |
-| Draft workflow | Root orchestrator writes via `refine_draft`, publishes via `research_complete`. Draft versions tracked. Verifier pushes back on shallow/low-insight reports. |
-| Budget management | Progressive turn warnings at 5/3/2/1 remaining; last turn restricts tools to `final_answer` only |
-| Trace fidelity | Every turn records: assistant content, tool calls with args/output/duration, child traces, token counts |
+| Model flexibility | You can swap between cloud models (GPT-5.4, Claude) and local ones freely — most LLM steps accept either as drop-in replacements. Research loops, chain analysis, and verification stages 1 and 3 all support both. The only exception: verification sub-agents (spawned at root) run on local models to keep costs down. Just configure `model.name` and `model.api_url` in your YAML. |
+| Causal chains | Before dispatch, the LLM reads your question and detects multi-step dependencies. We build a `ChainPlan` that enforces sequential execution — if a step depends on an earlier result, we block it until that result exists. |
+| Verification | Four-stage pipeline that runs after the agent publishes. First, we validate the format. Next, a verifier LLM checks for depth and insight. Then, parallel sub-agents spot-check claims by actually searching and reading sources. Finally, we audit the citations to make sure each quoted URL actually supports the claim. |
+| Cycle prevention | Five safety gates prevent infinite loops: can't publish without a draft, can't republish without revising, can't draft without researching, must follow the plan once it's active, and in report mode can't publish without a second research phase after the first draft. |
+| Context management | When the conversation gets long, we automatically trim old messages but keep the system prompt and recent turns. Tool outputs get stashed in an external `MemoryStore`, and synthesis sub-agents can query them by running code. No context is ever wasted. |
+| Search resilience | Three-tier fallback for search: try Serper first, then Exa.ai if Serper fails (better for neural queries), then DuckDuckGo as the last resort. Each tier handles credit exhaustion, auth failures, and rate limits gracefully. |
+| Fetch resilience | Four-tier fallback for fetching URLs: direct HTTP, then Jina Reader for JS-heavy sites, then Exa's content API, then Wayback Machine for archived versions. |
+| Draft workflow | The root agent writes drafts using the `refine_draft` tool and publishes via `research_complete`. We keep all draft versions, and the verifier gives feedback if your answer lacks depth or insight. |
+| Budget management | As you approach the turn limit, we send informal warnings at 5, 3, 2, and 1 turns remaining. On the final turn, the agent can only use `final_answer` to wrap things up. |
+| Trace fidelity | Every turn is fully recorded: what the LLM said, which tools it called and with what arguments, the results, wall-clock duration, any child traces from sub-agents, and token usage. |
 
 ---
 
 ## Experiment Configs
 
-Everything is defined in a single YAML:
+Define everything in one YAML file. Here's an example:
 
 ```yaml
 # configs/experiments/gpt_oss_deepsearchqa.yaml
@@ -354,19 +355,22 @@ judge:
   threads: 5
 ```
 
-Run it:
+Then just run:
 
 ```bash
 python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
 ```
 
-The orchestrator will:
-1. Pull the Apptainer SIF if not cached, start the sandbox container
-2. Launch vLLM with the correct model, GPU, parser, and flags
-3. Wait for both services to be healthy
-4. Run the eval on the configured dataset
-5. Run the LLM judge and save detailed ratings
-6. Leave services running for further use
+The orchestrator does the heavy lifting:
+
+1. Pulls container images from Apptainer and starts the sandbox
+2. Launches vLLM with your model, GPU setup, and parser configuration
+3. Waits for services to be healthy
+4. Runs evaluation on your dataset
+5. Grades results with the LLM judge (if enabled)
+6. Leaves services running so you can iterate
+
+Results are saved to `data/` as parquet files with per-item and aggregate metrics.
 
 ---
 
@@ -445,44 +449,52 @@ trajectorykit/
 
 ### Root tools (orchestrator only)
 
-| Tool | Description |
-|------|-------------|
-| `conduct_research` | Delegate a research task to a sub-agent with its own context window, tools, and trace. |
-| `refine_draft` | Write or replace the entire draft report. Each call overwrites the previous version. |
-| `read_draft` | Read previous draft versions and verifier feedback history. |
-| `research_complete` | Publish the draft — triggers the 4-stage verification pipeline. |
-| `summarize_webpage` | Fetch a URL and return an LLM-generated summary focused on a specific topic. Faster than `conduct_research` for targeted reads. |
-| `think` | Reasoning scratchpad — output is not shown to the user. |
-| `search_available_tools` | Self-introspection — list tools or get full schema for any tool. |
+These tools are available only to the root orchestrator agent:
+
+| Tool | What it does |
+|------|----------|
+| `conduct_research` | Spawn a sub-agent to research a specific topic. The sub-agent gets its own context, tools, and trace. |
+| `refine_draft` | Write or completely replace the draft report. Each call overwrites the previous version. |
+| `read_draft` | Look back at previous draft versions and any feedback the verifier left. |
+| `research_complete` | Publish the draft and trigger the 4-stage verification pipeline. |
+| `summarize_webpage` | Fetch a URL and get an LLM-generated summary focused on a topic. Faster than spawning a sub-agent for quick reads. |
+| `think` | Reasoning scratchpad — the LLM can think out loud here without showing it to the user. |
+| `search_available_tools` | Self-introspection. List all tools or get the full schema for a specific one. |
 
 ### Worker tools (sub-agents)
 
-| Tool | Description |
+Sub-agents have access to these tools for research and fact-checking:
+
+| Tool | What it does |
 |------|-------------|
-| `search_web` | Web search via Serper → Exa.ai → DuckDuckGo (three-tier automatic fallback). |
-| `fetch_url` | Fetch a web page with four-tier fallback: direct HTTP → Jina Reader → Exa contents → Wayback Machine. Supports `css_selector` for targeted extraction and `extract="table"` mode. |
-| `read_page` | Paginate through cached page text from a previous `fetch_url` call — no network I/O. |
-| `extract_tables` | Extract HTML tables from a URL as structured JSON (list of row-dicts). |
+| `search_web` | Search the web with automatic fallback: Serper → Exa.ai → DuckDuckGo. Handles credit exhaustion gracefully. |
+| `fetch_url` | Fetch a page with four-tier resilience: direct HTTP → Jina Reader → Exa contents → Wayback Machine. Supports `css_selector` for targeted extraction and `extract="table"` mode for structured data. |
+| `read_page` | Scroll through cached page text from a previous `fetch_url` call — no new network requests. |
+| `extract_tables` | Parse HTML tables from a URL and return them as structured JSON (array of dictionaries). |
 | `read_pdf` | Download and extract text from a PDF. |
-| `wikipedia_lookup` | Look up a Wikipedia article directly via the MediaWiki API. Returns article text, section list, and structured infobox data. |
-| `fetch_cached` | Fetch an archived version of a URL from the Wayback Machine. |
-| `execute_code` | Run code in an Apptainer sandbox (Python + 40 languages). Supports file upload/download as base64. |
-| `recall_memory` | Retrieve stored tool outputs by key. Query within compressed memory for specific data. |
-| `spawn_agent` | Spawn a recursive sub-agent with fresh context and its own trace. |
-| `final_answer` | Submit the final answer (terminates the loop). |
-| `think` | Reasoning scratchpad. |
+| `wikipedia_lookup` | Look up a Wikipedia article via the MediaWiki API. Returns the article text, section list, and structured infobox data. |
+| `fetch_cached` | Retrieve an archived version of a URL from the Wayback Machine. |
+| `execute_code` | Run code in a sandboxed environment (Python plus 40 other languages). Supports base64 file upload and download. |
+| `recall_memory` | Retrieve previously stored tool outputs by key. Query across the compressed memory for specific data. |
+| `spawn_agent` | Recursively spawn a sub-agent with fresh context and its own trace. |
+| `final_answer` | Submit the final answer and terminate the loop. |
+| `think` | Reasoning scratchpad for internal deliberation. |
 
 ---
 
 ## Tracing
 
-Every `dispatch()` call produces a full execution trace.
+Every `dispatch()` call produces a complete execution trace with every turn, tool call, and decision recorded.
 
 ### Terminal output
+
+Get a quick summary in your terminal:
 
 ```python
 result["trace"].pretty_print()
 ```
+
+Output:
 
 ```
 🏁 Agent [root]  trace_id=a3f7c912
@@ -510,17 +522,15 @@ result["trace"].pretty_print()
 
 ### JSON + HTML
 
+Save the full trace as self-contained JSON and HTML:
+
 ```python
 result["trace"].save()
 # → traces/trace_20260219_210429_154b9f2e.json
 # → traces/trace_20260219_210429_154b9f2e.html
 ```
 
-The HTML viewer is self-contained with:
-- Collapsible turn-by-turn trace detail
-- Reasoning content (chain-of-thought) dropdowns
-- Inline rendered images (base64)
-- Token stats and latency per turn
+The HTML viewer is fully interactive: collapse and expand turns, view reasoning content, inspect tool calls and their arguments, see inline images (stored as base64), and check token counts and latency per turn.
 
 ---
 
@@ -532,11 +542,39 @@ TrajectoryKit is evaluated on **[Deep Research Bench](deep_research_bench/README
 
 | Metric | Baseline | With Rewrite | Improvement |
 |--------|----------|--------------|-------------|
-| Comprehensiveness | 0.4543 | **0.5078** | +11.8% |
-| Insight/Depth | 0.4373 | **0.5472** | +25.2% |
-| Instruction Following | 0.4825 | **0.5215** | +8.1% |
-| Readability | 0.4861 | **0.5213** | +7.2% |
-| **Overall Score** | **0.4597** | **0.5266** | **+14.6%** |
+| Comprehensiveness | 0.4548 | **0.5078** | +11.7% |
+| Insight/Depth | 0.4397 | **0.5472** | +24.5% |
+| Instruction Following | 0.5071 | **0.5215** | +2.8% |
+| Readability | 0.4899 | **0.5213** | +6.4% |
+| **Overall Score** | **0.4696** | **0.5266** | **+12.1%** |
+
+<!-- ## LOW
+Comprehensiveness: xxxx
+Insight: xxxx
+Instruction Following: xxxx
+Readability: xxxx
+Overall Score: xxxx -->
+
+<!-- ## LOW
+Comprehensiveness: 0.5199
+Insight: 0.5636
+Instruction Following: 0.5223
+Readability: 0.5247
+Overall Score: 0.5360 -->
+
+<!-- ## MEDIUM
+Comprehensiveness: 0.5183
+Insight: 0.5645
+Instruction Following: 0.5239
+Readability: 0.5237
+Overall Score: 0.5361 -->
+
+<!-- ## HIGH
+Comprehensiveness: 0.5078
+Insight: 0.5472
+Instruction Following: 0.5215
+Readability: 0.5213
+Overall Score: 0.5266 -->
 
 ### Post-Processing Pipeline
 
@@ -595,59 +633,45 @@ python evals/llm_judge.py --results data/google_deepsearchqa/gpt_oss_20b/results
 # Recover parquet from trace JSONs (if eval crashed mid-run)
 python evals/recover_parquet.py
 ```
-
-### Results
-
-Evaluated on **DeepSearchQA** (n = 100, eval split) with `gpt-oss-20b` (131K context) served via vLLM, judged by GPT-4.1-mini:
-
-| Metric | Value |
-|--------|-------|
-| Fully Correct | 46.88 ± 9.98% (45/96) |
-| Fully Incorrect | 31.25 ± 9.27% (30/96) |
-| Correct w/ Extraneous | 5.21 ± 4.44% (5/96) |
-| Precision | 63.89% |
-| Recall | 61.14% |
-| F1 | 61.08% |
-
-96 of 100 items received valid judge ratings (1 empty model response, 3 invalid rater responses).
-
-> **Note:** DeepSearchQA questions are multi-hop research tasks requiring the agent to search, synthesize, and reason over multiple sources. The dataset often expects multi-part answers (e.g. lists of names, dates, or figures).
-
 ---
 
 ## Configuration
 
-Settings are loaded from YAML with fallback chain: explicit path → `TRAJECTORYKIT_CONFIG` env var → `configs/default.yaml` → hardcoded defaults.
+Settings are loaded from a YAML config file with a fallback chain: explicit path → `TRAJECTORYKIT_CONFIG` environment variable → `configs/default.yaml` → built-in defaults.
 
 ### Key config sections
 
 | Section | Purpose |
 |---------|---------|
-| `model` | Model name and API URL |
-| `vllm` | Server port, GPU devices, parser, memory utilization, extra args |
-| `sandbox` | Sandbox URL, port, SIF image, Docker URI |
-| `agent` | Recursion depth, sub-agent turn budget, safety margin, draft format, verification flags, compaction settings |
-| `model_profiles` | Per-model settings (context window, temperature, reasoning effort) |
-| `prompts` | Paths to system prompt files (orchestrator, worker, synthesizer) |
-| `dataset` | HuggingFace dataset name, split, sample size, seed |
-| `eval` | Turn length, reasoning effort, verbosity |
-| `judge` | Enable/disable, judge model, thread count |
+| `model` | Which model to use and where to find it (name and API URL) |
+| `vllm` | Server port, which GPUs to use, memory utilization, parser type, extra launch flags |
+| `sandbox` | Sandbox service URL, port, container image, Docker URI |
+| `agent` | Max recursion depth, sub-agent turn budget, verification settings, context compaction rules |
+| `model_profiles` | Per-model overrides: context window, temperature, reasoning effort |
+| `prompts` | Paths to system prompt files (orchestrator, worker, synthesizer, etc.) |
+| `dataset` | HuggingFace dataset source, split, sample count, random seed |
+| `eval` | Turn limit, reasoning effort, verbosity |
+| `judge` | Whether to run grading, which judge model, how many threads |
 
 ### Environment variables
 
-| Variable | Purpose |
+You need to set a few API keys depending on which features you're using:
+
+| Variable | What it's for |
 |----------|---------|
-| `SERPER_API_KEY` | Primary web search (Serper.dev). Falls back to Exa → DuckDuckGo if not set or credits exhausted. |
-| `EXA_API_KEY` | Exa.ai neural search (fallback) + Exa contents API (fetch fallback). Highly recommended. |
-| `JINA_API_KEY` | Jina Reader API for fetching JS-heavy / paywalled pages. Optional but improves fetch success rate. |
-| `OPENAI_API_KEY` | OpenAI API key for LLM judge (GPT-4.1-mini) and post-processing rewrite (GPT-5.4). Only needed for these features. |
+| `SERPER_API_KEY` | Primary web search provider (Serper.dev). Falls back to Exa or DuckDuckGo if not set or credits run out. |
+| `EXA_API_KEY` | Exa.ai for neural search (fallback) and content fetching. Highly recommended. |
+| `JINA_API_KEY` | Jina Reader for fetching JavaScript-heavy or paywalled pages. Optional but improves success rates. |
+| `OPENAI_API_KEY` | OpenAI API key for the LLM judge (GPT-4.1-mini) and optional post-processing rewrite (GPT-5.4). Only needed for those features. |
 | `ANTHROPIC_API_KEY` | Anthropic API key for alternative post-processing rewrite (Claude Opus). Optional. |
-| `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, set `SEARCH_BACKEND=serpapi`). |
-| `GOOGLE_API_KEY` | Gemini API key. Required only when using Gemini models as the LLM judge. |
+| `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, requires setting `SEARCH_BACKEND=serpapi`). |
+| `GOOGLE_API_KEY` | Gemini API key. Only needed if you're using Gemini as the judge model. |
 
 ---
 
 ## `dispatch()` API
+
+Call the agent directly from Python:
 
 ```python
 from trajectorykit import dispatch
@@ -655,19 +679,19 @@ from trajectorykit import dispatch
 result = dispatch(
     user_input="Your task here",
     turn_length=10,           # Max turns (None = unlimited)
-    verbose=True,             # Print turn-by-turn output
+    verbose=True,             # Print turn-by-turn output during execution
     temperature=0.7,          # Sampling temperature
     model="openai/gpt-oss-20b",
     reasoning_effort="high",  # For models that support it
-    example_id="q0042",       # Optional ID for tracing
-    config_path="configs/experiments/gpt_oss_deep_research_bench.yaml",  # Optional config override
+    example_id="q0042",       # Optional ID for trace records
+    config_path="configs/experiments/gpt_oss_deep_research_bench.yaml",  # Optional override
 )
 
 result["final_response"]   # str — the agent's final answer
-result["turns"]            # int — number of turns taken
-result["tool_calls"]       # int — total tool calls made
+result["turns"]            # int — how many turns it took
+result["tool_calls"]       # int — total tools invoked
 result["messages"]         # list — full conversation history
-result["trace"]            # EpisodeTrace — full execution tree
+result["trace"]            # EpisodeTrace — complete execution tree
 ```
 
 ---
