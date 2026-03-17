@@ -74,7 +74,7 @@ result["trace"].save()  # Saves to traces/trace_YYYYMMDD_HHMMSS_uuid.json + .htm
 
 TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.com/Ayanami0730/deep_research_bench)**, a benchmark with 100 PhD-level research tasks across 22 domains. The primary research engine uses **GPT-OSS-20B** (open-weight, locally deployed), with optional GPT-5.4 refinement:
 
-| Metric | Baseline (GPT-OSS-20B) | With Rewrite (+GPT4.5 refiner) | Improvement |
+| Metric | Baseline (GPT-OSS-20B) | With Rewrite (GPT-5.4 refiner) | Improvement |
 |--------|----------|--------------|-------------|
 | Comprehensiveness | 0.4548 | **0.5260** | +15.7% |
 | Insight/Depth | 0.4397 | **0.5701** | **+29.7%** ⭐ |
@@ -86,7 +86,7 @@ TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.
 
 ### Impact of Reasoning Effort
 
-The framework supports different reasoning effort levels. Here's how reasoning effort affects performance on Deep Research Bench:
+The framework supports using different reasoning effort levels to refine the final draft. Here's how reasoning effort affects performance on Deep Research Bench:
 
 | Reasoning Effort | Comprehensiveness | Insight | Instruction Following | Readability | Overall |
 |------------------|-------------------|---------|----------------------|-------------|---------|
@@ -266,7 +266,7 @@ python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
 | **Deep Research Bench** | `gpt_oss_deep_research_bench.yaml` | GPT-OSS-20B | Deep Research Bench (100 PhD-level tasks, 22 domains) |
 | **Alternative: Qwen** | `qwen3_deepsearchqa.yaml` | Qwen3-8B | Google DeepSearchQA |
 
-**Model Flexibility:** All configs default to minimal-model approaches (20B or 8B open-weight). You can swap in heavier models (e.g., GPT-4.5, Claude-3) by modifying the `model.name` and `model.api_url` fields in any config.
+**Model Flexibility:** All configs default to minimal-model approaches (20B or 8B open-weight). You can swap in heavier models (e.g., GPT-5.4, Claude-3) by modifying the `model.name` and `model.api_url` fields in any config.
 
 <p align="center">
   <strong>Get results in minutes:</strong> Choose a config above and run <code>python orchestrate.py --config ...</code>
@@ -616,4 +616,3 @@ result["trace"]            # EpisodeTrace — complete execution tree
 ## License
 
 MIT
-<!-- currently on gpt high redo -->
