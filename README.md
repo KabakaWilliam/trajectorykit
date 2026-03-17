@@ -496,10 +496,25 @@ You need to set a few API keys depending on which features you're using:
 | `SERPER_API_KEY` | Primary web search provider (Serper.dev). Falls back to Exa or DuckDuckGo if not set or credits run out. |
 | `EXA_API_KEY` | Exa.ai for neural search (fallback) and content fetching. Highly recommended. |
 | `JINA_API_KEY` | Jina Reader for fetching JavaScript-heavy or paywalled pages. Optional but improves success rates. |
-| `OPENAI_API_KEY` | OpenAI API key for the LLM judge (GPT-4.1-mini) and optional post-processing rewrite (GPT-5.4). Only needed for those features. |
+| `OPENAI_API_KEY` | OpenAI API key for rubric creation and post-processing rewrite (GPT-5.4). Only needed for those features. |
 | `ANTHROPIC_API_KEY` | Anthropic API key for alternative post-processing rewrite (Claude Opus). Optional. |
 | `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, requires setting `SEARCH_BACKEND=serpapi`). |
 | `GOOGLE_API_KEY` | Gemini API key. Only needed if you're using Gemini as the judge model. |
+
+#### Setting up your `.env` file
+
+Create a `.env` file in the **project root** with your API keys:
+
+```bash
+# .env (at root of trajectorykit/)
+SERPER_API_KEY=your_serper_key
+EXA_API_KEY=your_exa_key
+JINA_API_KEY=your_jina_key
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+```
+
+The framework automatically loads these when you run `orchestrate.py` or call `dispatch()`.
 
 ---
 
@@ -601,3 +616,4 @@ result["trace"]            # EpisodeTrace — complete execution tree
 ## License
 
 MIT
+<!-- currently on gpt high redo -->
