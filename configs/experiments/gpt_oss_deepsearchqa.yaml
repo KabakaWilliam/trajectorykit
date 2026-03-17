@@ -19,6 +19,27 @@ agent:
   max_recursion_depth: 1
   sub_agent_turn_budget: 15
   token_safety_margin: 256
+  # Symbolic references: compress large tool outputs to summaries at depth 0.
+  # Full data stays in MemoryStore; the LLM sees a compact reference.
+  symbolic_references: false
+  symbolic_threshold: 500         # chars — smaller outputs pass through
+  # Research plan: inject a structured progress tracker every N turns.
+  plan_state: true
+  plan_inject_interval: 3         # inject plan every N turns
+  draft_report: true              # update_draft tool at root for answer safety net
+  verify_before_publish: true      # LLM audits draft before publishing
+  spot_check_enabled: true          # Stage 2: search-verify key claims
+  spot_check_claims: 5
+  max_verification_rejections: 4    # Stage 1: verifier can reject up to N times before force-publish
+  max_spot_check_rejections: 4      # Stage 2: spot-check can reject up to N times before force-publish
+  chain_analysis_enabled: true       # Pre-dispatch causal chain decomposition
+    # History compaction: replace old root messages with a compact summary once
+  # the draft absorbs their findings, reclaiming context window.
+  history_compaction_enabled: true
+  history_compaction_msg_threshold: 30  # min messages before first compaction
+  history_compaction_min_interval: 4   # min turns between compactions
+  history_compaction_recent_turns: 3   # keep last N turn-groups in full
+
 
 sandbox:
   url: "http://localhost:8080/run_code"
@@ -33,6 +54,11 @@ traces:
 prompts:
   orchestrator: "configs/prompts/orchestrator.txt"
   worker: "configs/prompts/worker.txt"
+  verifier: "configs/prompts/verifier.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
+  spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
+  chain_analysis: "configs/prompts/chain_analysis.txt"
 
 model_profiles:
   "Qwen/Qwen3-8B":
@@ -62,10 +88,20 @@ eval:
   reasoning_effort: "high"
   verbose: true
   output_dir: null
-  workers: 5
+  workers: 8
 
 judge:
   enabled: true
-  model: "gemini-2.5-flash" #gemini-2.5-flash #gpt-4.1-mini
+  model: "gpt-4.1-mini" #gemini-2.5-flash #gpt-4.1-mini
   threads: 5
   # rpm: 5   # uncomment to throttle (free tier = 5 RPM). Omit or null for unlimited (paid tier).
+
+ntfy:
+  enabled: true
+  url: "https://ntfy.sh"
+  topic: "trajectorykit-eval"
+  interval_pct: 10                # push notification every N% (0 = start/finish only)
+
+# For Deep Research Bench, use configs/experiments/gpt_oss_deep_research_bench.yaml
+
+

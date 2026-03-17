@@ -34,6 +34,15 @@ _FALLBACK_CONFIG = {
         "max_recursion_depth": 1,
         "sub_agent_turn_budget": 15,
         "token_safety_margin": 256,
+        "symbolic_references": True,
+        "symbolic_threshold": 500,
+        "plan_state": True,
+        "plan_inject_interval": 3,
+        "draft_report": True,
+        "history_compaction_enabled": True,
+        "history_compaction_msg_threshold": 30,
+        "history_compaction_min_interval": 4,
+        "history_compaction_recent_turns": 3,
     },
     "sandbox": {
         "url": "http://localhost:8080/run_code",
@@ -88,8 +97,13 @@ def _resolve_path(relative: str) -> str:
     return str(_REPO_ROOT / relative)
 
 
-def _load_prompt(filepath: str) -> str:
-    """Load a prompt template from a text file, substituting {current_date}."""
+def _load_prompt(filepath: str, **extra_vars) -> str:
+    """Load a prompt template from a text file, substituting template variables.
+
+    Built-in variables: {current_date}
+    Additional variables can be passed via **extra_vars and will be
+    substituted as {key} → str(value) in the prompt text.
+    """
     resolved = _resolve_path(filepath)
     try:
         raw = Path(resolved).read_text(encoding="utf-8")
@@ -98,7 +112,10 @@ def _load_prompt(filepath: str) -> str:
             f"Prompt file not found: {resolved}\n"
             f"Expected at: {filepath} (relative to repo root {_REPO_ROOT})"
         )
-    return raw.replace("{current_date}", datetime.today().strftime("%Y-%m-%d %H:%M:%S"))
+    text = raw.replace("{current_date}", datetime.today().strftime("%Y-%m-%d %H:%M:%S"))
+    for key, value in extra_vars.items():
+        text = text.replace("{" + key + "}", str(value))
+    return text
 
 
 def load_config(path: Optional[str] = None) -> dict:
@@ -161,6 +178,16 @@ def _update_module_constants():
     global MODEL_PROFILES, _DEFAULT_PROFILE
     global SYSTEM_PROMPT, WORKER_PROMPT, SYNTHESIZER_PROMPT
     global DATASET_CONFIG, EVAL_CONFIG
+    global SYMBOLIC_REFERENCES, SYMBOLIC_THRESHOLD, PLAN_STATE, PLAN_INJECT_INTERVAL, DRAFT_REPORT, DRAFT_FORMAT
+    global VERIFY_BEFORE_PUBLISH, VERIFIER_PROMPT, VERIFIER_EXTERNAL_PROMPT, VERIFIER_MODEL, VERIFIER_API_URL, VERIFIER_API_KEY, VERIFIER_TEMPERATURE
+    global VERIFIER_STAGE1_PROVIDER, VERIFIER_STAGE2_PROVIDER, VERIFIER_STAGE3_PROVIDER
+    global SPOT_CHECK_ENABLED, SPOT_CHECK_CLAIMS, SPOTCHECK_EXTRACT_PROMPT, SPOTCHECK_COMPARE_PROMPT, SPOTCHECK_REFUSAL_PROMPT
+    global MAX_VERIFICATION_REJECTIONS, MAX_SPOT_CHECK_REJECTIONS
+    global CITATION_AUDIT_ENABLED, CITATION_AUDIT_PROMPT
+    global CHAIN_ANALYSIS_ENABLED, CHAIN_ANALYSIS_PROMPT
+    global HISTORY_COMPACTION_ENABLED, HISTORY_COMPACTION_MSG_THRESHOLD
+    global HISTORY_COMPACTION_MIN_INTERVAL, HISTORY_COMPACTION_RECENT_TURNS
+    global RUBRIC_ENABLED, RUBRIC_PROMPT, DRAFT_CRITIQUE_ENABLED, DRAFT_CRITIQUE_PROMPT
 
     c = _config
 
@@ -191,13 +218,111 @@ def _update_module_constants():
     # Derived
     CONTEXT_WINDOW = get_model_profile(MODEL_NAME)["context_window"]
 
-    # Prompts
+    # Prompts — inject budget so templates like {sub_agent_turn_budget} resolve
+    _budget = SUB_AGENT_TURN_BUDGET
+    _prompt_vars = {
+        "sub_agent_turn_budget": _budget,
+        "worker_checkpoint_turn": _budget // 2,
+        "worker_answer_turn": max(_budget - 2, _budget // 2 + 1),
+    }
     orchestrator_path = c.get("prompts", {}).get("orchestrator", "configs/prompts/orchestrator.txt")
     worker_path = c.get("prompts", {}).get("worker", "configs/prompts/worker.txt")
     synthesizer_path = c.get("prompts", {}).get("synthesizer", "configs/prompts/synthesizer.txt")
-    SYSTEM_PROMPT = _load_prompt(orchestrator_path)
-    WORKER_PROMPT = _load_prompt(worker_path)
-    SYNTHESIZER_PROMPT = _load_prompt(synthesizer_path)
+    SYSTEM_PROMPT = _load_prompt(orchestrator_path, **_prompt_vars)
+    WORKER_PROMPT = _load_prompt(worker_path, **_prompt_vars)
+    SYNTHESIZER_PROMPT = _load_prompt(synthesizer_path, **_prompt_vars)
+
+    # Agent feature flags
+    agent_cfg = c.get("agent", {})
+    SYMBOLIC_REFERENCES = agent_cfg.get("symbolic_references", True)
+    SYMBOLIC_THRESHOLD = agent_cfg.get("symbolic_threshold", 500)
+    PLAN_STATE = agent_cfg.get("plan_state", True)
+    PLAN_INJECT_INTERVAL = agent_cfg.get("plan_inject_interval", 3)
+    DRAFT_REPORT = agent_cfg.get("draft_report", True)
+    DRAFT_FORMAT = agent_cfg.get("draft_format", "qa")  # "qa" (Final Answer/Sources/Details) or "report" (Title/Executive Summary/Sections/Sources)
+    VERIFY_BEFORE_PUBLISH = agent_cfg.get("verify_before_publish", True)
+
+    # Verifier model — defaults to the main model/endpoint if not set
+    verifier_cfg = c.get("verifier", {})
+    VERIFIER_MODEL = verifier_cfg.get("model", None)       # None → use state.model
+    VERIFIER_API_URL = verifier_cfg.get("api_url", None)   # None → use VLLM_API_URL
+    VERIFIER_API_KEY = verifier_cfg.get("api_key", None) or os.getenv("OPENAI_API_KEY", "")
+    VERIFIER_TEMPERATURE = verifier_cfg.get("temperature", None)  # None → use state.temperature
+
+    # Per-stage provider: "self" = local model, "external" = verifier.model
+    VERIFIER_STAGE1_PROVIDER = verifier_cfg.get("stage1_provider", "self")
+    VERIFIER_STAGE2_PROVIDER = verifier_cfg.get("stage2_provider", "self")
+    VERIFIER_STAGE3_PROVIDER = verifier_cfg.get("stage3_provider", "self")
+
+    # Verifier prompts
+    verifier_path = c.get("prompts", {}).get("verifier", "configs/prompts/verifier.txt")
+    try:
+        VERIFIER_PROMPT = _load_prompt(verifier_path)
+    except FileNotFoundError:
+        VERIFIER_PROMPT = ""  # gracefully degrade if file missing
+
+    verifier_external_path = c.get("prompts", {}).get("verifier_external", "configs/prompts/verifier_external.txt")
+    try:
+        VERIFIER_EXTERNAL_PROMPT = _load_prompt(verifier_external_path)
+    except FileNotFoundError:
+        VERIFIER_EXTERNAL_PROMPT = ""
+
+    # Spot-check (Stage 2 verification)
+    SPOT_CHECK_ENABLED = agent_cfg.get("spot_check_enabled", False)
+    SPOT_CHECK_CLAIMS = agent_cfg.get("spot_check_claims", 3)
+    MAX_VERIFICATION_REJECTIONS = agent_cfg.get("max_verification_rejections", 5)
+    MAX_SPOT_CHECK_REJECTIONS = agent_cfg.get("max_spot_check_rejections", 5)
+    spotcheck_extract_path = c.get("prompts", {}).get("spotcheck_extract", "configs/prompts/spotcheck_extract.txt")
+    spotcheck_compare_path = c.get("prompts", {}).get("spotcheck_compare", "configs/prompts/spotcheck_compare.txt")
+    try:
+        SPOTCHECK_EXTRACT_PROMPT = _load_prompt(spotcheck_extract_path)
+    except FileNotFoundError:
+        SPOTCHECK_EXTRACT_PROMPT = ""
+    try:
+        SPOTCHECK_COMPARE_PROMPT = _load_prompt(spotcheck_compare_path)
+    except FileNotFoundError:
+        SPOTCHECK_COMPARE_PROMPT = ""
+    spotcheck_refusal_path = c.get("prompts", {}).get("spotcheck_refusal", "configs/prompts/spotcheck_refusal.txt")
+    try:
+        SPOTCHECK_REFUSAL_PROMPT = _load_prompt(spotcheck_refusal_path)
+    except FileNotFoundError:
+        SPOTCHECK_REFUSAL_PROMPT = ""
+
+    # Citation audit (Stage 3 verification — citation faithfulness)
+    CITATION_AUDIT_ENABLED = agent_cfg.get("citation_audit_enabled", False)
+    citation_audit_path = c.get("prompts", {}).get("citation_audit", "configs/prompts/citation_audit.txt")
+    try:
+        CITATION_AUDIT_PROMPT = _load_prompt(citation_audit_path)
+    except FileNotFoundError:
+        CITATION_AUDIT_PROMPT = ""
+
+    # History compaction (root context window management)
+    HISTORY_COMPACTION_ENABLED = agent_cfg.get("history_compaction_enabled", True)
+    HISTORY_COMPACTION_MSG_THRESHOLD = agent_cfg.get("history_compaction_msg_threshold", 30)
+    HISTORY_COMPACTION_MIN_INTERVAL = agent_cfg.get("history_compaction_min_interval", 4)
+    HISTORY_COMPACTION_RECENT_TURNS = agent_cfg.get("history_compaction_recent_turns", 3)
+
+    # Chain analysis (pre-dispatch decomposition)
+    CHAIN_ANALYSIS_ENABLED = agent_cfg.get("chain_analysis_enabled", False)
+    chain_analysis_path = c.get("prompts", {}).get("chain_analysis", "configs/prompts/chain_analysis.txt")
+    try:
+        CHAIN_ANALYSIS_PROMPT = _load_prompt(chain_analysis_path)
+    except FileNotFoundError:
+        CHAIN_ANALYSIS_PROMPT = ""
+
+    # Rubric-conditioned critique (pre-research rubric + post-draft critique)
+    RUBRIC_ENABLED = agent_cfg.get("rubric_enabled", False)
+    rubric_path = c.get("prompts", {}).get("rubric_generator", "configs/prompts/rubric_generator.txt")
+    try:
+        RUBRIC_PROMPT = _load_prompt(rubric_path) if RUBRIC_ENABLED else ""
+    except FileNotFoundError:
+        RUBRIC_PROMPT = ""
+    DRAFT_CRITIQUE_ENABLED = agent_cfg.get("draft_critique_enabled", False)
+    critique_path = c.get("prompts", {}).get("draft_critique", "configs/prompts/draft_critique.txt")
+    try:
+        DRAFT_CRITIQUE_PROMPT = _load_prompt(critique_path) if DRAFT_CRITIQUE_ENABLED else ""
+    except FileNotFoundError:
+        DRAFT_CRITIQUE_PROMPT = ""
 
     # Dataset & eval (new — used by eval.py)
     DATASET_CONFIG = c.get("dataset", {})

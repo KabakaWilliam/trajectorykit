@@ -163,6 +163,8 @@ def ensure_vllm(cfg: dict) -> subprocess.Popen | None:
     reasoning_parser = vllm_cfg.get("reasoning_parser")
     extra_args = vllm_cfg.get("extra_args", [])
 
+    tp_size = len(gpu_devices)
+
     cmd = [
         "vllm", "serve", model_name,
         "--enable-auto-tool-choice",
@@ -170,6 +172,8 @@ def ensure_vllm(cfg: dict) -> subprocess.Popen | None:
         "--port", str(port),
         "--gpu-memory-utilization", str(gpu_mem_util),
     ]
+    if tp_size > 1:
+        cmd.extend(["--tensor-parallel-size", str(tp_size)])
     if reasoning_parser:
         cmd.extend(["--reasoning-parser", reasoning_parser])
     cmd.extend(extra_args)
@@ -188,7 +192,7 @@ def ensure_vllm(cfg: dict) -> subprocess.Popen | None:
 
     print(f"🚀 Starting vLLM:")
     print(f"   Model:  {model_name}")
-    print(f"   GPUs:   {gpu_devices}")
+    print(f"   GPUs:   {gpu_devices}" + (f" (TP={tp_size})" if tp_size > 1 else ""))
     print(f"   Port:   {port}")
     print(f"   Parser: {tool_call_parser}" + (f" + {reasoning_parser}" if reasoning_parser else ""))
     print(f"   Cmd:    {' '.join(cmd)}")

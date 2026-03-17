@@ -98,6 +98,55 @@ class MemoryStore:
                 return entry.content
         return None
     
+    def upsert(
+        self,
+        key: str,
+        tool_name: str,
+        turn: int,
+        content: str,
+        description: str = "",
+    ) -> str:
+        """Insert or update an entry with a fixed key.
+        
+        Unlike add(), this uses the caller-provided key directly and
+        replaces any existing entry with the same key (updating content
+        and metadata in-place without changing its position).
+        
+        Returns:
+            The key (same as the input).
+        """
+        for entry in self.entries:
+            if entry.key == key:
+                # Update in-place
+                self._total_chars -= entry.content_length
+                entry.content = content
+                entry.content_length = len(content)
+                entry.source_tool = tool_name
+                entry.turn = turn
+                self._total_chars += entry.content_length
+                return key
+        
+        # New entry — enforce limits then append
+        while (
+            self.entries
+            and (
+                len(self.entries) >= self.max_entries
+                or self._total_chars + len(content) > self.max_total_chars
+            )
+        ):
+            dropped = self.entries.pop(0)
+            self._total_chars -= dropped.content_length
+        
+        entry = MemoryEntry(
+            key=key,
+            source_tool=tool_name,
+            turn=turn,
+            content=content,
+        )
+        self.entries.append(entry)
+        self._total_chars += entry.content_length
+        return key
+    
     def keys(self) -> List[str]:
         """List all stored keys."""
         return [e.key for e in self.entries]

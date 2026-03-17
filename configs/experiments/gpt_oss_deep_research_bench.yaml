@@ -1,0 +1,148 @@
+# Experiment: GPT-OSS-20B on Deep Research Bench
+# Usage: python evals/eval_deep_research_bench.py --config configs/experiments/gpt_oss_deep_research_bench.yaml
+
+model:
+  name: "openai/gpt-oss-20b"
+  api_url: "http://localhost:3030/v1"
+
+vllm:
+  port: 3030
+  gpu_devices: [2,3]
+  gpu_memory_utilization: 0.9
+  tool_call_parser: "openai"
+  reasoning_parser: null
+  extra_args: ["--async-scheduling"]
+  env:
+    TIKTOKEN_CACHE_DIR: "/VData/resources/huggingface/tiktoken-cache"
+
+agent:
+  max_recursion_depth: 1
+  sub_agent_turn_budget: 15
+  token_safety_margin: 256
+  symbolic_references: false
+  symbolic_threshold: 500
+  plan_state: true
+  plan_inject_interval: 3
+  draft_report: true
+  draft_format: "report"          # "report" = Title/Executive Summary/Sections/Sources (bench)
+  verify_before_publish: true
+  spot_check_enabled: true
+  spot_check_claims: 5
+  max_verification_rejections: 4
+  max_spot_check_rejections: 4
+  citation_audit_enabled: true
+  chain_analysis_enabled: true
+  history_compaction_enabled: true
+  history_compaction_msg_threshold: 15
+  history_compaction_min_interval: 2
+  history_compaction_recent_turns: 2
+  rubric_enabled: true               # generate quality rubric before research starts
+  draft_critique_enabled: true       # replace binary verifier with rubric-conditioned critique
+
+# ── Verifier configuration ────────────────────────────────────────────
+# Controls which model runs Stage 1 (quality audit) and Stage 3 (citation audit).
+#
+# stage1_provider / stage3_provider can be:
+#   "self"     — use the same local model (model.name / model.api_url)
+#   "external" — use verifier.model / verifier.api_url (needs OPENAI_API_KEY in .env)
+#
+# Example A: Both stages use the LOCAL model (omit the block entirely, or):
+#   verifier:
+#     stage1_provider: "self"
+#     stage3_provider: "self"
+#
+# Example B: Both stages use an EXTERNAL model:
+#   verifier:
+#     model: "gpt-4.1-mini"
+#     api_url: "https://api.openai.com/v1"
+#     stage1_provider: "external"
+#     stage3_provider: "external"
+#
+# Example C: External judge for quality, local for citations:
+#   verifier:
+#     model: "gpt-4.1-mini"
+#     api_url: "https://api.openai.com/v1"
+#     stage1_provider: "external"
+#     stage3_provider: "self"
+#
+# If the verifier block is omitted entirely, both stages default to "self".
+verifier:
+  model: "gpt-5.4-2026-03-05" # "gpt-5-mini-2025-08-07" #"gpt-5-nano-2025-08-07"                # external model name (needs OPENAI_API_KEY in .env)
+  api_url: "https://api.openai.com/v1"  # external model endpoint
+  stage1_provider: "external"            # "self" = local model, "external" = verifier.model above
+  stage2_provider: "self"            # "self" = local model, "external" = verifier.model above (compare step only)
+  stage3_provider: "self"            # "self" = local model, "external" = verifier.model above
+
+sandbox:
+  url: "http://localhost:8080/run_code"
+  port: 8080
+  sif_image: "sandbox-fusion_server-20250609.sif"
+  docker_uri: "docker://volcengine/sandbox-fusion:server-20250609"
+  sif_dir: "."
+
+traces:
+  dir: "deep_research_bench/traces/"
+
+prompts:
+  orchestrator: "configs/prompts/orchestrator_bench.txt"
+  worker: "configs/prompts/worker.txt"
+  verifier: "configs/prompts/verifier_bench.txt"
+  verifier_external: "configs/prompts/verifier_external.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare_bench.txt"
+  spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
+  chain_analysis: "configs/prompts/chain_analysis.txt"
+  citation_audit: "configs/prompts/citation_audit.txt"
+  rubric_generator: "configs/prompts/rubric_generator.txt"
+  draft_critique: "configs/prompts/draft_critique.txt"
+
+model_profiles:
+  "Qwen/Qwen3-8B":
+    context_window: 32768
+    supports_reasoning_effort: false
+    default_temperature: 0.7
+
+  "openai/gpt-oss-20b":
+    context_window: 131072
+    supports_reasoning_effort: true
+    default_reasoning_effort: "high"
+    default_temperature: 1.0
+
+default_profile:
+  context_window: 32768
+  supports_reasoning_effort: false
+  default_temperature: 0.7
+
+dataset:
+  name: "deep_research_bench"
+  query_file: "deep_research_bench/data/prompt_data/query.jsonl"
+  # lang: "en"                             # uncomment to restrict: "en" or "zh"
+  limit: 100                              # uncomment to cap prompts (for testing)
+  shuffle: true                           # random sampling (stratified by language when no lang filter)
+  seed: 42                                # reproducible shuffle seed
+
+eval:
+  turn_length: null
+  reasoning_effort: "high"
+  verbose: true
+  output_dir: "deep_research_bench/traces"
+  workers: 10
+
+judge:
+  enabled: true
+  model: "gemini-2.5-pro" #"gpt-4.1-mini" #"gemini-2.5-pro"
+  threads: 5
+
+ntfy:
+  enabled: true
+  url: "https://ntfy.sh"
+  topic: "trajectorykit-eval"
+  interval_pct: 10
+
+deep_research_bench:
+  bench_dir: "deep_research_bench"
+  raw_data_dir: "deep_research_bench/data/test_data/raw_data"
+  output_dir: "deep_research_bench/results"
+  model_alias: "trajectorykit"
+  max_workers: 10
+  skip_cleaning: false

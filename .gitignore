@@ -15,4 +15,12 @@ data
 demo
 evals
 private_example.py
+recovery_trace_scripts.sh
+deep_research_bench
+sample_essay*
+Deep_Research
 *.sif
+debug.ipynb
+exa_research.md
+recovery_trace_results.py
+rerender_traces.py

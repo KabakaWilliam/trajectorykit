@@ -16,8 +16,28 @@ model:
 # ── Agent behavior ─────────────────────────────────────────────────────
 agent:
   max_recursion_depth: 1
-  sub_agent_turn_budget: 15
+  sub_agent_turn_budget: 10
   token_safety_margin: 256
+  # Symbolic references: compress large tool outputs to summaries at depth 0.
+  # Full data stays in MemoryStore; the LLM sees a compact reference.
+  symbolic_references: false
+  symbolic_threshold: 500         # chars — smaller outputs pass through
+  # Research plan: inject a structured progress tracker every N turns.
+  plan_state: false
+  plan_inject_interval: 3         # inject plan every N turns
+  # Pre-publish verification: LLM audits draft before research_complete publishes.
+  verify_before_publish: true
+  # Stage 2 spot-check: after consistency passes, search-verify key claims.
+  spot_check_enabled: true
+  spot_check_claims: 3            # max claims to verify per spot-check
+  # Chain analysis: pre-dispatch causal chain decomposition for multi-hop questions.
+  chain_analysis_enabled: false
+  # History compaction: replace old root messages with a compact summary once
+  # the draft absorbs their findings, reclaiming context window.
+  history_compaction_enabled: true
+  history_compaction_msg_threshold: 30  # min messages before first compaction
+  history_compaction_min_interval: 4   # min turns between compactions
+  history_compaction_recent_turns: 3   # keep last N turn-groups in full
 
 # ── Sandbox ────────────────────────────────────────────────────────────
 sandbox:
@@ -31,6 +51,11 @@ traces:
 prompts:
   orchestrator: "configs/prompts/orchestrator.txt"
   worker: "configs/prompts/worker.txt"
+  verifier: "configs/prompts/verifier.txt"
+  spotcheck_extract: "configs/prompts/spotcheck_extract.txt"
+  spotcheck_compare: "configs/prompts/spotcheck_compare.txt"
+  spotcheck_refusal: "configs/prompts/spotcheck_refusal.txt"
+  chain_analysis: "configs/prompts/chain_analysis.txt"
 
 # ── Model profiles ─────────────────────────────────────────────────────
 # Each model's capabilities and defaults. Add new models here.
@@ -57,6 +82,15 @@ dataset:
   split: "eval"
   sample_n: 50               # random sample of N rows (null = use full dataset)
   seed: 42                    # random seed for reproducible sampling
+
+# ── Notifications (ntfy.sh push updates during eval) ──────────────────
+# Set a topic to get phone/desktop push notifications with progress.
+# Requires no signup — just subscribe to the same topic in the ntfy app.
+ntfy:
+  enabled: false
+  url: "https://ntfy.sh"          # server URL (or self-hosted instance)
+  topic: "trajectorykit-eval"     # topic name — pick something unique
+  interval_pct: 10                # notify every N% of prompts (0 = start/finish only)
 
 # ── Eval settings ──────────────────────────────────────────────────────
 eval:
