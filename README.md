@@ -54,7 +54,7 @@ result["trace"].save()  # Saves to traces/trace_YYYYMMDD_HHMMSS_uuid.json + .htm
 
 ### Live Demo
 
-[**Click here to see a real agent trace in action.**](https://kabakawilliam.github.io/trajectorykit/demo_trace.html) The HTML viewer lets you step through the timeline: watch the agent searching the web, reading pages, running code in a sandbox, and synthesizing answers across 15+ turns.
+[**Click here to see a real agent trace in action.**](https://kabakawilliam.github.io/trajectorykit/demo_trace.html) The HTML viewer lets you step through the timeline: watch the agent searching the web, reading pages, running code in a sandbox, and synthesizing answers across multiple turns.
 
 ---
 
