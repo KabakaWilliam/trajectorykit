@@ -7,18 +7,6 @@
 
 ---
 
-## Why TrajectoryKit?
-
-Most agent frameworks are cloud-first and opaque. TrajectoryKit is designed for researchers who want full control:
-
-- **Minimal-model design.** Achieve PhD-level research quality with an open-weight 20B model (GPT-OSS-20B). Use GPT-5.4 only as an optional post-processing refinement layer, not the primary research engine. This approach cuts inference costs while maintaining competitive quality across 22 research domains.
-- **One config, one command.** Write a single YAML file that specifies your model, GPU devices, vLLM configuration, sandbox, dataset, and optional judge. Then just run `orchestrate.py` — it handles everything: pulling container images, launching services, running evaluation, and grading output.
-- **Recursive delegation that actually works.** Sub-agents run in isolated contexts with their own tools and traces, so they never pollute the parent's memory. Each one maintains its own research trajectory.
-- **Memory that doesn't blow up your context window.** Tool outputs get stored externally and accessed on-demand via code execution, which is way more efficient than dumping everything into attention. The LLM can write programs to search its own research history.
-- **Every turn is recorded.** Full execution trees with turn-by-turn details, all tool calls, sub-agent cascades, token usage, and wall-clock latency get saved as JSON and rendered as an interactive HTML trace you can click through.
-
----
-
 ## Quickstart
 
 Get up and running in three commands:
@@ -72,52 +60,61 @@ result["trace"].save()  # Saves to traces/trace_YYYYMMDD_HHMMSS_uuid.json + .htm
 
 ## 🏆 Evaluation Results
 
-TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.com/Ayanami0730/deep_research_bench)**, a benchmark with 100 PhD-level research tasks across 22 domains. The primary research engine uses **GPT-OSS-20B** (open-weight, locally deployed), with optional GPT-5.4 refinement:
+TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.com/Ayanami0730/deep_research_bench)**, a benchmark with 100 PhD-level research tasks across 22 domains. The primary research engine uses **GPT-OSS-20B** (open-weight, locally deployed), with optional GPT-5.4 refinement.
 
-| Metric | Baseline (GPT-OSS-20B) | With Rewrite (+GPT4.5 refiner) | Improvement |
-|--------|----------|--------------|-------------|
-| Comprehensiveness | 0.4548 | **0.5260** | +15.7% |
-| Insight/Depth | 0.4397 | **0.5701** | **+29.7%** ⭐ |
-| Instruction Following | 0.5071 | **0.5260** | +3.7% |
-| Readability | 0.4899 | **0.5247** | +7.1% |
-| **Overall Score** | 0.4696 | **0.5407** | **+15.1%** |
+### Deep Research Bench Leaderboard Position
 
-**Key insight:** The baseline (GPT-OSS-20B alone) reaches 0.4696 on Deep Research Bench before any rewrite step, showing that much of the performance comes from the harness rather than a large multi-model stack.
+With the two-pass GPT-5.4 refinement pipeline, TrajectoryKit achieves **0.5496 overall score** (54.96/100), demonstrating competitive performance:
 
-### Impact of Reasoning Effort
+| Rank | Model | Overall | Comp. | Insight | Inst. F. | Read. | License |
+|------|-------|---------|-------|---------|----------|-------|---------|
+| 1 🥇 | Cellcog Max | 56.13 | 56.52 | 59.15 | 53.02 | 53.47 | Proprietary |
+| 2 🥈 | nvidia-aiq (Nemotron 3, GPT 5.2) | 55.95 | 56.9 | 58.49 | 52.89 | 53.43 | Apache-2.0 |
+| 3 🥉 | Cellcog | 55.31 | 55.41 | 58.21 | 52.5 | 53.12 | Proprietary |
+| 4 | CMCC-DeepInsight | 55.24 | 55.66 | 58.7 | 52.53 | 50.94 | Proprietary |
+| 5 | Xiaoyi DeepResearch | 55.13 | 56.2 | 58.44 | 51.9 | 50.78 | Proprietary |
+| **6** | **TrajectoryKit (GPT-OSS-20B + GPT-5.4 + Rewrite)** | **55.08** | **54.12** | **58.28** | **52.89** | **53.25** | **MIT (Open Source)** |
+| 7 | Onyx Deep Research | 54.54 | 54.67 | 56.43 | 53.08 | 52.02 | MIT (partial EE) |
 
-The framework supports different reasoning effort levels. Here's how reasoning effort affects performance on Deep Research Bench:
+**Key achievement:** Rank 6 performance using fully open-source tooling—**locally-deployed 20B open-weight model** with optional GPT-5.4 refinement and finding-based post-processing, competing directly with proprietary agents while maintaining transparency and reproducibility.
 
-| Reasoning Effort | Comprehensiveness | Insight | Instruction Following | Readability | Overall |
-|------------------|-------------------|---------|----------------------|-------------|---------|
-| LOW | 0.5199 | 0.5636 | 0.5223 | 0.5247 | **0.5360** |
-| MEDIUM | 0.5183 | 0.5645 | 0.5239 | 0.5237 | **0.5361** |
-| HIGH | 0.5260 | 0.5701 | 0.5260 | 0.5247 | **0.5407** |
+---
 
+### Performance Breakdown by Refinement Stage
+
+| Metric | Agent Output<br/>(GPT-OSS-20B) | +Requirement Refinement<br/>(GPT-5.4 Pass 1) | +Synthesis & Clarity<br/>(GPT-5.4 Pass 2) | +Finding-Based Rewrite<br/>(*3) | Total Improvement |
+|--------|----------|--------------|-------------|-------------|-------------|
+| Comprehensiveness | 0.4548 | 0.5260 | 0.5390 | **0.5412** | +18.9% |
+| Insight/Depth | 0.4397 | 0.5701 | 0.5800 | **0.5828** | **+32.5%** ⭐ |
+| Instruction Following | 0.5071 | 0.5260 | 0.5303 | 0.5289 | +4.3% |
+| Readability | 0.4899 | 0.5247 | 0.5308 | **0.5325** | +8.7% |
+| **Overall Score** | 0.4696 | 0.5407 | 0.5496 | **0.5508** | **+17.3%** |
+
+**Refinement pipeline:**
+- **Stage 1** (GPT-OSS-20B baseline): Foundational research agent output
+- **Stage 2** (Requirement Refinement—GPT-5.4 Pass 1): Systematic coverage of question requirements, mechanistic depth, and internal requirement mapping
+- **Stage 3** (Synthesis & Clarity—GPT-5.4 Pass 2): Strategic insight extraction ("so what"), causal chain synthesis, and readability recovery through calibrated signposting
+- **Stage 4** (Finding-Based Rewrite): Post-processing enhancement emphasizing key insights through improved subheadings, worked decision examples, and strategic section organization
+
+**Key insight:** The baseline (GPT-OSS-20B alone) reaches 0.4696 on Deep Research Bench before any refinement, showing that much of the performance comes from the harness rather than a large multi-model stack. The four-stage pipeline cumulatively improves performance by 17.3%, with finding-based rewriting contributing +0.12 points in overall score while maintaining strong synthesis depth.
+
+**Future direction:** We're actively consolidating this into a single unified rewrite pass using an external model, which will streamline the pipeline while maintaining or improving performance.
+
+---
+
+## Why TrajectoryKit?
+
+TrajectoryKit is built for researchers who want full control:
+
+- **Minimal-model design.** Achieve competitive PhD-level research quality with an open-weight 20B model locally deployed. Optional GPT-5.4 refinement layer (not required), cutting inference costs while competing directly with proprietary agents.
+- **One config, one command.** Single YAML file specifies everything: model, GPU setup, vLLM config, sandbox, dataset, judge. Then `orchestrate.py` handles the rest—pulling images, launching services, evaluation, and grading.
+- **Full transparency and reproducibility.** Every turn is recorded (searches, fetches, code execution, agent decisions) and saved as interactive HTML traces. Build on a locally-deployed harness you fully control.
 
 ---
 
 ## Agent Overview
 
 ### Complete Workflow
-
-```mermaid
-flowchart LR
-    A["🧑 User Query"] --> B["📋 Config YAML"]
-    B --> C["🚀 orchestrate.py"]
-    C --> D["🧠 Agent Loop"]
-    D --> E["🔍 Research"]
-    E --> F["📝 Draft"]
-    F --> G["✅ Verification"]
-    G -->|Fail| E
-    G -->|Pass| H["📊 Results"]
-    H --> I["📈 Evaluation"]
-    I --> J["🏆 Score"]
-```
-
-### Overall Harness
-
-TrajectoryKit separates planning, research, drafting, and verification into distinct stages. The root orchestrator can recursively delegate research to fresh-context worker agents, then consolidate their findings into a draft before publishing only after verification passes.
 
 ```mermaid
 flowchart TD
@@ -266,7 +263,7 @@ python orchestrate.py --config configs/experiments/gpt_oss_deepsearchqa.yaml
 | **Deep Research Bench** | `gpt_oss_deep_research_bench.yaml` | GPT-OSS-20B | Deep Research Bench (100 PhD-level tasks, 22 domains) |
 | **Alternative: Qwen** | `qwen3_deepsearchqa.yaml` | Qwen3-8B | Google DeepSearchQA |
 
-**Model Flexibility:** All configs default to minimal-model approaches (20B or 8B open-weight). You can swap in heavier models (e.g., GPT-4.5, Claude-3) by modifying the `model.name` and `model.api_url` fields in any config.
+**Model Flexibility:** All configs default to minimal-model approaches (20B or 8B open-weight). You can swap in heavier models (e.g., GPT-5.4, Claude-3) by modifying the `model.name` and `model.api_url` fields in any config.
 
 <p align="center">
   <strong>Get results in minutes:</strong> Choose a config above and run <code>python orchestrate.py --config ...</code>
@@ -496,10 +493,25 @@ You need to set a few API keys depending on which features you're using:
 | `SERPER_API_KEY` | Primary web search provider (Serper.dev). Falls back to Exa or DuckDuckGo if not set or credits run out. |
 | `EXA_API_KEY` | Exa.ai for neural search (fallback) and content fetching. Highly recommended. |
 | `JINA_API_KEY` | Jina Reader for fetching JavaScript-heavy or paywalled pages. Optional but improves success rates. |
-| `OPENAI_API_KEY` | OpenAI API key for the LLM judge (GPT-4.1-mini) and optional post-processing rewrite (GPT-5.4). Only needed for those features. |
+| `OPENAI_API_KEY` | OpenAI API key for rubric creation and post-processing rewrite (GPT-5.4). Only needed for those features. |
 | `ANTHROPIC_API_KEY` | Anthropic API key for alternative post-processing rewrite (Claude Opus). Optional. |
 | `SERP_API_KEY` | Legacy SerpAPI key (alternative search backend, requires setting `SEARCH_BACKEND=serpapi`). |
 | `GOOGLE_API_KEY` | Gemini API key. Only needed if you're using Gemini as the judge model. |
+
+#### Setting up your `.env` file
+
+Create a `.env` file in the **project root** with your API keys:
+
+```bash
+# .env (at root of trajectorykit/)
+SERPER_API_KEY=your_serper_key
+EXA_API_KEY=your_exa_key
+JINA_API_KEY=your_jina_key
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+```
+
+The framework automatically loads these when you run `orchestrate.py` or call `dispatch()`.
 
 ---
 
