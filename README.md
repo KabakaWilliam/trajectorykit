@@ -60,7 +60,7 @@ result["trace"].save()  # Saves to traces/trace_YYYYMMDD_HHMMSS_uuid.json + .htm
 
 ## 🏆 Evaluation Results
 
-TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.com/Ayanami0730/deep_research_bench)**, a benchmark with 100 PhD-level research tasks across 22 domains. The primary research engine uses **GPT-OSS-20B** (open-weight, locally deployed), with optional GPT-5.4 refinement.
+TrajectoryKit is rigorously evaluated on **[Deep Research Bench](https://github.com/Ayanami0730/deep_research_bench)**, a benchmark with 100 PhD-level research tasks across 22 domains. The primary research engine uses **GPT-OSS-20B** (open-weight, locally deployed), with optional GPT-5.4 refinement. Read more about our findings in our blogpost [here](https://www.williamlugoloobi.com/blog/building-trajectorykit).
 
 ### Deep Research Bench Leaderboard Position
 
@@ -90,15 +90,16 @@ With the two-pass GPT-5.4 refinement pipeline, TrajectoryKit achieves **0.5496 o
 | Readability | 0.4899 | 0.5247 | 0.5308 | **0.5325** | +8.7% |
 | **Overall Score** | 0.4696 | 0.5407 | 0.5496 | **0.5508** | **+17.3%** |
 
-**Refinement pipeline:**
-- **Stage 1** (GPT-OSS-20B baseline): Foundational research agent output
-- **Stage 2** (Requirement Refinement—GPT-5.4 Pass 1): Systematic coverage of question requirements, mechanistic depth, and internal requirement mapping
-- **Stage 3** (Synthesis & Clarity—GPT-5.4 Pass 2): Strategic insight extraction ("so what"), causal chain synthesis, and readability recovery through calibrated signposting
-- **Stage 4** (Finding-Based Rewrite): Post-processing enhancement emphasizing key insights through improved subheadings, worked decision examples, and strategic section organization
+**Refinement pipeline workflow:**
+1. **Agent Output** (GPT-OSS-20B): Foundational research harness
+2. **Stage 2** (Requirement Refinement—GPT-5.4): Systematic coverage and mechanistic depth
+3. **Stage 3** (Synthesis & Clarity—GPT-5.4): Natural narrative structure and calibrated signposting
+4. **Stage 4** (Post-Processing Chain): Running the external [`post_process_chain.py`](https://github.com/KabakaWilliam/deep_research_bench) tool—finding-based rewrite emphasizing key insights through improved subheadings and strategic section organization
+5. **→ Judge Evaluation**: Report is then graded on comprehensiveness, insight, instruction-following, and readability
+
+**Critical workflow note:** The final report **must** be passed through the post-processing chain (Stage 4) before submitting to the judge. This step is essential for achieving the performance gains shown.
 
 **Key insight:** The baseline (GPT-OSS-20B alone) reaches 0.4696 on Deep Research Bench before any refinement, showing that much of the performance comes from the harness rather than a large multi-model stack. The four-stage pipeline cumulatively improves performance by 17.3%, with finding-based rewriting contributing +0.12 points in overall score while maintaining strong synthesis depth.
-
-**Future direction:** We're actively consolidating this into a single unified rewrite pass using an external model, which will streamline the pipeline while maintaining or improving performance.
 
 ---
 
@@ -303,6 +304,67 @@ python evals/recover_parquet.py
 - `results.parquet` — Per-item metrics, token counts, latency
 - `results_judge_ratings.json` — Judge scores with per-metric breakdowns
 - `traces/` — Full JSON + HTML traces for each query
+
+---
+
+## 🔄 Post-Processing Chain: Batch Article Refinement
+
+For batch processing of draft articles (e.g., multiple reports from research runs), use the `post_process_chain.py` script to apply the same four-stage refinement pipeline described in the Evaluation Results section.
+
+### Setup
+
+`post_process_chain.py` is at the TrajectoryKit root level. It imports refinement prompts from `deep_research_bench/`, which you clone separately:
+
+```bash
+# Clone deep_research_bench for the refinement prompts
+git clone https://github.com/Ayanami0730/deep_research_bench.git
+
+# Install its dependencies (if any)
+cd deep_research_bench && pip install -r requirements.txt
+```
+
+### Usage
+
+From TrajectoryKit root:
+
+```bash
+# Process a directory of drafts
+python post_process_chain.py \
+  -i ./my_drafts/ \
+  -o ./refined_articles/ \
+  -c 3  # 3 concurrent refinements
+
+# Process JSONL file
+python post_process_chain.py \
+  -i research_results.jsonl \
+  -o refined_results.jsonl
+
+# Use data from the cloned deep_research_bench
+python post_process_chain.py \
+  -i deep_research_bench/data/sample_articles/ \
+  -o ./refined/
+```
+
+### The Four Refinement Stages
+
+1. **→ REWRITE_OG** — Quantify vague claims, fill entity gaps, strengthen causal reasoning
+2. **→ REFINEMENT_V2** — Add mechanistic depth, ground abstractions in examples, deepen analysis
+3. **→ REFINEMENT_V3** — Natural narrative clarity, calibrated signposting, scannability improvement
+4. **→ REFINEMENT_V3_B** — Finding-based subheadings, strong topic sentences, decision-relevance threading
+
+Each stage preserves all existing content while adding specificity, context, and structural clarity.
+
+### Options
+
+- **Input:** Directory of `.md`/`.txt` files OR JSONL file (one JSON object per line)
+- **Output:** Same format as input (directory or JSONL)
+- **Concurrency:** Control parallelization (default: 2 workers)
+- **Providers:** OpenAI (recommended: GPT-5.4 with reasoning_effort: high) or Anthropic
+- **`--test`:** Process only the first record (useful for testing)
+
+### Full Documentation
+
+See [deep_research_bench/POST_PROCESS_CHAIN_README.md](https://github.com/KabakaWilliam/deep_research_bench/blob/main/POST_PROCESS_CHAIN_README.md) in the external repository for detailed usage examples, API provider configuration, and development guide.
 
 ---
 
