@@ -329,6 +329,7 @@ def _search_exa(q: str, num_results: int = 10) -> str:
         "type": "auto",                  # let Exa pick keyword vs neural
         "contents": {
             "text": {"maxCharacters": 300},   # short snippet per result
+            "highlights": True,               # query-aware snippet fallback
         },
     }
 
@@ -341,6 +342,7 @@ def _search_exa(q: str, num_results: int = 10) -> str:
                 headers={
                     "x-api-key": api_key,
                     "Content-Type": "application/json",
+                    "x-exa-integration": "trajectorykit",
                 },
                 json=payload,
                 timeout=SEARCH_TIMEOUT,
@@ -363,7 +365,11 @@ def _search_exa(q: str, num_results: int = 10) -> str:
             for i, r in enumerate(results[:num_results], 1):
                 title = r.get("title") or "No title"
                 link = r.get("url") or "No link"
-                snippet = (r.get("text") or "").strip()[:250] or "No snippet"
+                snippet = (r.get("text") or "").strip()
+                if not snippet:
+                    highlights = r.get("highlights") or []
+                    snippet = " … ".join(h.strip() for h in highlights if h)
+                snippet = snippet[:250] or "No snippet"
                 formatted += f"{i}. {title}\n   URL: {link}\n   {snippet}\n\n"
 
             logger.info(f"Successfully retrieved {len(results[:num_results])} search results via Exa")
@@ -1039,6 +1045,7 @@ def _exa_contents_fallback(url: str, max_chars: int = 12000) -> str | None:
             headers={
                 "x-api-key": api_key,
                 "Content-Type": "application/json",
+                "x-exa-integration": "trajectorykit",
             },
             json={
                 "ids": [url],
